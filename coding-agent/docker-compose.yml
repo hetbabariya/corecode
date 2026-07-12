@@ -1,0 +1,17 @@
+services:
+  agent:
+    build: .
+    volumes:
+      - .:/workspace
+    environment:
+      - CODING_AGENT_LLM_API_KEY=${CODING_AGENT_LLM_API_KEY}
+      - CODING_AGENT_LLM_MODEL=${CODING_AGENT_LLM_MODEL:-claude-3-5-sonnet-20241022}
+    depends_on:
+      - sandbox
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    image: coding-agent-sandbox:latest
+    entrypoint: ["sleep", "infinity"]
