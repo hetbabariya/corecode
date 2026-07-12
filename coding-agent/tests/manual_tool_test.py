@@ -23,6 +23,7 @@ from coding_agent.tools import (
 
 DIVIDER = "-" * 60
 
+
 # Module-level Pydantic model so typing.get_type_hints() can resolve it
 class EditArgs(BaseModel):
     path: str = Field(description="File to edit")
@@ -38,6 +39,7 @@ async def _result_tool_func(msg: str) -> ToolResult:
 # Force stdout to utf-8 on Windows so we can print non-ASCII
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     import io
+
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 
@@ -94,7 +96,9 @@ def test_tool_registration() -> None:
         return f"Hello, {name}!"
 
     @tool(name="deploy", description="Deploy to an environment", permission="execute")
-    async def deploy(env: Literal["staging", "production"], dry_run: bool = False) -> str:
+    async def deploy(
+        env: Literal["staging", "production"], dry_run: bool = False
+    ) -> str:
         if dry_run:
             return f"[DRY RUN] Would deploy to {env}"
         return f"Deployed to {env}"
@@ -141,11 +145,16 @@ async def test_execution() -> None:
         raise ValueError("something went wrong")
 
     from coding_agent.tools.registry import FunctionTool
+
     manual_tool = FunctionTool(
         _result_tool_func,
         name="result_tool",
         description="Returns ToolResult directly",
-        parameters={"type": "object", "properties": {"msg": {"type": "string"}}, "required": ["msg"]},
+        parameters={
+            "type": "object",
+            "properties": {"msg": {"type": "string"}},
+            "required": ["msg"],
+        },
         permission_level="read",
     )
     tool_registry.register(manual_tool)
@@ -160,7 +169,9 @@ async def test_execution() -> None:
 
     # ToolResult passthrough
     result = await tool_registry.execute("result_tool", {"msg": "hello"})
-    print(f"  result_tool('hello') -> output={result.output}, metadata={result.metadata}")
+    print(
+        f"  result_tool('hello') -> output={result.output}, metadata={result.metadata}"
+    )
 
     # Nonexistent tool
     result = await tool_registry.execute("nope", {})
@@ -182,8 +193,8 @@ async def test_llm_dispatch() -> None:
     print("4. LLM FORMAT DISPATCH (execute_from_llm)")
     print(DIVIDER)
 
-    @tool(name="read_file", description="Read a file", permission="read")
-    async def read_file(path: str) -> str:
+    @tool(name="mock_read_file", description="Read a file", permission="read")
+    async def mock_read_file(path: str) -> str:
         return f"<contents of {path}>"
 
     # Simulate what the LLM returns
@@ -191,7 +202,7 @@ async def test_llm_dispatch() -> None:
         "id": "call_0",
         "type": "function",
         "function": {
-            "name": "read_file",
+            "name": "mock_read_file",
             "arguments": json.dumps({"path": "src/main.py"}),
         },
     }
@@ -204,7 +215,7 @@ async def test_llm_dispatch() -> None:
     bad_call = {
         "id": "call_1",
         "type": "function",
-        "function": {"name": "read_file", "arguments": "not-json"},
+        "function": {"name": "mock_read_file", "arguments": "not-json"},
     }
     result = await tool_registry.execute_from_llm(bad_call)
     print(f"  Bad JSON: success={result.success}, error={result.error}")
@@ -218,7 +229,7 @@ async def test_llm_dispatch() -> None:
     result = await tool_registry.execute_from_llm(no_name)
     print(f"  Missing name: success={result.success}, error={result.error}")
 
-    tool_registry.unregister("read_file")
+    tool_registry.unregister("mock_read_file")
 
 
 # ------------------------------------------------------------------
@@ -245,7 +256,11 @@ async def test_llm_integration() -> None:
             print("  [SKIP] No API key configured in .env")
             return
 
-        @tool(name="calculate", description="Calculate the result of a math expression", permission="read")
+        @tool(
+            name="calculate",
+            description="Calculate the result of a math expression",
+            permission="read",
+        )
         async def calculate(expression: str) -> str:
             """Evaluate a math expression safely."""
             allowed = set("0123456789+-*/.() ")
@@ -265,7 +280,9 @@ async def test_llm_integration() -> None:
         print("  Sending: 'What is 12 * 7? Use the calculate tool.'")
 
         response = await client.complete(
-            messages=[{"role": "user", "content": "What is 12 * 7? Use the calculate tool."}],
+            messages=[
+                {"role": "user", "content": "What is 12 * 7? Use the calculate tool."}
+            ],
             tools=tool_registry.get_schemas(),
         )
 

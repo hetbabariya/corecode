@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import pytest
 from pydantic import BaseModel, Field
 
 from coding_agent.tools.base import ToolResult
 from coding_agent.tools.registry import FunctionTool, ToolRegistry, tool, tool_registry
-
 
 # ------------------------------------------------------------------
 # Helpers — reusable test functions
@@ -61,7 +59,9 @@ async def _pydantic_tool(args: _EditArgs) -> str:
 class TestToolRegistry:
     def test_register_and_get(self) -> None:
         reg = ToolRegistry(name="test")
-        ft = FunctionTool(_add, name="add", description="Add", parameters={}, permission_level="read")
+        ft = FunctionTool(
+            _add, name="add", description="Add", parameters={}, permission_level="read"
+        )
         reg.register(ft)
         assert reg.get("add") is ft
 
@@ -114,7 +114,9 @@ class TestToolRegistry:
 
     def test_get_schema_single(self) -> None:
         reg = ToolRegistry(name="test")
-        reg.register(FunctionTool(_greet, name="greet", description="Greet", parameters={}))
+        reg.register(
+            FunctionTool(_greet, name="greet", description="Greet", parameters={})
+        )
         s = reg.get_schema("greet")
         assert s["function"]["name"] == "greet"
 
@@ -241,13 +243,17 @@ class TestFunctionTool:
         assert ft.description == "Add"
 
     async def test_execute_returns_str_wrapped(self) -> None:
-        ft = FunctionTool(_str_returns, name="str_returns", description="", parameters={})
+        ft = FunctionTool(
+            _str_returns, name="str_returns", description="", parameters={}
+        )
         result = await ft.execute()
         assert result.success is True
         assert result.output == "plain string"
 
     async def test_execute_returns_tool_result_passthrough(self) -> None:
-        ft = FunctionTool(_returns_result, name="returns_result", description="", parameters={})
+        ft = FunctionTool(
+            _returns_result, name="returns_result", description="", parameters={}
+        )
         result = await ft.execute()
         assert result.success is True
         assert result.output == "custom"
@@ -260,7 +266,9 @@ class TestFunctionTool:
         assert "boom" in (result.error or "")
 
     def test_permission_level(self) -> None:
-        ft = FunctionTool(_add, name="add", description="", parameters={}, permission_level="write")
+        ft = FunctionTool(
+            _add, name="add", description="", parameters={}, permission_level="write"
+        )
         assert ft.permission_level == "write"
 
     def test_wrapped_attribute(self) -> None:
@@ -302,6 +310,7 @@ class TestToolDecorator:
 
     def test_custom_registry(self) -> None:
         custom = ToolRegistry(name="custom")
+
         @tool(name="custom_reg_test", description="test", registry=custom)
         async def _my_tool(x: str) -> str:
             return x
@@ -356,6 +365,7 @@ class TestToolDecorator:
             "properties": {"x": {"type": "string"}},
             "required": ["x"],
         }
+
         @tool(name="override_test", description="test", parameters=custom_params)
         async def _my_tool(x: str) -> str:
             return x

@@ -118,7 +118,11 @@ def _type_to_schema(annotation: Any) -> dict[str, Any] | None:
 
     # --- list[T] / Sequence[T] ---
     origin = get_origin(annotation)
-    if origin is list or annotation is list or (hasattr(typing, "Sequence") and origin is typing.Sequence):
+    if (
+        origin is list
+        or annotation is list
+        or (hasattr(typing, "Sequence") and origin is typing.Sequence)
+    ):
         args = get_args(annotation)
         if args and args[0] is not Any:
             item_schema = _type_to_schema(args[0])
@@ -127,7 +131,11 @@ def _type_to_schema(annotation: Any) -> dict[str, Any] | None:
         return {"type": "array"}
 
     # --- dict[K, V] / Mapping[K, V] / dict ---
-    if origin is dict or annotation is dict or (hasattr(typing, "Mapping") and origin is typing.Mapping):
+    if (
+        origin is dict
+        or annotation is dict
+        or (hasattr(typing, "Mapping") and origin is typing.Mapping)
+    ):
         args = get_args(annotation)
         if len(args) == 2 and args[1] is not Any:
             val_schema = _type_to_schema(args[1])

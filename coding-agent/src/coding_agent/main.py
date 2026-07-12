@@ -12,7 +12,7 @@ app = typer.Typer(
 @app.command()
 def run(
     prompt: str = "",
-    model: str = "claude-3-5-sonnet-20241022",
+    model: str = "gemini-2.5-flash",
     workspace: Path = Path("."),
     permission_level: str = "write",
     sandbox: bool = True,

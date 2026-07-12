@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import typing
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-import pytest
 from pydantic import BaseModel, Field
 
 from coding_agent.tools.schema import infer_schema
-
 
 # ------------------------------------------------------------------
 # Helpers — sample functions for each inference case
@@ -51,7 +48,7 @@ def _fn_path(path: Path) -> None: ...
 def _fn_literal(value: Literal["read", "write", "execute"]) -> None: ...
 
 
-class _Color(str, Enum):
+class _Color(StrEnum):
     RED = "red"
     BLUE = "blue"
 
@@ -194,4 +191,7 @@ class TestInferSchemaShape:
 
     def test_kwargs_allows_additional_properties(self) -> None:
         schema = infer_schema(_fn_kwargs)
-        assert "additionalProperties" not in schema or schema.get("additionalProperties") is not False
+        assert (
+            "additionalProperties" not in schema
+            or schema.get("additionalProperties") is not False
+        )

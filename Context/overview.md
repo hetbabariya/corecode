@@ -102,7 +102,7 @@ User Input
 
 | Week | Focus | Done? |
 |---|---|---|
-| 1 | Project setup + config | ⬜ |
+| 1 | Project setup + config | ✅ |
 | 2 | LLM client + streaming | ⬜ |
 | 3 | Tool registry + base | ⬜ |
 | 4 | File tools | ⬜ |
@@ -190,5 +190,5 @@ uv run coding-agent --repl
 
 ## Status
 
-**Phase:** Pre-development (planning complete)
-**Next:** Start Week 1 — project setup + config
+**Phase:** Week 1 Complete (Project Setup)
+**Next:** Week 2 — LLM Client + Streaming

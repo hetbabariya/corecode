@@ -239,13 +239,13 @@ uv run pytest tests/test_tools/test_registry.py -v
 
 #### Tasks
 
-- [ ] Create `tools/file_ops.py`
-- [ ] Implement `read_file` tool
-- [ ] Implement `write_file` tool
-- [ ] Implement `edit_file` tool
-- [ ] Implement `list_files` tool
-- [ ] Add `.gitignore` respect
-- [ ] Write tests for all file operations
+- [x] Create `tools/file_ops.py`
+- [x] Implement `read_file` tool
+- [x] Implement `write_file` tool
+- [x] Implement `edit_file` tool
+- [x] Implement `list_files` tool
+- [x] Add `.gitignore` respect
+- [x] Write tests for all file operations
 
 #### How to Test
 
@@ -317,12 +317,12 @@ uv run pytest tests/test_tools/test_file_ops.py -v
 
 #### Definition of Done
 
-- [ ] `read_file` returns file contents with line numbers
-- [ ] `write_file` creates files and directories
-- [ ] `edit_file` makes targeted replacements
-- [ ] `list_files` respects glob patterns
-- [ ] All tools respect `.gitignore`
-- [ ] All unit tests pass
+- [x] `read_file` returns file contents with line numbers
+- [x] `write_file` creates files and directories
+- [x] `edit_file` makes targeted replacements
+- [x] `list_files` respects glob patterns
+- [x] All tools respect `.gitignore`
+- [x] All unit tests pass
 
 ---
 
@@ -330,14 +330,14 @@ uv run pytest tests/test_tools/test_file_ops.py -v
 
 #### Tasks
 
-- [ ] Create `tools/search.py`
-- [ ] Implement `search_content` (ripgrep)
-- [ ] Implement `search_files` (glob)
-- [ ] Create `tools/shell.py`
-- [ ] Implement `execute_command`
-- [ ] Create `tools/git.py`
-- [ ] Implement git status, diff, log, commit
-- [ ] Write tests for all tools
+- [x] Create `tools/search.py`
+- [x] Implement `search_content` (ripgrep)
+- [x] Implement `search_files` (glob)
+- [x] Create `tools/shell.py`
+- [x] Implement `execute_command`
+- [x] Create `tools/git.py`
+- [x] Implement git status, diff, log, commit
+- [x] Write tests for all tools
 
 #### How to Test
 
@@ -410,12 +410,12 @@ uv run pytest tests/test_tools/ -v
 
 #### Definition of Done
 
-- [ ] `search_content` returns file matches with line numbers
-- [ ] `search_files` returns matching file paths
-- [ ] `execute_command` runs shell commands and returns output
-- [ ] `git_status` shows working tree status
-- [ ] `git_log` shows recent commits
-- [ ] All unit tests pass
+- [x] `search_content` returns file matches with line numbers
+- [x] `search_files` returns matching file paths
+- [x] `execute_command` runs shell commands and returns output
+- [x] `git_status` shows working tree status
+- [x] `git_log` shows recent commits
+- [x] All unit tests pass
 
 ---
 
@@ -828,8 +828,8 @@ uv sync
 | Week 1 | ✅ | Project setup |
 | Week 2 | ✅ | LLM client |
 | Week 3 | ✅ | Tool registry + schema inference + @tool decorator |
-| Week 4 | ⬜ | File tools |
-| Week 5 | ⬜ | Search + Shell + Git |
+| Week 4 | ✅ | File tools (read, write, edit, list) + gitignore filter |
+| Week 5 | ✅ | Search + Shell + Git tools (8 tools total) |
 | Week 6 | ⬜ | Docker sandbox |
 | Week 7 | ⬜ | Agent loop |
 | Week 8 | ⬜ | TUI + Polish |
@@ -838,10 +838,10 @@ uv sync
 
 | Feature | Status | Tests |
 |---------|--------|-------|
-| File read/write/edit | ⬜ | ⬜ |
-| Search (ripgrep) | ⬜ | ⬜ |
-| Shell execution | ⬜ | ⬜ |
-| Git operations | ⬜ | ⬜ |
+| File read/write/edit | ✅ | ✅ (31 tests) |
+| Search (ripgrep) | ✅ | ✅ (16 tests) |
+| Shell execution | ✅ | ✅ (11 tests) |
+| Git operations | ✅ | ✅ (15 tests) |
 | Docker sandbox | ⬜ | ⬜ |
 | Agent loop | ⬜ | ⬜ |
 | Permission system | ⬜ | ⬜ |
@@ -853,7 +853,7 @@ uv sync
 
 | Metric | Target | Current |
 |--------|--------|---------|
-| Test coverage | >80% | 126 tests passing ✅ |
+| Test coverage | >80% | 233 tests passing ✅ |
 | Lint errors | 0 | 0 ✅ |
 | Type errors | 0 | 0 ✅ |
 | Documentation | Complete | ⬜ |
