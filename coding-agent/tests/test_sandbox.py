@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,7 +12,6 @@ import pytest
 from coding_agent.sandbox.docker import DockerSandbox, SandboxError, SandboxResult
 from coding_agent.sandbox.executor import SandboxExecutor
 from coding_agent.tools.base import ToolResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers — mock Docker objects
@@ -80,7 +77,9 @@ def _mock_docker_client(
         client.images.get.side_effect = ImageNotFound("not found")
 
     client.containers.run.return_value = container or _FakeContainer()
-    client.ping.return_value = {} if ping_ok else (_ for _ in ()).throw(Exception("no docker"))
+    client.ping.return_value = (
+        {} if ping_ok else (_ for _ in ()).throw(Exception("no docker"))
+    )
     return client
 
 
@@ -123,7 +122,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox(image="test:latest", workspace=".")
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
 
         assert sandbox._container is container
@@ -144,7 +145,9 @@ class TestDockerSandbox:
     async def test_start_image_not_found(self) -> None:
         mock_client = _mock_docker_client(image_exists=False)
 
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             sandbox = DockerSandbox(image="nonexistent:latest")
             with pytest.raises(SandboxError, match="not found"):
                 await sandbox.start()
@@ -154,7 +157,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             assert sandbox._container is not None
 
@@ -174,7 +179,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             result = await sandbox.execute("echo hello world")
 
@@ -192,7 +199,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             result = await sandbox.execute("exit 42")
 
@@ -204,7 +213,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             result = await sandbox.execute("")
 
@@ -225,7 +236,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             result = await sandbox.execute("test")
 
@@ -238,7 +251,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox(workspace="/tmp/test")
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             result = await sandbox.execute("pwd", cwd="subdir")
 
@@ -252,7 +267,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             result = await sandbox.execute("echo hi")
 
@@ -265,7 +282,9 @@ class TestDockerSandbox:
         mock_client = _mock_docker_client(container=container)
 
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             await sandbox.start()
             result = await sandbox.execute("echo ok")
 
@@ -274,7 +293,9 @@ class TestDockerSandbox:
     async def test_is_docker_available_true(self) -> None:
         mock_client = _mock_docker_client(ping_ok=True)
         sandbox = DockerSandbox()
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             assert await sandbox.is_docker_available() is True
 
     async def test_is_docker_available_false(self) -> None:
@@ -291,7 +312,9 @@ class TestDockerSandbox:
         container = _FakeContainer()
         mock_client = _mock_docker_client(container=container)
 
-        with patch("coding_agent.sandbox.docker.docker.from_env", return_value=mock_client):
+        with patch(
+            "coding_agent.sandbox.docker.docker.from_env", return_value=mock_client
+        ):
             async with DockerSandbox() as sandbox:
                 assert sandbox._container is not None
             # After exit, container should be stopped
@@ -629,7 +652,7 @@ class TestSandboxExecutorFromConfig:
             )
             mock_exec_cls.return_value = mock_executor
 
-            result = await shell.execute_command.__wrapped__("echo test")
+            await shell.execute_command.__wrapped__("echo test")
 
             # Verify sandbox path was taken
             mock_exec_cls.assert_called_once()
@@ -660,7 +683,7 @@ class TestSandboxExecutorFromConfig:
             )
             mock_exec_cls.return_value = mock_executor
 
-            result = await shell.execute_command.__wrapped__("echo test")
+            await shell.execute_command.__wrapped__("echo test")
 
             # Verify host path was taken (no sandbox)
             mock_exec_cls.assert_called_once()
@@ -701,7 +724,7 @@ class TestRealHostExecution:
     async def test_real_nonzero_exit(self) -> None:
         """Non-zero exit code on host."""
         executor = SandboxExecutor(sandbox=None, fallback_to_host=True)
-        result = await executor.execute("python -c \"import sys; sys.exit(42)\"")
+        result = await executor.execute('python -c "import sys; sys.exit(42)"')
 
         assert result.success is False
         assert result.metadata["exit_code"] == 42
@@ -710,7 +733,7 @@ class TestRealHostExecution:
         """Stderr output on host."""
         executor = SandboxExecutor(sandbox=None, fallback_to_host=True)
         result = await executor.execute(
-            'python -c "import sys; print(\'err\', file=sys.stderr)"'
+            "python -c \"import sys; print('err', file=sys.stderr)\""
         )
 
         assert "err" in result.output
@@ -722,7 +745,7 @@ class TestRealHostExecution:
         executor = SandboxExecutor(sandbox=None, fallback_to_host=True)
         with tempfile.TemporaryDirectory() as tmpdir:
             result = await executor.execute(
-                "python -c \"import os; print(os.getcwd())\"", cwd=tmpdir
+                'python -c "import os; print(os.getcwd())"', cwd=tmpdir
             )
 
             assert result.success is True
@@ -845,7 +868,7 @@ class TestRealSandboxExecution:
         try:
             await sandbox.start()
             result = await sandbox.execute(
-                'python3 -c "import sys; print(\'err\', file=sys.stderr)"'
+                "python3 -c \"import sys; print('err', file=sys.stderr)\""
             )
 
             assert "err" in result.stderr

@@ -36,6 +36,16 @@ class Settings(BaseSettings):
         default="write", description="Default permission level"
     )
 
+    # Summarization
+    summary_model: str = Field(
+        default="",
+        description="Model for context summarization (empty = use main model)",
+    )
+    summary_provider: str = Field(
+        default="",
+        description="Provider for summarization (empty = use main provider)",
+    )
+
     # Sandbox
     exec_mode: str = Field(
         default="sandbox",
@@ -112,6 +122,20 @@ class Settings(BaseSettings):
         if self.llm_provider == "openrouter":
             return self.openrouter_model
         return self.llm_model
+
+    def get_summary_model(self) -> tuple[str, str]:
+        """Return (provider, model) for summarization.
+
+        Falls back to the main provider/model when summary_model is empty.
+        """
+        provider = self.summary_provider or self.llm_provider
+        model = self.summary_model
+        if not model:
+            if provider == "openrouter":
+                model = self.openrouter_model
+            else:
+                model = self.llm_model
+        return provider, model
 
     def is_sandbox_mode(self) -> bool:
         """Return True if exec_mode is set to 'sandbox'."""
