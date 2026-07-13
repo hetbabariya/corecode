@@ -421,19 +421,22 @@ uv run pytest tests/test_tools/ -v
 
 ## Phase 3: Sandboxing (Week 6)
 
-### Week 6: Docker Sandbox
+### Week 6: Docker Sandbox ✅
 
 #### Tasks
 
-- [ ] Create `sandbox/docker.py` with Docker management
-- [ ] Implement container creation
-- [ ] Implement volume mounting
-- [ ] Implement resource limits
-- [ ] Implement command execution
-- [ ] Implement cleanup
-- [ ] Create `sandbox/executor.py` for high-level execution
-- [ ] Integrate sandbox with shell tool
-- [ ] Write tests for sandbox
+- [x] Create `sandbox/docker.py` with Docker management
+- [x] Implement persistent container with `docker exec`
+- [x] Implement volume mounting (workspace → /workspace)
+- [x] Implement resource limits (memory, CPU)
+- [x] Implement command execution with timeout
+- [x] Implement cleanup (start, stop, context manager)
+- [x] Create `sandbox/executor.py` — routes sandbox vs host
+- [x] Integrate sandbox with shell tool (lazy singleton)
+- [x] `exec_mode` config (sandbox | host) replaces `sandbox_enabled` bool
+- [x] Legacy env var migration via `model_post_init`
+- [x] Absolute path support in sandbox `cwd`
+- [x] Write tests (40 mocked + 6 real host + 6 real Docker)
 
 #### How to Test
 
@@ -515,12 +518,13 @@ uv run pytest tests/test_sandbox.py -v
 
 #### Definition of Done
 
-- [ ] `DockerSandbox.execute()` runs commands in container
-- [ ] Workspace is mounted correctly
-- [ ] Resource limits are enforced (memory, CPU)
-- [ ] Timeouts work (container killed after timeout)
-- [ ] Containers are cleaned up after execution
-- [ ] All unit tests pass
+- [x] `DockerSandbox.execute()` runs commands in container
+- [x] Workspace is mounted correctly
+- [x] Resource limits are enforced (memory, CPU)
+- [x] Timeouts work (container killed after timeout)
+- [x] Containers are cleaned up after execution
+- [x] Host fallback when Docker unavailable
+- [x] All unit tests pass (286 total)
 
 ---
 
@@ -830,7 +834,7 @@ uv sync
 | Week 3 | ✅ | Tool registry + schema inference + @tool decorator |
 | Week 4 | ✅ | File tools (read, write, edit, list) + gitignore filter |
 | Week 5 | ✅ | Search + Shell + Git tools (8 tools total) |
-| Week 6 | ⬜ | Docker sandbox |
+| Week 6 | ✅ | Docker sandbox + exec_mode toggle (52 sandbox tests) |
 | Week 7 | ⬜ | Agent loop |
 | Week 8 | ⬜ | TUI + Polish |
 
@@ -842,7 +846,7 @@ uv sync
 | Search (ripgrep) | ✅ | ✅ (16 tests) |
 | Shell execution | ✅ | ✅ (11 tests) |
 | Git operations | ✅ | ✅ (15 tests) |
-| Docker sandbox | ⬜ | ⬜ |
+| Docker sandbox | ✅ | ✅ (52 tests: 40 mocked + 6 host + 6 Docker) |
 | Agent loop | ⬜ | ⬜ |
 | Permission system | ⬜ | ⬜ |
 | Context management | ⬜ | ⬜ |
@@ -853,7 +857,7 @@ uv sync
 
 | Metric | Target | Current |
 |--------|--------|---------|
-| Test coverage | >80% | 233 tests passing ✅ |
+| Test coverage | >80% | 286 tests passing ✅ |
 | Lint errors | 0 | 0 ✅ |
 | Type errors | 0 | 0 ✅ |
 | Documentation | Complete | ⬜ |
