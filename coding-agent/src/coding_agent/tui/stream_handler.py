@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from coding_agent.agent.events import AgentEvent, EventType
@@ -11,6 +12,10 @@ from coding_agent.logging import logger
 
 if TYPE_CHECKING:
     from coding_agent.tui.app import CodingAgentApp
+    from coding_agent.tui.widgets.chat import ToolCallMessage
+
+# Tools whose results should be rendered as diffs
+_DIFF_TOOLS = {"edit_file", "write_file"}
 
 
 class StreamHandler:
@@ -26,8 +31,24 @@ class StreamHandler:
         self.app = app
         self.agent_loop = agent_loop
         self._running = False
+        self._cancel_requested = False
         self._current_task: asyncio.Task[None] | None = None
         self._current_text = ""
+        # Tool grouping: tool_name -> count
+        self._tool_counts: dict[str, int] = defaultdict(int)
+        # Track running tool messages for status updates
+        self._running_tools: dict[str, ToolCallMessage] = {}
+
+    @property
+    def running(self) -> bool:
+        """Whether the stream handler is currently processing."""
+        return self._running
+
+    def cancel(self) -> None:
+        """Request cancellation of the current stream."""
+        self._cancel_requested = True
+        if self._current_task and not self._current_task.done():
+            self._current_task.cancel()
 
     async def run(self, prompt: str) -> None:
         """Run the agent loop and update the UI with events."""
@@ -36,19 +57,28 @@ class StreamHandler:
             return
 
         self._running = True
+        self._cancel_requested = False
         self._current_text = ""
+        self._tool_counts.clear()
+        self._running_tools.clear()
+        self._current_task = asyncio.current_task()
         self.app.set_state("thinking")
+        self.app.chat_display.show_typing()
 
         try:
             async for event in self.agent_loop.process_input(prompt):
+                if self._cancel_requested:
+                    break
                 await self._handle_event(event)
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             logger.error("stream_handler_error", error=str(e))
             self.app.chat_display.add_error(str(e))
-            self.app.user_input.disabled = False
-            self.app.user_input.set_focus()
         finally:
             self._running = False
+            self._current_task = None
+            self.app.user_input.disabled = False
             self.app.set_state("idle")
             self._update_stats()
 
@@ -77,26 +107,31 @@ class StreamHandler:
         if not text:
             return
 
-        # Accumulate text for the current assistant message
+        # Reset the spinner's stall timer
+        self.app.status_bar.token_received()
+
         if not self._current_text:
             self.app.chat_display.add_assistant_text("")
 
         self._current_text += text
-
-        # Update the last assistant message
         self.app.chat_display.update_last_assistant(self._current_text)
 
     def _handle_tool_start(self, event: AgentEvent) -> None:
         """Handle tool execution start."""
-        # Reset text accumulator
         self._current_text = ""
+        self.app.status_bar.token_received()
 
         data = _extract_dict(event.data)
         tool_name = _get_str(data, "name", "unknown")
         args = _get_dict(data, "args")
+        call_id = _get_str(data, "id", "")
+        self._tool_counts[tool_name] += 1
+        if not call_id:
+            call_id = f"{tool_name}_{self._tool_counts[tool_name]}"
 
-        self.app.chat_display.add_tool_start(tool_name, args)
-        self.app.sidebar.set_state(f"running: {tool_name}")
+        msg = self.app.chat_display.add_tool_start(tool_name, args)
+        self._running_tools[call_id] = msg
+        self.app.set_state(f"running: {tool_name}")
         self.app.tool_count += 1
 
     def _handle_tool_result(self, event: AgentEvent) -> None:
@@ -104,9 +139,58 @@ class StreamHandler:
         data = _extract_dict(event.data)
         tool_name = _get_str(data, "name", "unknown")
         result = _get_str(data, "result", "")
+        call_id = _get_str(data, "id", "")
 
-        self.app.chat_display.add_tool_result(tool_name, result)
-        self.app.sidebar.set_state("thinking")
+        # Update running tool dot to success/error
+        msg = self._running_tools.pop(call_id, None) if call_id else None
+        if msg is None:
+            # Fallback: find any running tool with this name
+            for cid, _m in list(self._running_tools.items()):
+                if cid.startswith(tool_name):
+                    msg = self._running_tools.pop(cid)
+                    break
+        if msg is not None:
+            ok = not any(
+                marker in result.lower()
+                for marker in ("error:", "traceback", "exception", "failed")
+            )
+            status = "success" if ok else "error"
+            self.app.chat_display.update_tool_status(msg, status)
+
+        # Render as diff for edit_file/write_file tools — skip for large results
+        if tool_name in _DIFF_TOOLS and result and len(result) < 10_000:
+            self._render_tool_diff(tool_name, data, result)
+        else:
+            preview = result[:500] if result else ""
+            if len(result) > 500:
+                preview += "..."
+            self.app.chat_display.add_tool_result(tool_name, preview)
+
+        self.app.set_state("thinking")
+
+    def _render_tool_diff(
+        self, tool_name: str, data: dict[str, Any], result: str
+    ) -> None:
+        """Render edit_file/write_file results as a diff widget."""
+        filename = _get_str(data, "file_path", "")
+        if not filename:
+            filename = _get_str(data, "path", "")
+
+        # Try to extract old/new content from args or result
+        old_content = _get_str(data, "old_content", "")
+        new_content = _get_str(data, "new_content", "")
+        content = _get_str(data, "content", "")
+
+        if old_content and new_content:
+            self.app.chat_display.add_diff(old_content, new_content, filename)
+        elif content and old_content:
+            self.app.chat_display.add_diff(old_content, content, filename)
+        else:
+            # Fall back to result preview
+            preview = result[:500] if result else ""
+            if len(result) > 500:
+                preview += "..."
+            self.app.chat_display.add_tool_result(tool_name, preview)
 
     async def _handle_permission(self, event: AgentEvent) -> None:
         """Handle permission request — show dialog and wait for response."""
@@ -115,15 +199,15 @@ class StreamHandler:
         args = _get_dict(data, "args")
         perm_level = _get_str(data, "permission_level", "write")
 
-        # Show permission dialog
         self.app.permission_dialog.show(tool_name, args, perm_level)
-        self.app.sidebar.set_state("waiting for permission")
+        self.app.set_state("waiting for permission")
+        self.app.query_one("#help-bar").update_hints("permission")
 
-        # Wait for user response (the dialog posts PermissionDialog.Response)
         response = await self.app.wait_for_permission()
         self.app.permission_dialog.hide()
+        self.app.user_input.set_focus()
+        self.app.query_one("#help-bar").update_hints("normal")
 
-        # Feed response back to agent loop via queue callback
         if self.agent_loop.permission_callback is not None:
             if hasattr(self.agent_loop.permission_callback, "approve"):
                 if response.denied:
@@ -133,7 +217,7 @@ class StreamHandler:
                 else:
                     self.agent_loop.permission_callback.approve()  # type: ignore[union-attr]
 
-        self.app.sidebar.set_state("thinking")
+        self.app.set_state("thinking")
 
     def _handle_usage(self, event: AgentEvent) -> None:
         """Handle token usage update."""
@@ -147,29 +231,34 @@ class StreamHandler:
     def _handle_done(self) -> None:
         """Handle task completion."""
         self._current_text = ""
-        self.app.chat_display.add_status("--- Task complete ---")
-        self.app.user_input.disabled = False
-        self.app.user_input.set_focus()
+        self._flush_tool_groups()
+        self.app.chat_display.add_task_complete(
+            cost=self.app.llm_client.total_usage.estimated_cost,
+            tokens=self.app.total_tokens,
+            tools=self.app.tool_count,
+        )
 
     def _handle_error(self, event: AgentEvent) -> None:
         """Handle error event."""
         error = str(event.data) if event.data else "Unknown error"
         self.app.chat_display.add_error(error)
         self._current_text = ""
-        self.app.user_input.disabled = False
-        self.app.user_input.set_focus()
 
     def _handle_max_iterations(self) -> None:
         """Handle max iterations reached."""
         self._current_text = ""
-        self.app.chat_display.add_status("--- Max iterations reached ---")
-        self.app.user_input.disabled = False
-        self.app.user_input.set_focus()
-        self._current_text = ""
+        self.app.chat_display.add_task_max_iterations()
+
+    def _flush_tool_groups(self) -> None:
+        """Flush accumulated tool counts as grouped messages."""
+        for tool_name, count in self._tool_counts.items():
+            if count > 1:
+                self.app.chat_display.add_tool_group(tool_name, count)
+        self._tool_counts.clear()
 
     def _update_stats(self) -> None:
-        """Update sidebar with current stats."""
-        self.app.sidebar.update_stats(
+        """Update status bar with current stats."""
+        self.app.status_bar.update_stats(
             prompt_tokens=self.app.prompt_tokens,
             completion_tokens=self.app.completion_tokens,
             total_tokens=self.app.total_tokens,
