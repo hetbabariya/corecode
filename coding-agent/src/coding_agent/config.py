@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
@@ -34,7 +37,10 @@ class Settings(BaseSettings):
     )
 
     # Sandbox
-    sandbox_enabled: bool = Field(default=True, description="Enable Docker sandbox")
+    exec_mode: str = Field(
+        default="sandbox",
+        description="Command execution mode: sandbox (Docker) | host (direct)",
+    )
     sandbox_timeout: int = Field(
         default=30, description="Sandbox command timeout in seconds"
     )
@@ -44,6 +50,9 @@ class Settings(BaseSettings):
     sandbox_image: str = Field(
         default="coding-agent-sandbox:latest", description="Sandbox Docker image"
     )
+
+    # Legacy field — migrated to exec_mode in model_post_init
+    sandbox_enabled: bool | None = Field(default=None, exclude=True)
 
     # Logging
     log_level: str = Field(default="INFO", description="Log level")
@@ -55,13 +64,21 @@ class Settings(BaseSettings):
     )
 
     # Workspace
-    workspace: Path = Field(default=Path("."), description="Workspace directory")
+    workspace: Any = Field(default=".", description="Workspace directory")
 
     model_config = {
         "env_prefix": "CODING_AGENT_",
         "env_file": ".env",
         "env_file_encoding": "utf-8",
     }
+
+    def model_post_init(self, context: Any) -> None:
+        """Migrate legacy CODING_AGENT_SANDBOX_ENABLED → exec_mode."""
+        if (
+            self.sandbox_enabled is not None
+            and "exec_mode" not in self.model_fields_set
+        ):
+            self.exec_mode = "sandbox" if self.sandbox_enabled else "host"
 
     def get_api_keys(self) -> list[str]:
         """Return parsed list of API keys for the active provider.
@@ -95,3 +112,7 @@ class Settings(BaseSettings):
         if self.llm_provider == "openrouter":
             return self.openrouter_model
         return self.llm_model
+
+    def is_sandbox_mode(self) -> bool:
+        """Return True if exec_mode is set to 'sandbox'."""
+        return self.exec_mode.lower() == "sandbox"

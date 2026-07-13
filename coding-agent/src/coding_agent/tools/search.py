@@ -119,10 +119,7 @@ async def search_content(
 
 @tool(
     name="search_files",
-    description=(
-        "Find files by name/glob pattern. "
-        "Returns matching file paths."
-    ),
+    description=("Find files by name/glob pattern. Returns matching file paths."),
     permission="read",
 )
 async def search_files(

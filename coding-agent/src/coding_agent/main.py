@@ -15,7 +15,7 @@ def run(
     model: str = "gemini-2.5-flash",
     workspace: Path = Path("."),
     permission_level: str = "write",
-    sandbox: bool = True,
+    exec_mode: str = "sandbox",
     log_level: str = "INFO",
 ) -> None:
     """Start an interactive coding agent session."""
@@ -28,7 +28,7 @@ def run(
         typer.echo(f"Model: {model}")
         typer.echo(f"Workspace: {workspace.resolve()}")
         typer.echo(f"Permission level: {permission_level}")
-        typer.echo(f"Sandbox: {'enabled' if sandbox else 'disabled'}")
+        typer.echo(f"Exec mode: {exec_mode}")
     else:
         typer.echo("Interactive mode coming soon. Use --prompt to start with a task.")
 
@@ -43,7 +43,7 @@ def config() -> None:
     typer.echo(f"Max Iterations: {settings.max_iterations}")
     typer.echo(f"Max Tokens: {settings.max_tokens}")
     typer.echo(f"Permission Level: {settings.permission_level}")
-    typer.echo(f"Sandbox Enabled: {settings.sandbox_enabled}")
+    typer.echo(f"Exec Mode: {settings.exec_mode}")
     typer.echo(f"Sandbox Timeout: {settings.sandbox_timeout}s")
     typer.echo(f"Log Level: {settings.log_level}")
     typer.echo(f"DB Path: {settings.get_db_path()}")

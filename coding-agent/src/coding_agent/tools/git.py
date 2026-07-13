@@ -160,9 +160,7 @@ async def git_commit(
         return ToolResult(success=False, error=f"git add failed: {stderr}")
 
     # Commit
-    exit_code, stdout, stderr = await _run_git(
-        "commit", "-m", message, cwd=cwd
-    )
+    exit_code, stdout, stderr = await _run_git("commit", "-m", message, cwd=cwd)
     if exit_code != 0:
         return ToolResult(success=False, error=f"git commit failed: {stderr}")
 
