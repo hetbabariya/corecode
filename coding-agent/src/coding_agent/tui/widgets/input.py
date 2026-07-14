@@ -1,12 +1,12 @@
-"""User input widget — multi-line text input with submit handling and history."""
+"""User input widget — multi-line text input with submit handling."""
 
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal
+from textual.containers import Container
 from textual.events import Key
 from textual.message import Message
-from textual.widgets import Static, TextArea
+from textual.widgets import TextArea
 
 
 class SubmitTextArea(TextArea):
@@ -27,30 +27,17 @@ class SubmitTextArea(TextArea):
 
 
 class UserInput(Container):
-    """Multi-line text input with prompt character and history navigation.
+    """Multi-line text input container.
 
-    Layout::
-
-        ┌─ input-box ─────────────────────────────────┐
-        │ ❯ │ Type your message...                    │
-        └─────────────────────────────────────────────┘
-
-    Enter → submit.  Shift+Enter → newline.
-    Up/Down → navigate input history.
+    Enter or Ctrl+Enter → submit.
+    Shift+Enter → newline.
     """
 
-    def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self._history: list[str] = []
-        self._history_index: int = -1
-
     def compose(self) -> ComposeResult:
-        with Horizontal(id="input-box"):
-            yield Static("❯", id="input-prompt")
-            yield SubmitTextArea(
-                id="user-input",
-                placeholder="Type a message…",
-            )
+        yield SubmitTextArea(
+            id="user-input",
+            placeholder="Type your message... (Enter to submit, Shift+Enter for newline)",
+        )
 
     @property
     def text_area(self) -> SubmitTextArea:
@@ -68,65 +55,15 @@ class UserInput(Container):
         """Focus the text area."""
         self.text_area.focus()
 
-    # ── History ────────────────────────────────────────────
-
-    def add_to_history(self, text: str) -> None:
-        """Append text to the session history."""
-        if text and (not self._history or self._history[-1] != text):
-            self._history.append(text)
-        self._history_index = -1
-
-    def _history_up(self) -> None:
-        """Navigate to the previous history entry."""
-        if not self._history:
-            return
-        if self._history_index == -1:
-            self._history_index = len(self._history) - 1
-        elif self._history_index > 0:
-            self._history_index -= 1
-        self._load_history_entry()
-
-    def _history_down(self) -> None:
-        """Navigate to the next history entry."""
-        if not self._history:
-            return
-        if self._history_index == -1:
-            return
-        if self._history_index < len(self._history) - 1:
-            self._history_index += 1
-            self._load_history_entry()
-        else:
-            self._history_index = -1
-            self.text_area.clear()
-
-    def _load_history_entry(self) -> None:
-        """Load the current history entry into the text area."""
-        if 0 <= self._history_index < len(self._history):
-            self.text_area.text = self._history[self._history_index]
-            self.text_area.cursor_location = self.text_area.document.end
-
-    @property
-    def last_user_message(self) -> str:
-        """Return the last user message from history, or empty string."""
-        return self._history[-1] if self._history else ""
-
-    # ── Message handling ───────────────────────────────────
-
     def on_submit_text_area_submitted(self, message: SubmitTextArea.Submitted) -> None:
         """Handle submission from the text area."""
-        self.add_to_history(message.text)
         self.post_message(self.Submitted(message.text))
 
     def on_key(self, event: Key) -> None:
-        """Handle key events for history navigation."""
-        if event.key == "up" and not self.text_area.selected_text:
-            if self.text_area.cursor_location.row == 0:
-                event.prevent_default()
-                self._history_up()
-        elif event.key == "down" and not self.text_area.selected_text:
-            if self.text_area.cursor_location.row >= self.text_area.document.line_count - 1:
-                event.prevent_default()
-                self._history_down()
+        """Handle key events."""
+        if event.key == "escape":
+            event.prevent_default()
+            self.text_area.focus()
 
     class Submitted(Message):
         """Posted when the user submits input."""
