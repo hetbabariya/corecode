@@ -96,14 +96,16 @@ class TestPermissionDialog:
 
 class TestTheme:
     def test_css_is_string(self):
-        from coding_agent.tui.theme import TUI_CSS
+        from coding_agent.tui.theme import build_css
 
-        assert isinstance(TUI_CSS, str)
-        assert len(TUI_CSS) > 100
+        css = build_css()
+        assert isinstance(css, str)
+        assert len(css) > 100
 
     def test_css_has_required_selectors(self):
-        from coding_agent.tui.theme import TUI_CSS
+        from coding_agent.tui.theme import build_css
 
-        assert "#chat" in TUI_CSS
-        assert "#input-container" in TUI_CSS
-        assert "#permission-dialog" in TUI_CSS
+        css = build_css()
+        assert "#chat" in css
+        assert "#input-container" in css
+        assert "#permission-dialog" in css

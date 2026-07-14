@@ -178,7 +178,6 @@ class StreamHandler:
         self.app.chat_display.add_status("--- Max iterations reached ---")
         self.app.user_input.disabled = False
         self.app.user_input.set_focus()
-        self._current_text = ""
 
     def _handle_plan_update(self, event: AgentEvent) -> None:
         """Handle plan update (replan needed)."""

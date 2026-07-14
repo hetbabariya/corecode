@@ -25,7 +25,7 @@ class ToolCallMessage(Static):
         super().__init__(text, markup=False)
         self.tool_name = tool_name
         self.detail = detail
-        self.add_class("chat-tool")
+        self.add_class("tool-call-message")
 
 
 class ErrorMessage(Static):
@@ -75,16 +75,12 @@ class ChatDisplay(VerticalScroll):
         assistants = list(self.query(".chat-assistant"))
         if assistants:
             widget = assistants[-1]
-            # Remove old widget and add new one
-            widget.remove()
             try:
                 rendered = RichMarkdown(content)
-                new_widget = Static(rendered)
-                new_widget.add_class("chat-assistant")
-                self.mount(new_widget)
+                widget.update(rendered)
             except Exception:
-                msg = ChatMessage(role="assistant", content=content)
-                self.mount(msg)
+                widget.update(content)
+            widget.refresh(layout=False)
         self.scroll_end(animate=False)
 
     def add_tool_start(
@@ -98,14 +94,18 @@ class ChatDisplay(VerticalScroll):
                 args_str = args_str[:77] + "..."
             detail = args_str
         msg = ToolCallMessage(tool_name=tool_name, detail=detail)
+        msg.add_class("tool-call-message")
         self.mount(msg)
         self.scroll_end(animate=False)
 
-    def add_tool_result(self, tool_name: str, result: str) -> None:
+    def add_tool_result(self, tool_name: str, result: str | None = None) -> None:
         """Add a tool result message."""
-        preview = result[:200] if result else ""
-        if len(result) > 200:
-            preview += "..."
+        if result is None:
+            preview = "(no result)"
+        else:
+            preview = str(result)[:200]
+            if len(str(result)) > 200:
+                preview += "..."
         msg = ToolCallMessage(tool_name=f"{tool_name} result", detail=preview)
         self.mount(msg)
         self.scroll_end(animate=False)
@@ -119,7 +119,32 @@ class ChatDisplay(VerticalScroll):
     def add_status(self, text: str) -> None:
         """Add a status message (info, not from user/assistant)."""
         msg = Static(text)
-        msg.add_class("chat-tool")
+        msg.add_class("tool-call-message")
+        self.mount(msg)
+        self.scroll_end(animate=False)
+
+    def add_welcome(self, model_name: str) -> None:
+        """Add a welcome card with model info."""
+        welcome = Static(
+            f"Welcome! Using {model_name}\n"
+            "Type your message and press Enter to submit.\n"
+            "Shift+Enter for newline. /help for commands."
+        )
+        welcome.add_class("welcome-card")
+        self.mount(welcome)
+        self.scroll_end(animate=False)
+
+    def add_task_complete(self) -> None:
+        """Add a task complete banner."""
+        msg = Static("Task complete.")
+        msg.add_class("task-complete")
+        self.mount(msg)
+        self.scroll_end(animate=False)
+
+    def add_task_cancelled(self) -> None:
+        """Add a task cancelled banner."""
+        msg = Static("Task cancelled.")
+        msg.add_class("task-cancelled")
         self.mount(msg)
         self.scroll_end(animate=False)
 
