@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from coding_agent.logging import logger
+
 
 class Permission(Enum):
     """Permission levels for tool operations."""
@@ -94,10 +96,14 @@ class PermissionManager:
     def approve_tool(self, tool_name: str) -> None:
         """Mark a write tool as approved for this session."""
         self._approved_writes.add(tool_name)
+        logger.debug("permission_approved", tool=tool_name)
 
     def reset(self) -> None:
         """Reset all approvals (e.g. for a new session)."""
+        count = len(self._approved_writes)
         self._approved_writes.clear()
+        if count:
+            logger.debug("permission_approvals_reset", count=count)
 
     @classmethod
     def from_trust_level(cls, trust: TrustLevel) -> PermissionManager:

@@ -16,7 +16,7 @@ from coding_agent.agent.permission_callback import QueueCallback
 from coding_agent.agent.permissions import PermissionManager
 from coding_agent.config import Settings
 from coding_agent.llm.client import LLMClient
-from coding_agent.logging import get_tui_handler, setup_logging
+from coding_agent.logging import get_tui_handler, logger, setup_logging
 from coding_agent.tui.stream_handler import StreamHandler
 from coding_agent.tui.theme import TUI_CSS
 from coding_agent.tui.widgets.chat import ChatDisplay
@@ -48,6 +48,8 @@ class CodingAgentApp(App[None]):
         Ctrl+C      → quit
         Ctrl+L      → clear chat
         Ctrl+N      → new session
+        Ctrl+Z      → undo last file change
+        Ctrl+B      → view session history
         Ctrl+D      → toggle debug/log viewer panel
     """
 
@@ -58,19 +60,21 @@ class CodingAgentApp(App[None]):
         Binding("ctrl+l", "clear", "Clear Chat"),
         Binding("ctrl+r", "regenerate", "Regenerate"),
         Binding("ctrl+n", "new_session", "New Session"),
+        Binding("ctrl+z", "undo", "Undo"),
+        Binding("ctrl+b", "history", "History"),
         Binding("ctrl+d", "toggle_debug", "Debug Log"),
     ]
 
     TITLE = "Coding Agent"
     SUB_TITLE = "AI-powered coding assistant"
 
-    def __init__(self, workspace: Path | None = None) -> None:
+    def __init__(self, workspace: Path | None = None, log_level: str = "INFO") -> None:
         super().__init__()
         self.workspace = workspace or Path(".")
         self.settings = Settings()
 
-        # Initialize logging with TUI capture
-        setup_logging(level=self.settings.log_level, capture_for_tui=True)
+        # Initialize logging with TUI capture — use passed log_level (respects --verbose)
+        setup_logging(level=log_level, log_file=self.settings.log_file, capture_for_tui=True)
 
         # Build LLM client
         provider = self.settings.llm_provider
@@ -91,6 +95,13 @@ class CodingAgentApp(App[None]):
         permissions = PermissionManager()
         context = ContextManager(max_tokens=self.settings.max_tokens)
 
+        # Session persistence
+        from coding_agent.session.manager import SessionManager
+        from coding_agent.agent.memory import MemoryManager
+
+        self._session_manager = SessionManager(self.settings.get_db_path())
+        self._memory_manager = MemoryManager(self._session_manager)
+
         self.agent_loop = AgentLoop(
             llm_client=self.llm_client,
             permission_manager=permissions,
@@ -98,6 +109,8 @@ class CodingAgentApp(App[None]):
             workspace=self.workspace,
             max_iterations=self.settings.max_iterations,
             permission_callback=self._perm_callback,
+            memory_manager=self._memory_manager,
+            session_manager=self._session_manager,
         )
 
         # Stream handler
@@ -121,8 +134,17 @@ class CodingAgentApp(App[None]):
         yield PermissionDialog(id="permission-dialog")
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         """Initialize the app after mounting."""
+        # Initialize session manager (async SQLite open)
+        await self._session_manager.initialize()
+
+        logger.info(
+            "tui_app_mounted",
+            model=self.llm_client.model,
+            provider=self.llm_client.provider,
+            workspace=str(self.workspace.resolve()),
+        )
         # Set sidebar values
         self.sidebar.update_stats(
             model=self.llm_client.model,
@@ -217,9 +239,38 @@ class CodingAgentApp(App[None]):
             state="idle",
         )
         self.chat_display.add_status("New session started.")
+        logger.info("tui_new_session")
+
+    def action_undo(self) -> None:
+        """Undo the last file mutation."""
+        from coding_agent.agent.undo import UndoStack
+
+        stack = self.agent_loop.undo_stack
+        entry = stack.undo()
+        if entry is None:
+            self.chat_display.add_status("Nothing to undo.")
+            return
+        try:
+            UndoStack.apply_entry(entry, redo=False)
+            desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
+            self.chat_display.add_status(f"Undone: {desc}")
+            logger.info("tui_undo", file=entry.file_path)
+        except Exception as exc:
+            self.chat_display.add_status(f"Undo failed: {exc}")
+            logger.error("tui_undo_failed", error=str(exc))
+
+    def action_history(self) -> None:
+        """Open the session history viewer."""
+        from coding_agent.tui.screens.history import HistoryScreen
+
+        self.push_screen(HistoryScreen(workspace=self.workspace))
 
     def action_toggle_debug(self) -> None:
         """Toggle the debug log viewer panel."""
+        # Only toggle on the main screen, not on pushed screens
+        if len(self.screen_stack) > 1:
+            return
+
         self._debug_visible = not self._debug_visible
 
         if self._debug_visible:

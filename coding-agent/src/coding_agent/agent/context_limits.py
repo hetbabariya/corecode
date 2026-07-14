@@ -1,4 +1,4 @@
-"""Tool result truncation to prevent context window explosion."""
+"""Tool result truncation and large-file handling for context management."""
 
 from __future__ import annotations
 
@@ -9,6 +9,14 @@ MAX_TOOL_RESULT_TOKENS: int = 8000
 MAX_TOOL_RESULT_LINES: int = 500
 PRESERVED_HEAD_LINES: int = 50
 PRESERVED_TAIL_LINES: int = 50
+
+# Large-file instruction thresholds
+LARGE_FILE_LINES: int = 200
+LARGE_FILE_INSTRUCTION = (
+    "IMPORTANT: This file is {total} lines. You are viewing lines {start}-{end}. "
+    "Use offset and limit parameters to read other sections. "
+    "Do NOT attempt to read or edit the entire file at once."
+)
 
 
 def truncate_tool_result(
@@ -90,3 +98,21 @@ def truncate_search_results(
     omitted = len(lines) - max_results
     truncated.append(f"\n[... {omitted} more results omitted ...]")
     return "\n".join(truncated)
+
+
+def large_file_instruction(total_lines: int, returned_lines: int) -> str:
+    """Generate an instruction for the LLM when reading large files.
+
+    Returns an instruction string if the file is large and only a portion
+    was returned, empty string otherwise.
+    """
+    if total_lines <= LARGE_FILE_LINES:
+        return ""
+    if returned_lines >= total_lines:
+        return ""
+
+    return LARGE_FILE_INSTRUCTION.format(
+        total=total_lines,
+        start=1,
+        end=returned_lines,
+    )

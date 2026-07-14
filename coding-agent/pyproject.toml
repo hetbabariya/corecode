@@ -26,6 +26,10 @@ dev = [
     "pyright>=1.1.367",
     "pre-commit>=3.7.0",
 ]
+ast = [
+    "tree-sitter>=0.23.0",
+    "tree-sitter-languages>=1.10.0",
+]
 
 [project.scripts]
 coding-agent = "coding_agent.main:app"

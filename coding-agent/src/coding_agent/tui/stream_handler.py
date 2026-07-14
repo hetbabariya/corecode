@@ -109,9 +109,6 @@ class StreamHandler:
         self.app.sidebar.set_state(f"running: {tool_name}")
         self.app.tool_count += 1
 
-        # Verbose logging: full args
-        logger.debug("tool_start", name=tool_name, args=args)
-
     def _handle_tool_result(self, event: AgentEvent) -> None:
         """Handle tool execution result."""
         data = _extract_dict(event.data)
@@ -120,9 +117,6 @@ class StreamHandler:
 
         self.app.chat_display.add_tool_result(tool_name, result)
         self.app.sidebar.set_state("thinking")
-
-        # Verbose logging: full result
-        logger.debug("tool_result", name=tool_name, result=result[:500], total=len(result))
 
     async def _handle_permission(self, event: AgentEvent) -> None:
         """Handle permission request — show dialog and wait for response."""
@@ -159,14 +153,6 @@ class StreamHandler:
             self.app.completion_tokens = _get_int(data, "completion_tokens")
             self.app.total_tokens = _get_int(data, "total_tokens")
             self._update_stats()
-
-            # Verbose logging
-            logger.debug(
-                "usage_update",
-                prompt=self.app.prompt_tokens,
-                completion=self.app.completion_tokens,
-                total=self.app.total_tokens,
-            )
 
     def _handle_done(self) -> None:
         """Handle task completion."""

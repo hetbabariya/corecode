@@ -7,8 +7,7 @@ error context, and verification feedback.
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from coding_agent.agent.context import ContextManager, ConversationMessage
@@ -97,6 +96,7 @@ class SmartContextEngine:
         """
         slices: list[ContextSlice] = []
         token_budget = self._max_context_tokens
+        excluded: list[str] = []
 
         # 1. Recent messages (always include)
         recent = self._get_recent_messages(count=6)
@@ -123,6 +123,8 @@ class SmartContextEngine:
                     token_estimate=est,
                 ))
                 token_budget -= est
+            else:
+                excluded.append("tool_result")
 
         # 3. Error context (if errors exist)
         if include_error_context and self._error_tracker:
@@ -138,6 +140,8 @@ class SmartContextEngine:
                         token_estimate=est,
                     ))
                     token_budget -= est
+                else:
+                    excluded.append("error")
 
         # 4. Verification feedback (if failures)
         if include_verification and self._verification_results:
@@ -153,6 +157,8 @@ class SmartContextEngine:
                         token_estimate=est,
                     ))
                     token_budget -= est
+                else:
+                    excluded.append("verification")
 
         # 5. Plan context (if enabled)
         if include_plan and plan_text:
@@ -165,9 +171,12 @@ class SmartContextEngine:
                     token_estimate=est,
                 ))
                 token_budget -= est
+            else:
+                excluded.append("plan")
 
         # Sort by priority descending
         slices.sort(key=lambda s: s.priority, reverse=True)
+
         return slices
 
     def format_selected_context(self, slices: list[ContextSlice]) -> str:

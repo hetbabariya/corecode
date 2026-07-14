@@ -17,6 +17,8 @@ import platform
 import subprocess
 from pathlib import Path
 
+from coding_agent.logging import logger
+
 # Marker that separates static (cacheable) from dynamic (per-session) content.
 DYNAMIC_BOUNDARY = "__DYNAMIC_BOUNDARY__"
 
@@ -128,6 +130,45 @@ def _task_execution_section() -> str:
 - Only switch tactics if the approach is fundamentally wrong"""
 
 
+def _get_model_tier(model: str) -> str:
+    """Determine model capability tier from model name.
+
+    Returns one of: "fast", "balanced", "advanced".
+    """
+    model_lower = model.lower()
+    # Fast tier — smaller, cheaper models
+    if any(k in model_lower for k in ("flash", "mini", "lite", "haiku", "small")):
+        return "fast"
+    # Advanced tier — largest, most capable models
+    if any(k in model_lower for k in ("ultra", "pro", "o1", "o3", "opus", "sonnet")):
+        return "advanced"
+    # Default
+    return "balanced"
+
+
+def _adaptive_notes_section(model_tier: str) -> str:
+    """Return model-tier-specific guidance notes."""
+    if model_tier == "fast":
+        return """\
+## Model Notes (Fast Tier)
+
+You are a fast, efficient model. Focus on:
+- Concise responses — get to the point
+- Single-pass edits when possible
+- Skip verbose explanations unless asked
+- Prioritize speed over thoroughness"""
+    elif model_tier == "advanced":
+        return """\
+## Model Notes (Advanced Tier)
+
+You are a highly capable model. Leverage your strengths:
+- Deep analysis before acting
+- Consider edge cases and side effects
+- Suggest architectural improvements when relevant
+- Be thorough but still prefer minimal changes"""
+    return ""  # balanced tier uses default behavior
+
+
 def _safety_section() -> str:
     return """\
 ## Safety
@@ -223,8 +264,14 @@ A good plan has:
 Don't over-plan. For simple tasks (read a file, make one edit), skip planning and just act."""
 
 
-def build_static_prompt() -> str:
-    """Build the complete static (cacheable) prompt."""
+def build_static_prompt(model: str = "") -> str:
+    """Build the complete static (cacheable) prompt.
+
+    Parameters
+    ----------
+    model:
+        Model name for adaptive tier detection. Empty uses "balanced".
+    """
     sections = [
         _identity_section(),
         _core_principles_section(),
@@ -236,6 +283,14 @@ def build_static_prompt() -> str:
         _error_handling_section(),
         _planning_section(),
     ]
+
+    # Adaptive notes based on model tier
+    if model:
+        tier = _get_model_tier(model)
+        notes = _adaptive_notes_section(tier)
+        if notes:
+            sections.append(notes)
+
     return "\n\n".join(sections)
 
 
@@ -346,7 +401,7 @@ def build_system_prompt(
     workspace_index_summary:
         Optional workspace file tree from WorkspaceIndex.to_summary().
     """
-    static = build_static_prompt()
+    static = build_static_prompt(model=model)
 
     dynamic_parts: list[str] = []
 
@@ -376,9 +431,20 @@ def build_system_prompt(
 
     if dynamic_parts:
         dynamic = "\n\n".join(dynamic_parts)
-        return f"{static}\n\n{DYNAMIC_BOUNDARY}\n\n{dynamic}"
+        result = f"{static}\n\n{DYNAMIC_BOUNDARY}\n\n{dynamic}"
+    else:
+        result = static
 
-    return static
+    logger.debug(
+        "system_prompt_built",
+        total_length=len(result),
+        static_length=len(static),
+        dynamic_sections=len(dynamic_parts),
+        has_plan=bool(plan_prompt),
+        has_memory=bool(memory_content),
+        has_workspace_index=bool(workspace_index_summary),
+    )
+    return result
 
 
 # ============================================================================

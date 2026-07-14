@@ -87,8 +87,9 @@ async def execute_command(
         return ToolResult(success=False, error="Command cannot be empty")
 
     executor = await _get_executor()
-    return await executor.execute(
+    result = await executor.execute(
         command,
         timeout=timeout,
         cwd=cwd,
     )
+    return result

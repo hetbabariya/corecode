@@ -1,12 +1,13 @@
 """Session persistence using SQLite.
 
-Provides CRUD operations for sessions, messages, and tool operations
-to enable history, resume, and undo functionality.
+Provides CRUD operations for sessions, messages, tool operations,
+and cross-session memory.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,9 +15,8 @@ from typing import Any
 
 import aiosqlite
 
-from coding_agent.logging import logger
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -58,9 +58,28 @@ CREATE TABLE IF NOT EXISTS operations (
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL DEFAULT '',
+    memory_type TEXT NOT NULL DEFAULT 'semantic',
+    content TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    session_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_operations_session ON operations(session_id);
+CREATE INDEX IF NOT EXISTS idx_memory_workspace ON memory(workspace);
+CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(memory_type);
 """
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -104,6 +123,30 @@ class OperationRecord:
     created_at: str = ""
 
 
+@dataclass(frozen=True)
+class MemoryRecord:
+    """A single memory entry."""
+
+    id: int
+    workspace: str
+    memory_type: str
+    content: str
+    tags: list[str]
+    session_id: str | None
+    created_at: str
+    updated_at: str
+
+
+def _json_dumps(obj: object) -> str:
+    """Shortcut to JSON-serialise a value."""
+    return json.dumps(obj, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Session Manager
+# ---------------------------------------------------------------------------
+
+
 class SessionManager:
     """Async SQLite-backed session persistence.
 
@@ -131,7 +174,6 @@ class SessionManager:
         self._db = await aiosqlite.connect(str(self._db_path))
         await self._db.executescript(_SCHEMA_SQL)
         await self._db.commit()
-        logger.info("session_db_initialized", path=str(self._db_path))
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -150,8 +192,6 @@ class SessionManager:
         workspace: str = "",
     ) -> str:
         """Create a new session and return its ID."""
-        import uuid
-
         session_id = uuid.uuid4().hex[:12]
         now = datetime.now(UTC).isoformat()
         assert self._db is not None
@@ -161,7 +201,6 @@ class SessionManager:
             (session_id, now, now, model, provider, workspace),
         )
         await self._db.commit()
-        logger.info("session_created", session_id=session_id, model=model)
         return session_id
 
     async def list_sessions(self, limit: int = 50) -> list[SessionInfo]:
@@ -336,3 +375,137 @@ class SessionManager:
             )
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Memory CRUD
+    # ------------------------------------------------------------------
+
+    async def save_memory(
+        self,
+        content: str,
+        *,
+        memory_type: str = "semantic",
+        workspace: str = "",
+        tags: list[str] | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """Insert a memory record and return its id."""
+        assert self._db is not None
+        now = datetime.now(UTC).isoformat()
+        cursor = await self._db.execute(
+            "INSERT INTO memory "
+            "(workspace, memory_type, content, tags, session_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                workspace,
+                memory_type,
+                content,
+                _json_dumps(tags or []),
+                session_id,
+                now,
+                now,
+            ),
+        )
+        await self._db.commit()
+        return cursor.lastrowid or 0
+
+    async def get_memories(
+        self,
+        *,
+        workspace: str = "",
+        memory_type: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[MemoryRecord]:
+        """Return memory records, newest first."""
+        assert self._db is not None
+        query = (
+            "SELECT id, workspace, memory_type, content, tags, "
+            "session_id, created_at, updated_at "
+            "FROM memory WHERE 1=1"
+        )
+        params: list[str | int] = []
+        if workspace:
+            query += " AND workspace = ?"
+            params.append(workspace)
+        if memory_type:
+            query += " AND memory_type = ?"
+            params.append(memory_type)
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        cursor = await self._db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [
+            MemoryRecord(
+                id=r[0],
+                workspace=r[1],
+                memory_type=r[2],
+                content=r[3],
+                tags=json.loads(r[4]) if r[4] else [],
+                session_id=r[5],
+                created_at=r[6],
+                updated_at=r[7],
+            )
+            for r in rows
+        ]
+
+    async def search_memories(
+        self,
+        query: str,
+        *,
+        workspace: str = "",
+        memory_type: str | None = None,
+        limit: int = 10,
+    ) -> list[MemoryRecord]:
+        """Simple LIKE-based search across memory content."""
+        assert self._db is not None
+        sql = (
+            "SELECT id, workspace, memory_type, content, tags, "
+            "session_id, created_at, updated_at "
+            "FROM memory WHERE content LIKE ?"
+        )
+        params: list[str | int] = [f"%{query}%"]
+        if workspace:
+            sql += " AND workspace = ?"
+            params.append(workspace)
+        if memory_type:
+            sql += " AND memory_type = ?"
+            params.append(memory_type)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [
+            MemoryRecord(
+                id=r[0],
+                workspace=r[1],
+                memory_type=r[2],
+                content=r[3],
+                tags=json.loads(r[4]) if r[4] else [],
+                session_id=r[5],
+                created_at=r[6],
+                updated_at=r[7],
+            )
+            for r in rows
+        ]
+
+    async def delete_memory(self, memory_id: int) -> bool:
+        """Delete a memory record by id. Returns True if deleted."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "DELETE FROM memory WHERE id = ?",
+            (memory_id,),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def update_memory(self, memory_id: int, content: str) -> bool:
+        """Update a memory's content and updated_at timestamp."""
+        assert self._db is not None
+        now = datetime.now(UTC).isoformat()
+        cursor = await self._db.execute(
+            "UPDATE memory SET content = ?, updated_at = ? WHERE id = ?",
+            (content, now, memory_id),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0

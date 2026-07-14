@@ -8,11 +8,14 @@ for basic workspace navigation.
 from __future__ import annotations
 
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from coding_agent.logging import logger
 
 
 # Directories always excluded from indexing
@@ -132,6 +135,7 @@ class WorkspaceIndex:
             Stop scanning after this many files (safety limit).
         """
         workspace = workspace.resolve()
+        scan_start = time.monotonic()
         tree: dict[str, list[str]] = {}
         lang_counter: Counter[str] = Counter()
         total_files = 0
@@ -185,6 +189,16 @@ class WorkspaceIndex:
         self.total_files = total_files
         self.total_lines = total_lines
         self.last_scanned = datetime.now(timezone.utc)
+
+        scan_duration = (time.monotonic() - scan_start) * 1000
+        top_langs = list(self.languages.items())[:5]
+        logger.info(
+            "workspace_scan_complete",
+            files=total_files,
+            dirs=len(tree),
+            duration_ms=round(scan_duration, 1),
+            languages=top_langs,
+        )
 
     # ------------------------------------------------------------------
     # Incremental updates

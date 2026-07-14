@@ -39,23 +39,29 @@ def run(
     Permission modes: auto (default), confirm, deny.
     Use --verbose/-v for debug logging. Use --log-file to write logs to a file.
     """
+    from coding_agent.config import Settings
     from coding_agent.logging import setup_logging
 
     effective_level = "DEBUG" if verbose else log_level
+
+    # Fall back to config's log_file when not passed via CLI
+    if log_file is None:
+        log_file = Settings().log_file
+
     setup_logging(level=effective_level, log_file=log_file)
 
     if not prompt:
-        _launch_tui(workspace)
+        _launch_tui(workspace, log_level=effective_level)
         return
 
     asyncio.run(_run_agent(prompt, workspace, permission))
 
 
-def _launch_tui(workspace: Path) -> None:
+def _launch_tui(workspace: Path, log_level: str = "INFO") -> None:
     """Launch the Textual TUI application."""
     from coding_agent.tui.app import CodingAgentApp
 
-    app = CodingAgentApp(workspace=workspace)
+    app = CodingAgentApp(workspace=workspace, log_level=log_level)
     app.run()
 
 
@@ -110,6 +116,14 @@ async def _run_agent(
     permissions = PermissionManager()
     context = ContextManager(max_tokens=settings.max_tokens)
 
+    # Session persistence + memory
+    from coding_agent.session.manager import SessionManager
+    from coding_agent.agent.memory import MemoryManager
+
+    session_mgr = SessionManager(settings.get_db_path())
+    await session_mgr.initialize()
+    memory_mgr = MemoryManager(session_mgr)
+
     agent = AgentLoop(
         llm_client=llm_client,
         permission_manager=permissions,
@@ -118,6 +132,8 @@ async def _run_agent(
         max_iterations=settings.max_iterations,
         permission_callback=perm_callback,
         summary_llm_client=summary_client,
+        memory_manager=memory_mgr,
+        session_manager=session_mgr,
     )
 
     # Stream events to terminal
@@ -150,6 +166,9 @@ async def _run_agent(
     )
     print(f"  Cost: ${usage.estimated_cost:.4f}")
 
+    # Cleanup
+    await session_mgr.close()
+
 
 @app.command()
 def config() -> None:
@@ -176,6 +195,40 @@ def version() -> None:
     typer.echo("coding-agent v0.1.0")
     typer.echo("Python 3.12+")
     typer.echo("Built with Textual, Google GenAI, Docker")
+
+
+@app.command()
+def history(
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of sessions to show"),
+) -> None:
+    """List past session history."""
+    import asyncio
+    from coding_agent.config import Settings
+    from coding_agent.session.manager import SessionManager
+
+    settings = Settings()
+    db_path = settings.get_db_path()
+    manager = SessionManager(db_path)
+
+    async def _list() -> None:
+        await manager.initialize()
+        sessions = await manager.list_sessions(limit=limit)
+        await manager.close()
+
+        if not sessions:
+            typer.echo("No session history found.")
+            return
+
+        typer.echo(f"{'ID':<14} {'Date':<22} {'Model':<30} {'Tokens':>10} {'Cost':>10}")
+        typer.echo("-" * 90)
+        for s in sessions:
+            date = s.created_at[:19].replace("T", " ")
+            tokens = f"{s.total_tokens:,}" if s.total_tokens else "-"
+            cost = f"${s.total_cost:.4f}" if s.total_cost else "-"
+            model_str = f"{s.model}" if s.model else "-"
+            typer.echo(f"{s.id:<14} {date:<22} {model_str:<30} {tokens:>10} {cost:>10}")
+
+    asyncio.run(_list())
 
 
 if __name__ == "__main__":

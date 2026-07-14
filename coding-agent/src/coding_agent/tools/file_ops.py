@@ -11,9 +11,12 @@ import aiofiles
 import pathspec
 import pathspec.patterns.gitignore  # noqa: F401  # type: ignore[reportUnusedImport]  — registers gitignore factory
 
+from coding_agent.agent.ast_check import validate_syntax
 from coding_agent.logging import logger
 from coding_agent.tools.base import ToolResult
 from coding_agent.tools.registry import tool
+from coding_agent.tools.undo import get_undo_stack
+from coding_agent.agent.undo import UndoEntry
 
 # Directories always excluded from listing
 _DEFAULT_EXCLUDES = {
@@ -25,6 +28,19 @@ _DEFAULT_EXCLUDES = {
     ".ruff_cache",
     ".pyright",
 }
+
+
+def _push_undo(tool_name: str, file_path: str, before: str, after: str, desc: str = "") -> None:
+    """Push an undo entry if the undo stack is available."""
+    stack = get_undo_stack()
+    if stack is not None:
+        stack.push(UndoEntry(
+            tool_name=tool_name,
+            file_path=file_path,
+            before=before,
+            after=after,
+            description=desc,
+        ))
 
 
 class GitignoreFilter:
@@ -168,6 +184,14 @@ async def write_file(path: str, content: str) -> ToolResult:
     """Create or overwrite a file with the given content."""
     p = Path(path).resolve()
 
+    # Capture before-state for undo
+    before = ""
+    if p.exists() and p.is_file():
+        try:
+            before = p.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -179,12 +203,22 @@ async def write_file(path: str, content: str) -> ToolResult:
     except OSError as exc:
         return ToolResult(success=False, error=f"Cannot write file: {exc}")
 
+    # Push undo entry
+    _push_undo("write_file", str(p), before, content, f"write {p.name}")
+
     byte_count = len(content.encode("utf-8"))
     logger.debug("write_file", path=str(p), bytes=byte_count)
+
+    # AST validation
+    is_valid, err_msg = validate_syntax(content, str(p))
+    output = f"Successfully wrote {byte_count} bytes to {p}"
+    if not is_valid:
+        output += f"\n\nWARNING: Syntax issue detected — {err_msg}"
+
     return ToolResult(
         success=True,
-        output=f"Successfully wrote {byte_count} bytes to {p}",
-        metadata={"path": str(p), "bytes_written": byte_count},
+        output=output,
+        metadata={"path": str(p), "bytes_written": byte_count, "syntax_valid": is_valid},
     )
 
 
@@ -225,14 +259,24 @@ async def edit_file(path: str, old_text: str, new_text: str) -> ToolResult:
     except OSError as exc:
         return ToolResult(success=False, error=f"Cannot write file: {exc}")
 
+    # Push undo entry
+    _push_undo("edit_file", str(p), text, new_content, f"edit {p.name}")
+
+    # AST validation
+    is_valid, err_msg = validate_syntax(new_content, str(p))
+    output = f"Successfully edited {p}"
+    if not is_valid:
+        output += f"\n\nWARNING: Syntax issue detected — {err_msg}"
+
     logger.debug("edit_file", path=str(p))
     return ToolResult(
         success=True,
-        output=f"Successfully edited {p}",
+        output=output,
         metadata={
             "path": str(p),
             "old_preview": old_text[:120],
             "new_preview": new_text[:120],
+            "syntax_valid": is_valid,
         },
     )
 
@@ -445,11 +489,20 @@ async def apply_patch(path: str, patch: str) -> ToolResult:
     except OSError as exc:
         return ToolResult(success=False, error=f"Cannot write file: {exc}")
 
+    # Push undo entry
+    _push_undo("apply_patch", str(p), text, new_content, f"patch {p.name} ({len(hunks)} hunks)")
+
+    # AST validation
+    is_valid, err_msg = validate_syntax(new_content, str(p))
+    output = f"Successfully applied {len(hunks)} hunk(s) to {p}"
+    if not is_valid:
+        output += f"\n\nWARNING: Syntax issue detected — {err_msg}"
+
     logger.debug("apply_patch", path=str(p), hunks=len(hunks))
     return ToolResult(
         success=True,
-        output=f"Successfully applied {len(hunks)} hunk(s) to {p}",
-        metadata={"path": str(p), "hunks_applied": len(hunks)},
+        output=output,
+        metadata={"path": str(p), "hunks_applied": len(hunks), "syntax_valid": is_valid},
     )
 
 
@@ -486,6 +539,8 @@ async def multi_edit(path: str, edits: list[dict[str, str]]) -> ToolResult:
     except OSError as exc:
         return ToolResult(success=False, error=f"Cannot read file: {exc}")
 
+    original_text = text
+
     # Validate all old_text values exist before applying any
     for i, edit in enumerate(edits):
         old_text = edit.get("old_text", "")
@@ -515,9 +570,18 @@ async def multi_edit(path: str, edits: list[dict[str, str]]) -> ToolResult:
     except OSError as exc:
         return ToolResult(success=False, error=f"Cannot write file: {exc}")
 
+    # Push undo entry
+    _push_undo("multi_edit", str(p), original_text, text, f"multi-edit {p.name} ({len(edits)} edits)")
+
+    # AST validation
+    is_valid, err_msg = validate_syntax(text, str(p))
+    output = f"Successfully applied {len(edits)} edit(s) to {p}"
+    if not is_valid:
+        output += f"\n\nWARNING: Syntax issue detected — {err_msg}"
+
     logger.debug("multi_edit", path=str(p), edits=len(edits))
     return ToolResult(
         success=True,
-        output=f"Successfully applied {len(edits)} edit(s) to {p}",
-        metadata={"path": str(p), "edits_applied": len(edits)},
+        output=output,
+        metadata={"path": str(p), "edits_applied": len(edits), "syntax_valid": is_valid},
     )

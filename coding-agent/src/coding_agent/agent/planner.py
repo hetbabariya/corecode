@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from coding_agent.logging import logger
+
 
 class StepStatus(str, Enum):
     PENDING = "pending"
@@ -124,6 +126,7 @@ class PlanManager:
             steps=plan_steps,
             status=PlanStatus.EXECUTING,
         )
+        logger.info("plan_created", goal=goal, steps=len(steps))
         return self._plan
 
     def start_step(self, index: int) -> PlanStep:
@@ -157,6 +160,15 @@ class PlanManager:
         if all(s.status in (StepStatus.DONE, StepStatus.IN_PROGRESS) for s in self._plan.steps):
             if all(s.status == StepStatus.DONE for s in self._plan.steps):
                 self._plan.status = PlanStatus.COMPLETED
+                logger.info("plan_completed", goal=self._plan.goal, steps=len(self._plan.steps))
+            else:
+                logger.debug(
+                    "plan_step_completed",
+                    step=index,
+                    description=step.description,
+                    completed=len(self._plan.completed_steps),
+                    total=len(self._plan.steps),
+                )
 
         return step
 
@@ -167,6 +179,7 @@ class PlanManager:
         step = self._plan.steps[index]
         step.status = StepStatus.FAILED
         step.result = result
+        logger.warning("plan_step_failed", step=index, description=step.description, result=result[:200])
         return step
 
     def needs_replan(self) -> bool:

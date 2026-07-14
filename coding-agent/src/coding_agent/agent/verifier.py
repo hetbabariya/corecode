@@ -96,13 +96,17 @@ class PostEditVerifier:
         result = VerificationResult(file_path=str(file_path))
 
         if not file_path.exists():
+            logger.debug("verify_file_not_found", path=str(file_path))
             return result
 
         ext = file_path.suffix.lower()
         language = _EXT_TO_CHECKER.get(ext)
 
         if language is None:
+            logger.debug("verify_unsupported_ext", path=str(file_path), ext=ext)
             return result
+
+        logger.info("verify_started", path=str(file_path), language=language)
 
         # Run checks concurrently
         checks = await asyncio.gather(
@@ -112,6 +116,26 @@ class PostEditVerifier:
         )
 
         result.checks = [c for c in checks if c is not None]
+
+        for check in result.checks:
+            logger.debug(
+                "verify_check_result",
+                path=str(file_path),
+                tool=check.tool,
+                passed=check.passed,
+                duration_ms=round(check.duration_ms, 1),
+            )
+
+        if result.all_passed:
+            logger.info("verify_passed", path=str(file_path), checks=len(result.checks))
+        else:
+            logger.warning(
+                "verify_failed",
+                path=str(file_path),
+                failed=len(result.failed_checks),
+                checks=len(result.checks),
+            )
+
         return result
 
     async def _check_syntax(

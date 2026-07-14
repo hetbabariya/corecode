@@ -6,6 +6,8 @@ from typing import Any
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+from coding_agent.logging import logger
+
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables."""
@@ -102,6 +104,16 @@ class Settings(BaseSettings):
             and "exec_mode" not in self.model_fields_set
         ):
             self.exec_mode = "sandbox" if self.sandbox_enabled else "host"
+
+        logger.debug(
+            "config_loaded",
+            provider=self.llm_provider,
+            model=self.get_active_model(),
+            exec_mode=self.exec_mode,
+            max_iterations=self.max_iterations,
+            max_tokens=self.max_tokens,
+            log_level=self.log_level,
+        )
 
     def get_api_keys(self) -> list[str]:
         """Return parsed list of API keys for the active provider.

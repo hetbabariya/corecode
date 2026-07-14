@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from coding_agent.logging import logger
+
 
 class ErrorCategory(str, Enum):
     """Classification of errors for recovery strategy."""
@@ -103,8 +105,16 @@ class ErrorTracker:
         # Track consecutive errors per tool
         if not success:
             self._consecutive_errors[name] = self._consecutive_errors.get(name, 0) + 1
+            logger.debug(
+                "error_recorded",
+                tool=name,
+                error=error[:200],
+                consecutive=self._consecutive_errors[name],
+            )
         else:
-            self._consecutive_errors.pop(name, None)
+            was_failing = self._consecutive_errors.pop(name, None)
+            if was_failing:
+                logger.debug("error_resolved", tool=name)
 
     def is_stuck(self) -> bool:
         """Return True if the agent appears stuck.
@@ -171,23 +181,29 @@ class ErrorTracker:
         # Too many stuck cycles → ask user
         if self._stuck_count >= 3:
             self._ask_user_count += 1
+            logger.warning("error_stuck_ask_user", tool=last.name, stuck_count=self._stuck_count)
             return RetryStrategy.ASK_USER
 
         # Stuck but not yet at ask_user threshold → replan
         if self._stuck_count >= 2:
+            logger.warning("error_stuck_replan", tool=last.name, stuck_count=self._stuck_count)
             return RetryStrategy.REPLAN
 
         # Classify the error
         category = self.categorize_error(last.error)
+        strategy = {
+            ErrorCategory.TRANSIENT: RetryStrategy.RETRY,
+            ErrorCategory.PERMANENT: RetryStrategy.ALTERNATIVE,
+            ErrorCategory.LOGIC: RetryStrategy.REPLAN,
+        }.get(category, RetryStrategy.ALTERNATIVE)
 
-        if category == ErrorCategory.TRANSIENT:
-            return RetryStrategy.RETRY
-        elif category == ErrorCategory.PERMANENT:
-            return RetryStrategy.ALTERNATIVE
-        elif category == ErrorCategory.LOGIC:
-            return RetryStrategy.REPLAN
-        else:
-            return RetryStrategy.ALTERNATIVE
+        logger.debug(
+            "error_strategy_suggested",
+            tool=last.name,
+            category=category.value,
+            strategy=strategy.value,
+        )
+        return strategy
 
     def categorize_error(self, error: str) -> ErrorCategory:
         """Classify an error message into a category."""

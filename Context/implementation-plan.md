@@ -14,6 +14,16 @@ Each phase is ordered by dependency and ROI. No phase depends on something that 
 
 **Expected score after:** 3.5 → 5/10
 
+**Status: ✅ COMPLETE (7/7)**
+
+- [x] 1.1 Fix Gemini System Prompt Bug
+- [x] 1.2 tiktoken-Based Token Counting
+- [x] 1.3 Tool Result Truncation
+- [x] 1.4 Parallel Tool Execution
+- [x] 1.5 Streaming Tool Call Emission
+- [x] 1.6 Session Persistence (SQLite)
+- [x] 1.7 Cost & Time Budget Limits
+
 ---
 
 ### 1.1 Fix Gemini System Prompt Bug [CRITICAL]
@@ -182,6 +192,16 @@ Each phase is ordered by dependency and ROI. No phase depends on something that 
 
 **Expected score after:** 5 → 7/10
 
+**Status: ✅ COMPLETE (7/7)**
+
+- [x] 2.1 Workspace Index (File Tree + Basic Symbols)
+- [x] 2.2 Planning System (Create/Update/Query Plans)
+- [x] 2.3 Post-Edit Verification
+- [x] 2.4 Error Recovery (Retry/Fallback/Graceful Degradation)
+- [x] 2.5 Smart Context Engine (File Prioritization + Summarization)
+- [x] 2.6 Stuck Detection (Loop Detection + User Escalation)
+- [x] 2.7 Apply-Patch Tool (Multi-File Edits + AST-Aware)
+
 ---
 
 ### 2.1 Workspace Index (File Tree + Basic Symbols)
@@ -345,6 +365,12 @@ Each phase is ordered by dependency and ROI. No phase depends on something that 
 **Complexity:** Medium (6-8 hours)
 **Impact:** High (preserves context for real work)
 
+**Implementation Notes (Gap Fill):**
+- SmartContextEngine wired into loop.py — records tool results, verification, errors
+- Large-file instruction injection in `_process_tool_result` when read_file returns partial content
+- Progressive threshold summarization: 70% (log), 85% (summarize), 95% (aggressive + warning)
+- Context engine cleared on reset
+
 ---
 
 ### 2.6 Stuck Detection & Backtracking
@@ -396,6 +422,13 @@ Each phase is ordered by dependency and ROI. No phase depends on something that 
 **Complexity:** Medium (6-8 hours)
 **Impact:** High (more reliable editing)
 
+**Implementation Notes (Gap Fill):**
+- AST validation via new `agent/ast_check.py` module
+- Uses tree-sitter for supported languages when available, falls back to `ast.parse` for Python, bracket matching for others
+- Validation runs after every write_file, edit_file, apply_patch, multi_edit
+- Syntax warnings included in tool output but don't block the edit (soft validation)
+- `tree-sitter` and `tree-sitter-languages` added as optional `[ast]` dependency
+
 ---
 
 ## Phase 3: Memory & Learning (Week 7-9)
@@ -403,6 +436,13 @@ Each phase is ordered by dependency and ROI. No phase depends on something that 
 **Goal:** Make the agent remember things across sessions. Learn project conventions. Support undo.
 
 **Expected score after:** 7 → 8.5/10
+
+**Status: ✅ COMPLETE (4/4)**
+
+- [x] 3.1 Cross-Session Memory
+- [x] 3.2 Undo/Redo System
+- [x] 3.3 Session History Viewer
+- [x] 3.4 Adaptive System Prompt
 
 ---
 
@@ -528,6 +568,18 @@ Each phase is ordered by dependency and ROI. No phase depends on something that 
 **Goal:** Make it production-ready. Add extensibility, security, monitoring, and polish.
 
 **Expected score after:** 8.5 → 9.5/10
+
+**Status: 🔄 IN PROGRESS (0/9)**
+
+- [ ] 4.1 Prompt Caching
+- [ ] 4.2 Anthropic SDK
+- [ ] 4.3 MCP Integration
+- [ ] 4.4 Sub-Agent Orchestration
+- [ ] 4.5 Network-Isolated Sandbox
+- [ ] 4.6 Structured Logging & Monitoring
+- [ ] 4.7 TUI Polish
+- [ ] 4.8 Integration Test Suite
+- [ ] 4.9 Documentation
 
 ---
 
@@ -843,9 +895,411 @@ Phase 4 (Production)  ←── depends on Phase 2
 
 ---
 
+## Phase 5: Advanced Agent Capabilities (Week 15-20)
+
+**Goal:** Transform from a coding tool into an autonomous development partner. Full Git workflow, multi-modal understanding, custom agents, plugin ecosystem, team collaboration.
+
+**Expected score after:** 9.5 → 9.8/10
+
+**Status: ⬜ PLANNED (0/8)**
+
+- [ ] 5.1 Full Git Integration
+- [ ] 5.2 Multi-Modal Understanding
+- [ ] 5.3 Custom Agent Definitions
+- [ ] 5.4 Plugin System
+- [ ] 5.5 Team Collaboration
+- [ ] 5.6 Autonomous Background Workflows
+- [ ] 5.7 Code Intelligence & Impact Analysis
+- [ ] 5.8 Interactive Code Review
+
+---
+
+### 5.1 Full Git Integration
+
+**Why:** Currently the agent can only do `git_commit`. Real development requires full Git workflow — branching, diffing, merging, rebasing, conflict resolution, PR creation.
+
+**What to build:**
+- New module `tools/git.py` — comprehensive Git tools:
+  - `git_status` — current branch, staged/unstaged changes
+  - `git_diff` — diff of staged or specific files
+  - `git_log` — recent commits with messages
+  - `git_branch` — list/create/switch branches
+  - `git_commit` — commit with message (already exists, enhance)
+  - `git_push` / `git_pull` — remote sync
+  - `git_merge` / `git_rebase` — branch integration
+  - `git_stash` / `git_stash_pop` — temporary save
+  - `git_resolve_conflict` — structured conflict resolution
+- Smart commit messages: auto-generate from changes
+- Branch awareness: agent knows what branch it's on, suggests branching strategy
+- Conflict resolution: when merge conflicts occur, agent reads both sides, proposes resolution
+
+**Files to create/modify:**
+- `src/coding_agent/tools/git.py` (NEW — ~400 lines)
+- `src/coding_agent/tools/__init__.py` — register git tools
+- `src/coding_agent/agent/loop.py` — git context in system prompt
+- `tests/test_tools/test_git.py` (NEW)
+
+**Verification:** Agent can create a branch, make changes, commit, and create a merge commit — all through tools.
+
+**Complexity:** High (12-15 hours)
+**Impact:** Critical (real development workflow)
+
+---
+
+### 5.2 Multi-Modal Understanding
+
+**Why:** Developers share screenshots of bugs, UI mockups, architecture diagrams. The agent can't process images.
+
+**What to build:**
+- Extend LLM clients to support image inputs:
+  - Gemini: native multimodal (already supports images)
+  - OpenRouter: pass image as base64 in content blocks
+  - Anthropic: native image support
+- New tool `describe_image` — agent can ask about a screenshot/diagram
+- TUI support: paste image from clipboard (Ctrl+V), drag-drop file
+- Image context: when image is provided, agent can:
+  - Describe what it sees
+  - Compare with code (e.g., "this UI doesn't match the mockup")
+  - Generate code from mockup
+  - Identify bugs from screenshots
+
+**Files to create/modify:**
+- `src/coding_agent/llm/client.py` — image content blocks
+- `src/coding_agent/llm/gemini_client.py` — multimodal support
+- `src/coding_agent/tui/app.py` — clipboard paste handling
+- `src/coding_agent/tui/widgets/chat.py` — image display
+- `tests/test_llm/test_multimodal.py` (NEW)
+
+**Verification:** User pastes a screenshot, agent describes what it sees and suggests code changes.
+
+**Complexity:** High (10-12 hours)
+**Impact:** High (visual context)
+
+---
+
+### 5.3 Custom Agent Definitions
+
+**Why:** Different tasks need different agent personalities. A security reviewer thinks differently than a performance optimizer.
+
+**What to build:**
+- Agent definition files (YAML/TOML):
+  ```yaml
+  # ~/.coding-agent/agents/security-reviewer.yaml
+  name: "Security Reviewer"
+  description: "Reviews code for security vulnerabilities"
+  system_prompt: |
+    You are a security expert. Focus on:
+    - SQL injection, XSS, CSRF
+    - Authentication/authorization flaws
+    - Secrets in code
+    - Dependency vulnerabilities
+  model: "gemini-2.5-pro"
+  tools: ["read_file", "grep", "list_files"]
+  temperature: 0.3
+  ```
+- New CLI command: `coding-agent --agent security-reviewer`
+- TUI: agent selector in status bar
+- Built-in agent profiles:
+  - `default` — general coding (current)
+  - `security-reviewer` — security focus
+  - `performance-optimizer` — perf focus
+  - `test-writer` — test generation
+  - `documenter` — documentation
+  - `refactorer` — code quality
+- Agent memory: each agent has its own memory namespace
+
+**Files to create/modify:**
+- `src/coding_agent/agent/definitions.py` (NEW — ~200 lines)
+- `src/coding_agent/agent/system_prompt.py` — load from agent definition
+- `src/coding_agent/main.py` — `--agent` flag
+- `src/coding_agent/tui/app.py` — agent selector
+- `~/.coding-agent/agents/` — built-in profiles
+- `tests/test_agent/test_definitions.py` (NEW)
+
+**Verification:** `coding-agent --agent security-reviewer` loads a security-focused system prompt.
+
+**Complexity:** Medium (8-10 hours)
+**Impact:** High (task-specific expertise)
+
+---
+
+### 5.4 Plugin System
+
+**Why:** Users want to extend the agent with custom tools, prompts, and workflows without modifying core code.
+
+**What to build:**
+- Plugin architecture:
+  ```
+  ~/.coding-agent/plugins/
+    my-plugin/
+      plugin.yaml          # metadata
+      tools/               # custom tools
+      prompts/             # custom prompt sections
+      hooks/               # event handlers
+  ```
+- Plugin manifest:
+  ```yaml
+  name: "my-plugin"
+  version: "1.0.0"
+  description: "Adds custom linting tools"
+  tools:
+    - name: "custom_lint"
+      description: "Run custom linting rules"
+      module: "tools.custom_lint"
+  hooks:
+    - event: "after_edit"
+      module: "hooks.auto_format"
+  ```
+- Dynamic tool registration: plugin tools added to `tool_registry`
+- Event hooks: plugins can listen to agent events (after_edit, before_llm_call, etc.)
+- Plugin discovery: scan `~/.coding-agent/plugins/` on startup
+- Plugin marketplace: future — community-shared plugins
+
+**Files to create/modify:**
+- `src/coding_agent/plugins/loader.py` (NEW — ~200 lines)
+- `src/coding_agent/plugins/manifest.py` (NEW — ~100 lines)
+- `src/coding_agent/tools/__init__.py` — plugin tool registration
+- `src/coding_agent/agent/loop.py` — plugin hooks
+- `tests/test_plugins/` (NEW directory)
+
+**Verification:** User creates a plugin with a custom tool, agent can use it.
+
+**Complexity:** High (12-15 hours)
+**Impact:** High (extensibility)
+
+---
+
+### 5.5 Team Collaboration
+
+**Why:** Teams need shared context, conventions, and memory. Not just per-user, per-project.
+
+**What to build:**
+- Shared memory: `.coding-agent/team-memory.json` in project root:
+  - Team conventions ("we use 4-space indent, not 2")
+  - Project decisions ("auth uses JWT, not sessions")
+  - Coding standards ("all functions must have docstrings")
+- Session handoff: export session state, another team member can import
+- Team agents: shared agent definitions in `.coding-agent/agents/`
+- Conflict prevention: when multiple agents work on same branch, detect and warn
+- Convention enforcement: agent follows team conventions automatically
+
+**Files to create/modify:**
+- `src/coding_agent/agent/memory.py` — team memory support
+- `src/coding_agent/session/manager.py` — export/import sessions
+- `src/coding_agent/agent/system_prompt.py` — inject team conventions
+- `src/coding_agent/config.py` — team settings
+- `tests/test_agent/test_team.py` (NEW)
+
+**Verification:** Two sessions on same project share conventions and learned facts.
+
+**Complexity:** Medium (8-10 hours)
+**Impact:** High (team productivity)
+
+---
+
+### 5.6 Autonomous Background Workflows
+
+**Why:** Some tasks should run without user interaction — CI checks, scheduled refactoring, monitoring.
+
+**What to build:**
+- Background task runner:
+  - `coding-agent run-task "run all tests and fix failures"`
+  - Agent runs autonomously, writes results to file
+- Workflow definitions (YAML):
+  ```yaml
+  name: "pre-commit-check"
+  triggers: ["pre-commit"]
+  steps:
+    - run: "ruff check ."
+    - run: "pytest tests/"
+    - on_failure: "fix and retry"
+  ```
+- Integration points:
+  - Git hooks (pre-commit, pre-push)
+  - CI/CD (GitHub Actions, GitLab CI)
+  - Scheduled (cron-like)
+- Progress reporting: background tasks write to `~/.coding-agent/tasks/`
+- Notification: when background task completes, notify via system notification
+
+**Files to create/modify:**
+- `src/coding_agent/agent/background.py` (NEW — ~200 lines)
+- `src/coding_agent/workflows/` (NEW directory)
+- `src/coding_agent/main.py` — `run-task` command
+- `tests/test_agent/test_background.py` (NEW)
+
+**Verification:** `coding-agent run-task "fix lint errors"` runs autonomously and reports results.
+
+**Complexity:** High (10-12 hours)
+**Impact:** High (automation)
+
+---
+
+### 5.7 Code Intelligence & Impact Analysis
+
+**Why:** Agent edits files without understanding the full impact. Breaking changes propagate silently.
+
+**What to build:**
+- Dependency graph: map which files import/depend on which
+  - Python: AST-based import analysis
+  - JS/TS: require/import resolution
+  - Generic: grep-based fallback
+- Impact analysis: before editing a file, show:
+  - "This file is imported by 5 other files"
+  - "Changing this function will break X, Y, Z"
+- Call graph: which functions call which
+- Dead code detection: unused imports, unreachable code
+- Code metrics: complexity, duplication, coverage gaps
+- New tool `impact_analysis` — agent can query impact before editing
+
+**Files to create/modify:**
+- `src/coding_agent/agent/code_intel.py` (NEW — ~300 lines)
+- `src/coding_agent/tools/code_intel.py` (NEW — ~150 lines)
+- `src/coding_agent/agent/loop.py` — impact warnings before edits
+- `tests/test_agent/test_code_intel.py` (NEW)
+
+**Verification:** Before editing a widely-imported function, agent is warned about downstream impact.
+
+**Complexity:** High (15-20 hours)
+**Impact:** High (prevents breaking changes)
+
+---
+
+### 5.8 Interactive Code Review
+
+**Why:** Agent can write code but can't review it. Code review is a critical development workflow.
+
+**What to build:**
+- New tool `review_code` — agent reviews a file or diff:
+  - Checks for bugs, security issues, performance problems
+  - Suggests improvements
+  - Rates code quality (1-10)
+  - Compares against team conventions
+- PR review workflow:
+  - `coding-agent review-pr <number>` — reviews a GitHub PR
+  - Posts comments on specific lines
+  - Suggests changes
+  - Approves or requests changes
+- Review memory: agent remembers past reviews, learns team preferences
+- Review standards: configurable review criteria per project
+
+**Files to create/modify:**
+- `src/coding_agent/tools/review.py` (NEW — ~250 lines)
+- `src/coding_agent/agent/reviewer.py` (NEW — ~200 lines)
+- `src/coding_agent/main.py` — `review-pr` command
+- `tests/test_agent/test_reviewer.py` (NEW)
+
+**Verification:** `coding-agent review-pr 42` posts review comments on a GitHub PR.
+
+**Complexity:** High (12-15 hours)
+**Impact:** High (code quality)
+
+---
+
+## Dependency Graph (Updated)
+
+```
+Phase 1 (Foundation)
+  ├── 1.1 Fix Gemini bug
+  ├── 1.2 tiktoken counting
+  ├── 1.3 Tool result truncation
+  ├── 1.4 Parallel execution
+  ├── 1.5 Streaming tool calls
+  ├── 1.6 Session persistence ←── blocks Phase 3
+  └── 1.7 Cost/time budgets
+
+Phase 2 (Intelligence)  ←── depends on Phase 1
+  ├── 2.1 Workspace index
+  ├── 2.2 Planning system ←── blocks 2.3, 2.6
+  ├── 2.3 Verification ←── depends on 2.2
+  ├── 2.4 Error recovery ←── depends on 2.2
+  ├── 2.5 Context engine
+  ├── 2.6 Stuck detection ←── depends on 2.2
+  ├── 2.7 Apply-patch tool
+
+Phase 3 (Memory)  ←── depends on Phase 1.6
+  ├── 3.1 Cross-session memory
+  ├── 3.2 Undo/redo ←── depends on 1.6
+  ├── 3.3 History viewer ←── depends on 1.6, 3.1
+  └── 3.4 Adaptive prompt
+
+Phase 4 (Production)  ←── depends on Phase 2
+  ├── 4.1 Prompt caching
+  ├── 4.2 Anthropic SDK
+  ├── 4.3 MCP integration
+  ├── 4.4 Sub-agents
+  ├── 4.5 Network isolation
+  ├── 4.6 Telemetry
+  ├── 4.7 TUI polish
+  ├── 4.8 Integration tests
+  └── 4.9 Documentation
+
+Phase 5 (Advanced)  ←── depends on Phase 3, Phase 4
+  ├── 5.1 Full Git integration ←── depends on 4.8 (tests)
+  ├── 5.2 Multi-modal ←── depends on 4.2 (Anthropic)
+  ├── 5.3 Custom agents ←── depends on 3.4 (adaptive prompt)
+  ├── 5.4 Plugin system ←── depends on 4.3 (MCP)
+  ├── 5.5 Team collaboration ←── depends on 3.1 (memory)
+  ├── 5.6 Background workflows ←── depends on 4.4 (sub-agents)
+  ├── 5.7 Code intelligence ←── depends on 2.1 (workspace index)
+  └── 5.8 Code review ←── depends on 5.7 (code intelligence)
+```
+
+---
+
+## Effort Summary
+
+| Phase | Duration | Complexity | Score Impact |
+|---|---|---|---|
+| Phase 1: Foundation | 10-15 days | Low-Medium | 3.5 → 5.0 |
+| Phase 2: Intelligence | 20-25 days | Medium-High | 5.0 → 7.0 |
+| Phase 3: Memory | 15-18 days | Medium-High | 7.0 → 8.5 |
+| Phase 4: Production | 25-30 days | Medium-High | 8.5 → 9.5 |
+| Phase 5: Advanced | 30-40 days | High | 9.5 → 9.8 |
+| **Total** | **100-128 days** | | **3.5 → 9.8** |
+
+---
+
+## Priority Matrix (Quick Reference)
+
+| Priority | Task | Effort | Impact |
+|---|---|---|---|
+| P0 | Fix Gemini system prompt bug | 2h | Critical |
+| P0 | Tool result truncation | 4h | High |
+| P0 | tiktoken token counting | 3h | High |
+| P1 | Parallel tool execution | 6h | High |
+| P1 | Session persistence | 8h | High |
+| P1 | Planning system | 12h | Critical |
+| P1 | Verification system | 10h | Critical |
+| P2 | Workspace index | 8h | High |
+| P2 | Error recovery | 8h | High |
+| P2 | Context engine | 8h | High |
+| P2 | Cross-session memory | 15h | Critical |
+| P2 | Undo/redo | 8h | High |
+| P3 | Stuck detection | 6h | High |
+| P3 | Apply-patch tool | 8h | High |
+| P3 | Prompt caching | 8h | High |
+| P3 | Anthropic SDK | 12h | High |
+| P3 | MCP integration | 15h | High |
+| P3 | Sub-agents | 20h | Medium |
+| P4 | Network isolation | 3h | Medium |
+| P4 | Telemetry | 8h | Medium |
+| P4 | TUI polish | 10h | Medium |
+| P4 | Integration tests | 12h | High |
+| P4 | Documentation | 8h | Medium |
+| P5 | Full Git integration | 15h | Critical |
+| P5 | Multi-modal | 12h | High |
+| P5 | Custom agents | 10h | High |
+| P5 | Plugin system | 15h | High |
+| P5 | Team collaboration | 10h | High |
+| P5 | Background workflows | 12h | High |
+| P5 | Code intelligence | 20h | High |
+| P5 | Code review | 15h | High |
+
+---
+
 ## What Success Looks Like
 
-After all 4 phases, CoreCode will:
+After all 5 phases, CoreCode will:
 
 1. **Plan before executing** — creates explicit step-by-step plans
 2. **Execute in parallel** — reads multiple files concurrently
@@ -857,5 +1311,12 @@ After all 4 phases, CoreCode will:
 8. **Cost-conscious** — prompt caching, budget limits, model routing
 9. **Extensible** — MCP tools, custom plugins
 10. **Production-ready** — monitoring, logging, testing, documentation
+11. **Full Git workflow** — branch, commit, merge, PR, conflict resolution
+12. **Multi-modal** — understands screenshots, mockups, diagrams
+13. **Customizable** — task-specific agent personas
+14. **Team-aware** — shared conventions, collaborative memory
+15. **Autonomous** — background tasks, CI integration, scheduled workflows
+16. **Intelligent** — dependency graphs, impact analysis, dead code detection
+17. **Reviewable** — code review, PR review, quality scoring
 
-This will be a system that competes with Claude Code and Cursor Agent, not just a portfolio piece.
+This will be a system that doesn't just write code — it understands code, reviews code, and works as a full development partner.

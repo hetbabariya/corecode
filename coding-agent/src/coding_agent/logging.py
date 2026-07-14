@@ -94,6 +94,18 @@ def setup_logging(
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
 
+    # Suppress noisy third-party loggers even when root is at DEBUG
+    _noisy_loggers = [
+        "markdown_it",   # markdown parser state machine debug spam
+        "httpcore",      # HTTP connection lifecycle details
+        "httpx",         # HTTP request/response details
+        "asyncio",       # event loop proactor debug info
+        "urllib3",       # connection pool details
+        "aiosqlite",     # per-SQL-statement debug logging
+    ]
+    for logger_name in _noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
     # Configure structlog to use stdlib logging (so file handlers work)
     structlog.configure(
         processors=[

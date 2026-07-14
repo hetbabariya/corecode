@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from coding_agent.logging import logger
 from coding_agent.tools.base import ToolResult
 from coding_agent.tools.registry import tool
 
@@ -49,6 +50,7 @@ async def refresh_index() -> ToolResult:
     stats = index.get_language_stats()
     top_langs = ", ".join(f"{lang}({count})" for lang, count in list(stats.items())[:5])
 
+    logger.debug("refresh_index_done", files=index.total_files, dirs=index.get_dir_count())
     return ToolResult(
         success=True,
         output=(

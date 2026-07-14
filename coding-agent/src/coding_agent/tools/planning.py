@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from coding_agent.logging import logger
 from coding_agent.tools.base import ToolResult
 from coding_agent.tools.registry import tool
 
@@ -53,6 +54,7 @@ async def create_plan(goal: str, steps: list[str]) -> ToolResult:
     """
     manager = get_plan_manager()
     if manager is None:
+        logger.debug("create_plan_failed", reason="manager_not_available")
         return ToolResult(
             success=False,
             error="Planning system not available. This is an internal error.",

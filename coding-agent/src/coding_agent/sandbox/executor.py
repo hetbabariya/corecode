@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 from coding_agent.logging import logger
@@ -144,8 +145,7 @@ class SandboxExecutor:
         cwd: str | None,
     ) -> ToolResult:
         """Run directly on the host — mirrors tools/shell.py logic."""
-        logger.debug("host_exec", command=command, timeout=timeout, cwd=cwd)
-
+        exec_start = time.monotonic()
         use_shell = sys.platform == "win32"
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -159,12 +159,16 @@ class SandboxExecutor:
         except TimeoutError:
             proc.kill()  # type: ignore[union-attr]
             await proc.wait()  # type: ignore[union-attr]
+            duration_ms = (time.monotonic() - exec_start) * 1000
+            logger.warning("host_exec_timeout", command=command[:200], timeout=timeout, duration_ms=round(duration_ms, 1))
             return ToolResult(
                 success=False,
                 error=f"Command timed out after {timeout} seconds",
                 metadata={"timeout": True, "exit_code": -1, "sandbox": False},
             )
         except OSError as exc:
+            duration_ms = (time.monotonic() - exec_start) * 1000
+            logger.error("host_exec_os_error", command=command[:200], error=str(exc), duration_ms=round(duration_ms, 1))
             return ToolResult(
                 success=False,
                 error=f"Failed to execute command: {exc}",
@@ -174,6 +178,7 @@ class SandboxExecutor:
         exit_code = proc.returncode or 0  # type: ignore[union-attr]
         stdout_text = stdout.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
         stderr_text = stderr.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
+        duration_ms = (time.monotonic() - exec_start) * 1000
 
         parts: list[str] = []
         if stdout_text:

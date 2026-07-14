@@ -177,22 +177,12 @@ class DockerSandbox:
                 metadata={"error": "empty_command"},
             )
 
-        effective_timeout = timeout or self.default_timeout
-
         # Build the exec command
         exec_cmd = ["sh", "-c", command]
         if cwd:
             workdir = cwd if cwd.startswith("/") else f"/workspace/{cwd}"
         else:
             workdir = "/workspace"
-
-        logger.debug(
-            "sandbox_exec",
-            container_id=self._container_id,
-            command=command,
-            timeout=effective_timeout,
-            cwd=workdir,
-        )
 
         t0 = time.monotonic()
         try:
@@ -202,13 +192,6 @@ class DockerSandbox:
                 workdir,
             )
             duration_ms = (time.monotonic() - t0) * 1000
-
-            logger.debug(
-                "sandbox_exec_done",
-                container_id=self._container_id,
-                exit_code=result["exit_code"],
-                duration_ms=round(duration_ms, 1),
-            )
 
             return SandboxResult(
                 exit_code=result["exit_code"],

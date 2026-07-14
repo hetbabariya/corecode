@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -320,6 +321,7 @@ class LLMClient:
         stream: bool = False,
     ) -> Any:
         """Single raw call — dispatches to the active provider."""
+        call_start = time.monotonic()
         logger.debug(
             "llm_request",
             model=self.model,
@@ -328,9 +330,24 @@ class LLMClient:
             tool_count=len(tools or []),
             message_count=len(messages),
         )
-        if self.provider == "gemini":
-            return await self._raw_call_gemini(messages, tools=tools, stream=stream)
-        return await self._raw_call_openrouter(messages, tools=tools, stream=stream)
+        try:
+            if self.provider == "gemini":
+                result = await self._raw_call_gemini(messages, tools=tools, stream=stream)
+            else:
+                result = await self._raw_call_openrouter(messages, tools=tools, stream=stream)
+            latency_ms = (time.monotonic() - call_start) * 1000
+            logger.debug("llm_request_success", latency_ms=round(latency_ms, 1), stream=stream)
+            return result
+        except Exception as exc:
+            latency_ms = (time.monotonic() - call_start) * 1000
+            logger.error(
+                "llm_request_failed",
+                model=self.model,
+                provider=self.provider,
+                error=str(exc)[:200],
+                latency_ms=round(latency_ms, 1),
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Call with key-pool rotation + retry
@@ -562,9 +579,11 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Send a completion request and return the full response."""
+        complete_start = time.monotonic()
         response: Any = await self._call_with_rotation(
             messages, tools=tools, stream=False
         )
+        complete_duration_ms = (time.monotonic() - complete_start) * 1000
         response_dict = self._parse_response(response)
 
         choice: dict[str, Any] = response_dict["choices"][0]
@@ -611,6 +630,8 @@ class LLMClient:
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             tool_call_count=len(tool_calls),
+            duration_ms=round(complete_duration_ms, 1),
+            content_preview=content[:200] if content else "",
         )
 
         return LLMResponse(

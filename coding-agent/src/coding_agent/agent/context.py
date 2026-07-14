@@ -119,6 +119,7 @@ class ContextManager:
             )
         )
 
+
     def add_tool_result(
         self,
         tool_call_id: str,

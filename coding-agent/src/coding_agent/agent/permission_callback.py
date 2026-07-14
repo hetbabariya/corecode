@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Protocol
 
+from coding_agent.logging import logger
+
 
 class PermissionCallback(Protocol):
     """Signature for permission callbacks."""
@@ -45,7 +47,10 @@ class QueueCallback:
     async def __call__(
         self, tool_name: str, args: dict[str, Any], permission_level: str
     ) -> bool:
-        return await self._queue.get()
+        logger.debug("permission_callback_waiting", tool=tool_name, level=permission_level)
+        result = await self._queue.get()
+        logger.debug("permission_callback_resolved", tool=tool_name, approved=result)
+        return result
 
     def approve(self) -> None:
         """Approve the pending permission request."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -93,9 +94,11 @@ class ToolRegistry:
         Returns ``ToolResult(success=False, ...)`` on error instead of raising,
         so the agent loop can feed the error back to the LLM.
         """
+        exec_start = time.monotonic()
         try:
             tool = self.get(name)
         except KeyError as exc:
+            logger.warning("tool_not_found", tool=name, available=self.list_tools())
             return ToolResult(
                 success=False,
                 error=str(exc),
@@ -103,19 +106,25 @@ class ToolRegistry:
 
         try:
             result = await tool.execute(**arguments)
+            duration_ms = (time.monotonic() - exec_start) * 1000
             logger.info(
                 "tool_executed",
                 registry=self.name,
                 tool=name,
                 success=result.success,
+                duration_ms=round(duration_ms, 1),
+                output_length=len(result.output) if result.output else 0,
+                error=result.error[:200] if result.error else "",
             )
             return result
         except Exception as exc:
+            duration_ms = (time.monotonic() - exec_start) * 1000
             logger.error(
                 "tool_failed",
                 registry=self.name,
                 tool=name,
                 error=str(exc),
+                duration_ms=round(duration_ms, 1),
             )
             return ToolResult(
                 success=False,
@@ -146,12 +155,14 @@ class ToolRegistry:
         try:
             arguments: dict[str, Any] = json.loads(raw_args)
         except json.JSONDecodeError:
+            logger.warning("tool_args_parse_failed", tool=name, raw_args=raw_args[:200])
             return ToolResult(
                 success=False,
                 error=f"Invalid JSON in tool arguments: {raw_args!r}",
             )
 
         if not name:
+            logger.warning("tool_name_missing", raw_args=raw_args[:200])
             return ToolResult(
                 success=False,
                 error="Tool call missing function name",
