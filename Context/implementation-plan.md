@@ -6,6 +6,8 @@ This document is the actionable, phase-by-phase build plan to take CoreCode from
 
 Each phase is ordered by dependency and ROI. No phase depends on something that hasn't been built yet. Every phase produces a measurable improvement.
 
+> **TUI Overhaul:** A separate 39-item plan for TUI improvements exists at [`Context/tui-implementation-plan.md`](tui-implementation-plan.md). It covers theme system recovery, widget restoration, streaming performance, and UX polish across 5 phases (69-87 hours).
+
 ---
 
 ## Phase 1: Critical Fixes & Foundation Hardening (Week 1-2)
