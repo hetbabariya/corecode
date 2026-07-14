@@ -73,6 +73,19 @@ class Settings(BaseSettings):
         default="~/.coding-agent/sessions.db", description="SQLite database path"
     )
 
+    # Budgets
+    max_cost_per_session: float = Field(
+        default=5.0, description="Max cost per session in USD"
+    )
+    max_time_per_task: int = Field(
+        default=300, description="Max time per task in seconds"
+    )
+
+    # Verification
+    verify_after_edit: bool = Field(
+        default=True, description="Run syntax/lint checks after file edits"
+    )
+
     # Workspace
     workspace: Any = Field(default=".", description="Workspace directory")
 

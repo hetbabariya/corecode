@@ -30,15 +30,19 @@ def run(
     workspace: Path = Path("."),
     permission: str = "auto",
     log_level: str = "INFO",
+    log_file: str | None = None,
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug-level logging"),
 ) -> None:
     """Start a coding agent session.
 
     Use --prompt for single-shot mode, or run without it to launch the TUI.
     Permission modes: auto (default), confirm, deny.
+    Use --verbose/-v for debug logging. Use --log-file to write logs to a file.
     """
     from coding_agent.logging import setup_logging
 
-    setup_logging(level=log_level)
+    effective_level = "DEBUG" if verbose else log_level
+    setup_logging(level=effective_level, log_file=log_file)
 
     if not prompt:
         _launch_tui(workspace)

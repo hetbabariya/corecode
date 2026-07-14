@@ -15,6 +15,11 @@ class TestEventType:
             "done",
             "error",
             "max_iter",
+            "budget_exceeded",
+            "plan_update",
+            "verification",
+            "stuck_detected",
+            "ask_user",
         }
         actual = {e.value for e in EventType}
         assert actual == expected

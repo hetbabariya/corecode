@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -281,4 +283,241 @@ async def list_files(path: str = ".", pattern: str | None = None) -> ToolResult:
         success=True,
         output=output,
         metadata={"count": len(entries), "path": str(p)},
+    )
+
+
+# ------------------------------------------------------------------
+# Patch tools
+# ------------------------------------------------------------------
+
+
+def _parse_unified_diff(diff_text: str) -> list[dict[str, Any]]:
+    """Parse unified diff text into a list of hunks.
+
+    Each hunk is a dict with keys:
+      - old_start: starting line in old file (1-indexed)
+      - old_count: number of lines removed
+      - new_start: starting line in new file (1-indexed)
+      - new_count: number of lines added
+      - removed: list of removed lines (without leading '-')
+      - added: list of added lines (without leading '+')
+    """
+    hunks: list[dict[str, Any]] = []
+    lines = diff_text.splitlines()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Match hunk header: @@ -old_start,old_count +new_start,new_count @@
+        match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+        if match:
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or "1")
+            new_start = int(match.group(3))
+            new_count = int(match.group(4) or "1")
+
+            removed: list[str] = []
+            added: list[str] = []
+
+            i += 1
+            while i < len(lines):
+                dline = lines[i]
+                if dline.startswith("@@") or dline.startswith("diff "):
+                    break
+                if dline.startswith("-"):
+                    removed.append(dline[1:])
+                elif dline.startswith("+"):
+                    added.append(dline[1:])
+                elif dline.startswith(" "):
+                    removed.append(dline[1:])
+                    added.append(dline[1:])
+                elif dline == "":
+                    # Empty line at end of diff
+                    break
+                i += 1
+
+            hunks.append({
+                "old_start": old_start,
+                "old_count": old_count,
+                "new_start": new_start,
+                "new_count": new_count,
+                "removed": removed,
+                "added": added,
+            })
+        else:
+            i += 1
+
+    return hunks
+
+
+def _apply_hunks(lines: list[str], hunks: list[dict[str, Any]]) -> list[str] | str:
+    """Apply parsed hunks to file lines. Returns new lines or error string."""
+    # Work on a copy
+    result = list(lines)
+
+    # Apply hunks in reverse order to preserve line numbers
+    for hunk in sorted(hunks, key=lambda h: h["old_start"], reverse=True):
+        old_start = hunk["old_start"]
+        removed = hunk["removed"]
+        added = hunk["added"]
+
+        # Convert to 0-indexed
+        idx = old_start - 1
+
+        # Verify the removed lines match
+        existing = result[idx: idx + len(removed)]
+        if existing != removed:
+            # Try to find the block nearby (fuzzy match within ±3 lines)
+            found = False
+            for offset in range(-3, 4):
+                try_idx = idx + offset
+                if try_idx < 0:
+                    continue
+                if result[try_idx: try_idx + len(removed)] == removed:
+                    idx = try_idx
+                    found = True
+                    break
+            if not found:
+                preview = "\n".join(existing[:3])
+                expected = "\n".join(removed[:3])
+                return (
+                    f"Hunk at line {old_start} does not match file content.\n"
+                    f"Expected:\n{expected}\nFound:\n{preview}"
+                )
+
+        # Replace the block
+        result[idx: idx + len(removed)] = added
+
+    return result
+
+
+@tool(
+    name="apply_patch",
+    description="Apply a unified diff patch to a file. Accepts standard unified diff format with @@ headers.",
+    permission="write",
+)
+async def apply_patch(path: str, patch: str) -> ToolResult:
+    """Apply a unified diff patch to a file.
+
+    The patch should be in unified diff format, e.g.::
+
+        @@ -10,6 +10,8 @@
+         def main():
+         -    pass
+         +    print("hello")
+         +    return 0
+
+    Multiple hunks can be included in a single patch.
+    """
+    p = Path(path).resolve()
+    if not p.exists():
+        return ToolResult(success=False, error=f"File not found: {path}")
+    if p.is_dir():
+        return ToolResult(success=False, error=f"Path is a directory: {path}")
+
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        return ToolResult(success=False, error=f"Cannot read file: {exc}")
+
+    lines = text.splitlines(keepends=True)
+
+    # Strip trailing newlines from each line for comparison
+    stripped = [l.rstrip("\n\r") for l in lines]
+
+    hunks = _parse_unified_diff(patch)
+    if not hunks:
+        return ToolResult(
+            success=False,
+            error="No valid hunks found in patch. Ensure the patch uses unified diff format with @@ headers.",
+        )
+
+    result = _apply_hunks(stripped, hunks)
+    if isinstance(result, str):
+        return ToolResult(success=False, error=result)
+
+    # Write the result
+    new_content = "\n".join(result) + "\n" if text.endswith("\n") else "\n".join(result)
+
+    try:
+        p.write_text(new_content, encoding="utf-8")
+    except OSError as exc:
+        return ToolResult(success=False, error=f"Cannot write file: {exc}")
+
+    logger.debug("apply_patch", path=str(p), hunks=len(hunks))
+    return ToolResult(
+        success=True,
+        output=f"Successfully applied {len(hunks)} hunk(s) to {p}",
+        metadata={"path": str(p), "hunks_applied": len(hunks)},
+    )
+
+
+@tool(
+    name="multi_edit",
+    description="Apply multiple text replacements to a single file in one call. Each edit specifies old_text and new_text.",
+    permission="write",
+)
+async def multi_edit(path: str, edits: list[dict[str, str]]) -> ToolResult:
+    """Apply multiple text replacements to a file in one call.
+
+    Each edit in the list should have ``old_text`` and ``new_text`` keys.
+    Edits are applied in order. All old_text values must be found exactly
+    once in the file before any edits are applied (to prevent ordering issues).
+
+    Example::
+
+        multi_edit("app.py", [
+            {"old_text": "def foo():", "new_text": "def bar():"},
+            {"old_text": "return None", "new_text": "return 0"},
+        ])
+    """
+    p = Path(path).resolve()
+    if not p.exists():
+        return ToolResult(success=False, error=f"File not found: {path}")
+    if p.is_dir():
+        return ToolResult(success=False, error=f"Path is a directory: {path}")
+
+    if not edits:
+        return ToolResult(success=False, error="No edits provided.")
+
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        return ToolResult(success=False, error=f"Cannot read file: {exc}")
+
+    # Validate all old_text values exist before applying any
+    for i, edit in enumerate(edits):
+        old_text = edit.get("old_text", "")
+        new_text = edit.get("new_text", "")
+        if not old_text:
+            return ToolResult(success=False, error=f"Edit {i+1}: old_text is empty.")
+        count = text.count(old_text)
+        if count == 0:
+            return ToolResult(
+                success=False,
+                error=f"Edit {i+1}: old_text not found in {path}.",
+            )
+        if count > 1:
+            return ToolResult(
+                success=False,
+                error=f"Edit {i+1}: old_text appears {count} times in {path}. Provide more context.",
+            )
+
+    # Apply edits sequentially
+    for i, edit in enumerate(edits):
+        old_text = edit["old_text"]
+        new_text = edit["new_text"]
+        text = text.replace(old_text, new_text, 1)
+
+    try:
+        p.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return ToolResult(success=False, error=f"Cannot write file: {exc}")
+
+    logger.debug("multi_edit", path=str(p), edits=len(edits))
+    return ToolResult(
+        success=True,
+        output=f"Successfully applied {len(edits)} edit(s) to {p}",
+        metadata={"path": str(p), "edits_applied": len(edits)},
     )

@@ -93,16 +93,31 @@ class StreamParser:
             if tc_delta.get("id"):
                 acc.id = tc_delta["id"]
 
+            # Emit tool call incrementally if it's complete
+            if acc.name and acc.arguments:
+                try:
+                    json.loads(acc.arguments)
+                    tool_call = _build_tool_call(acc)
+                    if tool_call:
+                        events.append(
+                            StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
+                        )
+                        # Mark as emitted so we don't emit again at finish
+                        acc.name = ""
+                except json.JSONDecodeError:
+                    pass  # Arguments still incomplete, wait for more chunks
+
         # Check for stream end
         if finish_reason is not None:
             self._finished = True
-            # Emit accumulated tool calls
+            # Emit any remaining tool calls not yet emitted
             for acc in self._tool_calls.values():
-                tool_call = _build_tool_call(acc)
-                if tool_call:
-                    events.append(
-                        StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
-                    )
+                if acc.name:  # Only emit if not already emitted
+                    tool_call = _build_tool_call(acc)
+                    if tool_call:
+                        events.append(
+                            StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
+                        )
             # Emit usage if present
             usage_data: dict[str, Any] | None = chunk.get("usage")  # type: ignore[assignment]
             if usage_data:

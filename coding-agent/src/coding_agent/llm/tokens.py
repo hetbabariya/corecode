@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import tiktoken
+
 
 @dataclass(frozen=True)
 class TokenUsage:
@@ -53,14 +55,44 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int, model: str) -> fl
     ) / 1_000_000
 
 
-def count_tokens(text: str, model: str = "gpt-4o") -> int:
-    """Count tokens in a text string.
+_ENCODING_CACHE: dict[str, tiktoken.Encoding] = {}
 
-    Uses a simple heuristic (chars / 4) as a fast estimate. For exact counts
-    the caller should use the response metadata from the LLM provider.
+_MODEL_TO_ENCODING: dict[str, str] = {
+    "gpt-4o": "o200k_base",
+    "gpt-4o-mini": "o200k_base",
+    "gpt-4": "cl100k_base",
+    "gpt-4-turbo": "cl100k_base",
+    "gpt-3.5-turbo": "cl100k_base",
+    "claude": "cl100k_base",
+    "gemini": "cl100k_base",
+}
+
+
+def _get_encoding(model: str = "gpt-4o") -> tiktoken.Encoding:
+    """Get (and cache) a tiktoken encoding for the given model.
+
+    Falls back to ``o200k_base`` for unknown models, which is the most
+    accurate general-purpose encoding available.
     """
-    # Fallback: ~4 chars per token (rough English average)
-    return len(text) // 4
+    encoding_name = _MODEL_TO_ENCODING.get(model, "o200k_base")
+    if encoding_name not in _ENCODING_CACHE:
+        _ENCODING_CACHE[encoding_name] = tiktoken.get_encoding(encoding_name)
+    return _ENCODING_CACHE[encoding_name]
+
+
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    """Count tokens in a text string using tiktoken.
+
+    Uses the model's encoding for accurate counts. Falls back to a
+    ``len(text) // 4`` heuristic if tiktoken is unavailable.
+    """
+    if not text:
+        return 0
+    try:
+        enc = _get_encoding(model)
+        return len(enc.encode(text))
+    except Exception:
+        return len(text) // 4
 
 
 def format_usage(usage: TokenUsage) -> str:

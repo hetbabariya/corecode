@@ -130,7 +130,31 @@ class TestCountTokens:
 
     def test_empty_string(self) -> None:
         result = count_tokens("")
-        assert result >= 0
+        assert result == 0
+
+    def test_accurate_on_known_string(self) -> None:
+        # "hello world" is 2 tokens in cl100k_base/o200k_base
+        result = count_tokens("hello world")
+        assert result == 2
+
+    def test_code_tokens_reasonable(self) -> None:
+        code = "def hello_world():\n    print('Hello, World!')\n"
+        tokens = count_tokens(code)
+        # Should be much more accurate than len(code)//4 = 10
+        # Actual tiktoken count is ~12-14 tokens
+        assert 8 <= tokens <= 20
+
+    def test_long_text(self) -> None:
+        text = "The quick brown fox jumps over the lazy dog. " * 100
+        tokens = count_tokens(text)
+        # Should be roughly 1/4 to 1/3 of character count
+        assert tokens > 0
+        assert tokens < len(text) // 2
+
+    def test_fallback_on_bad_model(self) -> None:
+        # Unknown models should still work (fallback to o200k_base)
+        result = count_tokens("test", model="unknown-model-xyz")
+        assert result > 0
 
 
 class TestFormatUsage:
@@ -193,7 +217,7 @@ class TestStreamParser:
 
     def test_tool_call_across_chunks(self) -> None:
         parser = StreamParser()
-        # First chunk: tool call starts
+        # First chunk: tool call starts (name only, no args yet)
         events1 = parser.feed(
             {
                 "choices": [
@@ -212,9 +236,9 @@ class TestStreamParser:
                 ]
             }
         )
-        assert len(events1) == 0  # Not finished yet
+        assert len(events1) == 0  # No complete args yet
 
-        # Second chunk: arguments arrive
+        # Second chunk: arguments arrive — tool call is now complete
         events2 = parser.feed(
             {
                 "choices": [
@@ -232,18 +256,19 @@ class TestStreamParser:
                 ]
             }
         )
-        assert len(events2) == 0
-
-        # Final chunk
-        events3 = parser.feed(
-            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
-        )
-        # Should have tool_call + done
-        tool_events = [e for e in events3 if e.type == StreamEventType.TOOL_CALL]
+        # Tool call emitted incrementally since name + valid JSON args are present
+        tool_events = [e for e in events2 if e.type == StreamEventType.TOOL_CALL]
         assert len(tool_events) == 1
         tc = tool_events[0].data
         assert tc["function"]["name"] == "read_file"
         assert json.loads(tc["function"]["arguments"]) == {"path": "test.py"}
+
+        # Final chunk — should NOT emit the tool call again
+        events3 = parser.feed(
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
+        )
+        tool_events3 = [e for e in events3 if e.type == StreamEventType.TOOL_CALL]
+        assert len(tool_events3) == 0  # Already emitted
 
     def test_done_emitted(self) -> None:
         parser = StreamParser()
@@ -303,6 +328,34 @@ class TestStreamParser:
 # ===================================================================
 
 
+class TestExtractSystemPrompt:
+    def test_single_system_message(self) -> None:
+        msgs = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+        ]
+        assert LLMClient._extract_system_prompt(msgs) == "You are helpful."
+
+    def test_multiple_system_messages(self) -> None:
+        msgs = [
+            {"role": "system", "content": "Rule 1"},
+            {"role": "system", "content": "Rule 2"},
+            {"role": "user", "content": "Hi"},
+        ]
+        assert LLMClient._extract_system_prompt(msgs) == "Rule 1\n\nRule 2"
+
+    def test_no_system_messages(self) -> None:
+        msgs = [{"role": "user", "content": "Hi"}]
+        assert LLMClient._extract_system_prompt(msgs) is None
+
+    def test_empty_system_content(self) -> None:
+        msgs = [{"role": "system", "content": ""}]
+        assert LLMClient._extract_system_prompt(msgs) is None
+
+    def test_empty_list(self) -> None:
+        assert LLMClient._extract_system_prompt([]) is None
+
+
 class TestLLMClientComplete:
     @pytest.mark.asyncio
     async def test_basic_completion(self) -> None:
@@ -320,6 +373,68 @@ class TestLLMClientComplete:
             assert result.tool_calls == []
             assert result.usage.prompt_tokens == 10
             assert result.usage.completion_tokens == 20
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_injected_to_gemini(self) -> None:
+        """System messages must reach Gemini via system_instruction, not as content."""
+        fake_resp = _FakeGoogleResponse(text="Got it")
+        mock_aclient = MagicMock()
+        mock_aclient.models.generate_content = AsyncMock(return_value=fake_resp)
+        mock_client = MagicMock()
+        mock_client.aio = mock_aclient
+
+        with patch("coding_agent.llm.client.genai.Client", return_value=mock_client):
+            client = LLMClient(model="test-model", api_key="fake")
+            messages = [
+                {"role": "system", "content": "You are a code assistant."},
+                {"role": "user", "content": "Fix the bug"},
+            ]
+            await client.complete(messages=messages)
+
+            call_kwargs = mock_aclient.models.generate_content.call_args.kwargs
+            config = call_kwargs["config"]
+            assert config is not None
+            assert hasattr(config, "system_instruction")
+            assert config.system_instruction == "You are a code assistant."
+
+    @pytest.mark.asyncio
+    async def test_multiple_system_messages_combined(self) -> None:
+        """Multiple system messages are joined with double-newline."""
+        fake_resp = _FakeGoogleResponse(text="ok")
+        mock_aclient = MagicMock()
+        mock_aclient.models.generate_content = AsyncMock(return_value=fake_resp)
+        mock_client = MagicMock()
+        mock_client.aio = mock_aclient
+
+        with patch("coding_agent.llm.client.genai.Client", return_value=mock_client):
+            client = LLMClient(model="test-model", api_key="fake")
+            messages = [
+                {"role": "system", "content": "Rule 1: be concise."},
+                {"role": "system", "content": "Rule 2: use python."},
+                {"role": "user", "content": "Hi"},
+            ]
+            await client.complete(messages=messages)
+
+            call_kwargs = mock_aclient.models.generate_content.call_args.kwargs
+            config = call_kwargs["config"]
+            assert config.system_instruction == "Rule 1: be concise.\n\nRule 2: use python."
+
+    @pytest.mark.asyncio
+    async def test_no_system_message_no_instruction(self) -> None:
+        """When there are no system messages, system_instruction should not be set."""
+        fake_resp = _FakeGoogleResponse(text="ok")
+        mock_aclient = MagicMock()
+        mock_aclient.models.generate_content = AsyncMock(return_value=fake_resp)
+        mock_client = MagicMock()
+        mock_client.aio = mock_aclient
+
+        with patch("coding_agent.llm.client.genai.Client", return_value=mock_client):
+            client = LLMClient(model="test-model", api_key="fake")
+            await client.complete(messages=[{"role": "user", "content": "Hi"}])
+
+            call_kwargs = mock_aclient.models.generate_content.call_args.kwargs
+            config = call_kwargs["config"]
+            assert config.system_instruction is None
 
     @pytest.mark.asyncio
     async def test_completion_with_tool_calls(self) -> None:

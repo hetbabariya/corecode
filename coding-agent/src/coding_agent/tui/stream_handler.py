@@ -70,6 +70,16 @@ class StreamHandler:
             self._handle_error(event)
         elif event.type == EventType.MAX_ITERATIONS:
             self._handle_max_iterations()
+        elif event.type == EventType.PLAN_UPDATE:
+            self._handle_plan_update(event)
+        elif event.type == EventType.VERIFICATION:
+            self._handle_verification(event)
+        elif event.type == EventType.STUCK_DETECTED:
+            self._handle_stuck_detected(event)
+        elif event.type == EventType.ASK_USER:
+            self._handle_ask_user(event)
+        elif event.type == EventType.BUDGET_EXCEEDED:
+            self._handle_budget_exceeded(event)
 
     def _handle_text(self, event: AgentEvent) -> None:
         """Handle streaming text from LLM."""
@@ -99,6 +109,9 @@ class StreamHandler:
         self.app.sidebar.set_state(f"running: {tool_name}")
         self.app.tool_count += 1
 
+        # Verbose logging: full args
+        logger.debug("tool_start", name=tool_name, args=args)
+
     def _handle_tool_result(self, event: AgentEvent) -> None:
         """Handle tool execution result."""
         data = _extract_dict(event.data)
@@ -107,6 +120,9 @@ class StreamHandler:
 
         self.app.chat_display.add_tool_result(tool_name, result)
         self.app.sidebar.set_state("thinking")
+
+        # Verbose logging: full result
+        logger.debug("tool_result", name=tool_name, result=result[:500], total=len(result))
 
     async def _handle_permission(self, event: AgentEvent) -> None:
         """Handle permission request — show dialog and wait for response."""
@@ -144,6 +160,14 @@ class StreamHandler:
             self.app.total_tokens = _get_int(data, "total_tokens")
             self._update_stats()
 
+            # Verbose logging
+            logger.debug(
+                "usage_update",
+                prompt=self.app.prompt_tokens,
+                completion=self.app.completion_tokens,
+                total=self.app.total_tokens,
+            )
+
     def _handle_done(self) -> None:
         """Handle task completion."""
         self._current_text = ""
@@ -159,6 +183,9 @@ class StreamHandler:
         self.app.user_input.disabled = False
         self.app.user_input.set_focus()
 
+        # Verbose logging
+        logger.error("agent_error", error=error)
+
     def _handle_max_iterations(self) -> None:
         """Handle max iterations reached."""
         self._current_text = ""
@@ -167,15 +194,112 @@ class StreamHandler:
         self.app.user_input.set_focus()
         self._current_text = ""
 
+    def _handle_plan_update(self, event: AgentEvent) -> None:
+        """Handle plan update (replan needed)."""
+        data = _extract_dict(event.data)
+        action = _get_str(data, "action", "updated")
+        plan_data = data.get("plan")
+
+        if isinstance(plan_data, dict):
+            steps = plan_data.get("steps", [])
+            total = len(steps)
+            completed = sum(1 for s in steps if isinstance(s, dict) and s.get("status") == "done")
+            self.app.chat_display.add_status(
+                f"--- Plan {action} ({completed}/{total} steps complete) ---"
+            )
+        else:
+            self.app.chat_display.add_status(f"--- Plan {action} ---")
+
+        self.app.sidebar.set_state("replanning")
+
+    def _handle_verification(self, event: AgentEvent) -> None:
+        """Handle post-edit verification result."""
+        data = _extract_dict(event.data)
+        file_path = _get_str(data, "file_path", "unknown")
+        checks = data.get("checks", [])
+
+        if not isinstance(checks, list) or not checks:
+            return
+
+        failed = [c for c in checks if isinstance(c, dict) and not c.get("passed", True)]
+        if not failed:
+            self.app.chat_display.add_status(f"Verification passed for {file_path}")
+            return
+
+        details = []
+        for c in failed[:3]:
+            tool = c.get("tool", "?")
+            output = c.get("output", "")[:100]
+            if output:
+                details.append(f"  [{tool}] {output}")
+            else:
+                details.append(f"  [{tool}] (no output)")
+        msg = f"Verification failed for {file_path}:\n" + "\n".join(details)
+        self.app.chat_display.add_error(msg)
+
+    def _handle_stuck_detected(self, event: AgentEvent) -> None:
+        """Handle stuck detection (non-ask_user strategy)."""
+        data = _extract_dict(event.data)
+        message = _get_str(data, "message", "Agent appears stuck")
+        strategy = _get_str(data, "strategy", "unknown")
+
+        self.app.chat_display.add_status(
+            f"--- Stuck detected: {message} (strategy: {strategy}) ---"
+        )
+        self.app.sidebar.set_state(f"recovering: {strategy}")
+
+    def _handle_ask_user(self, event: AgentEvent) -> None:
+        """Handle ask_user — agent is stuck and needs user guidance."""
+        data = _extract_dict(event.data)
+        message = _get_str(data, "message", "I'm stuck and need your help.")
+
+        self.app.chat_display.add_error(f"Agent needs help: {message}")
+        self.app.chat_display.add_status(
+            "Please provide guidance or try a different approach."
+        )
+        # Re-enable input so user can respond
+        self._current_text = ""
+        self.app.user_input.disabled = False
+        self.app.user_input.set_focus()
+        self.app.sidebar.set_state("waiting for input")
+
+    def _handle_budget_exceeded(self, event: AgentEvent) -> None:
+        """Handle budget exceeded (time or cost)."""
+        data = _extract_dict(event.data)
+        reason = _get_str(data, "reason", "unknown")
+
+        if reason == "time":
+            elapsed = data.get("elapsed", 0)
+            limit = data.get("limit", 0)
+            self.app.chat_display.add_status(
+                f"--- Time budget exceeded ({elapsed:.0f}s / {limit:.0f}s limit) ---"
+            )
+        elif reason == "cost":
+            cost = data.get("cost", 0)
+            limit = data.get("limit", 0)
+            self.app.chat_display.add_status(
+                f"--- Cost budget exceeded (${cost:.4f} / ${limit:.2f} limit) ---"
+            )
+        else:
+            self.app.chat_display.add_status(f"--- Budget exceeded ({reason}) ---")
+
+        self._current_text = ""
+        self.app.user_input.disabled = False
+        self.app.user_input.set_focus()
+        self.app.sidebar.set_state("budget exceeded")
+
     def _update_stats(self) -> None:
         """Update sidebar with current stats."""
-        self.app.sidebar.update_stats(
-            prompt_tokens=self.app.prompt_tokens,
-            completion_tokens=self.app.completion_tokens,
-            total_tokens=self.app.total_tokens,
-            cost=self.app.llm_client.total_usage.estimated_cost,
-            tool_count=self.app.tool_count,
-        )
+        try:
+            self.app.sidebar.update_stats(
+                prompt_tokens=self.app.prompt_tokens,
+                completion_tokens=self.app.completion_tokens,
+                total_tokens=self.app.total_tokens,
+                cost=self.app.llm_client.total_usage.estimated_cost,
+                tool_count=self.app.tool_count,
+            )
+        except Exception:
+            pass  # Sidebar may not exist (debug mode or shutting down)
 
 
 def _extract_dict(data: Any) -> dict[str, Any]:

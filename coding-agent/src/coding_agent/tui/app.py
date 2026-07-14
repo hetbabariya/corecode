@@ -8,7 +8,7 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Footer, Header
+from textual.widgets import Footer, Header, Static
 
 from coding_agent.agent.context import ContextManager
 from coding_agent.agent.loop import AgentLoop
@@ -16,10 +16,12 @@ from coding_agent.agent.permission_callback import QueueCallback
 from coding_agent.agent.permissions import PermissionManager
 from coding_agent.config import Settings
 from coding_agent.llm.client import LLMClient
+from coding_agent.logging import get_tui_handler, setup_logging
 from coding_agent.tui.stream_handler import StreamHandler
 from coding_agent.tui.theme import TUI_CSS
 from coding_agent.tui.widgets.chat import ChatDisplay
 from coding_agent.tui.widgets.input import UserInput
+from coding_agent.tui.widgets.log_viewer import LogViewer
 from coding_agent.tui.widgets.permission import PermissionDialog
 from coding_agent.tui.widgets.sidebar import Sidebar
 
@@ -46,6 +48,7 @@ class CodingAgentApp(App[None]):
         Ctrl+C      → quit
         Ctrl+L      → clear chat
         Ctrl+N      → new session
+        Ctrl+D      → toggle debug/log viewer panel
     """
 
     CSS = TUI_CSS
@@ -55,6 +58,7 @@ class CodingAgentApp(App[None]):
         Binding("ctrl+l", "clear", "Clear Chat"),
         Binding("ctrl+r", "regenerate", "Regenerate"),
         Binding("ctrl+n", "new_session", "New Session"),
+        Binding("ctrl+d", "toggle_debug", "Debug Log"),
     ]
 
     TITLE = "Coding Agent"
@@ -64,6 +68,9 @@ class CodingAgentApp(App[None]):
         super().__init__()
         self.workspace = workspace or Path(".")
         self.settings = Settings()
+
+        # Initialize logging with TUI capture
+        setup_logging(level=self.settings.log_level, capture_for_tui=True)
 
         # Build LLM client
         provider = self.settings.llm_provider
@@ -102,6 +109,9 @@ class CodingAgentApp(App[None]):
         self.total_tokens = 0
         self.tool_count = 0
 
+        # Debug panel state
+        self._debug_visible = False
+
     def compose(self) -> ComposeResult:
         """Build the UI layout."""
         yield Header()
@@ -130,6 +140,9 @@ class CodingAgentApp(App[None]):
         )
         self.chat_display.add_status(
             "Type your message and press Enter to submit. Shift+Enter for newline."
+        )
+        self.chat_display.add_status(
+            "Press Ctrl+D to toggle the debug log panel."
         )
 
     @property
@@ -205,6 +218,69 @@ class CodingAgentApp(App[None]):
         )
         self.chat_display.add_status("New session started.")
 
+    def action_toggle_debug(self) -> None:
+        """Toggle the debug log viewer panel."""
+        self._debug_visible = not self._debug_visible
+
+        if self._debug_visible:
+            self._show_debug_panel()
+        else:
+            self._hide_debug_panel()
+
+    def _show_debug_panel(self) -> None:
+        """Show the debug log viewer, replacing the sidebar."""
+        # Remove sidebar
+        try:
+            sidebar = self.query_one("#sidebar")
+            sidebar.remove()
+        except Exception:
+            pass
+
+        # Create and mount debug panel
+        handler = get_tui_handler()
+        panel = Static(id="debug-panel")
+        self.mount(panel)
+
+        title = Static("Debug Log (Ctrl+D to close)", classes="log-viewer-title")
+        panel.mount(title)
+
+        viewer = LogViewer(handler=handler, id="log-viewer", max_lines=200)
+        panel.mount(viewer)
+
+        # Update grid to single column for debug mode
+        self.screen.styles.grid_size = 1
+        self.screen.styles.grid_columns = "1fr"
+
+    def _hide_debug_panel(self) -> None:
+        """Hide the debug panel and restore the sidebar."""
+        # Remove debug panel
+        try:
+            panel = self.query_one("#debug-panel")
+            panel.remove()
+        except Exception:
+            pass
+
+        # Restore grid and mount sidebar
+        self.screen.styles.grid_size = 2
+        self.screen.styles.grid_columns = "1fr 30"
+
+        sidebar = Sidebar(id="sidebar")
+        self.mount(sidebar)
+        sidebar.update_stats(
+            model=self.llm_client.model,
+            provider=self.llm_client.provider,
+            workspace=str(self.workspace.resolve()),
+            state="idle",
+            tool_count=self.tool_count,
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            total_tokens=self.total_tokens,
+            cost=self.llm_client.total_usage.estimated_cost,
+        )
+
     def set_state(self, state: str) -> None:
         """Update the app state in the sidebar."""
-        self.sidebar.set_state(state)
+        try:
+            self.sidebar.set_state(state)
+        except Exception:
+            pass  # Sidebar may not exist in debug mode

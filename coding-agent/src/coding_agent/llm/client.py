@@ -165,8 +165,21 @@ class LLMClient:
     # Gemini message / tool conversion (OpenAI → Google)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_system_prompt(messages: list[dict[str, Any]]) -> str | None:
+        """Extract and combine all system messages into a single prompt."""
+        parts: list[str] = []
+        for msg in messages:
+            if msg.get("role") == "system" and msg.get("content"):
+                parts.append(msg["content"])
+        return "\n\n".join(parts) if parts else None
+
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[Any]:
-        """Convert OpenAI-format messages to Google GenAI Content objects."""
+        """Convert OpenAI-format messages to Google GenAI Content objects.
+
+        System messages are excluded from the contents list — they are
+        passed separately via ``system_instruction`` in the request config.
+        """
         contents: list[Any] = []
         for msg in messages:
             role: str = msg.get("role", "user")
@@ -249,6 +262,9 @@ class LLMClient:
         config = types.GenerateContentConfig(
             max_output_tokens=self._max_output_tokens,
         )
+        system_prompt = self._extract_system_prompt(messages)
+        if system_prompt:
+            config.system_instruction = system_prompt
         if tools:
             config.tools = self._convert_tools(tools)
 
@@ -310,6 +326,7 @@ class LLMClient:
             provider=self.provider,
             stream=stream,
             tool_count=len(tools or []),
+            message_count=len(messages),
         )
         if self.provider == "gemini":
             return await self._raw_call_gemini(messages, tools=tools, stream=stream)

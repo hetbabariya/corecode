@@ -19,6 +19,11 @@ class EventType(Enum):
     DONE = "done"
     ERROR = "error"
     MAX_ITERATIONS = "max_iter"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    PLAN_UPDATE = "plan_update"
+    VERIFICATION = "verification"
+    STUCK_DETECTED = "stuck_detected"
+    ASK_USER = "ask_user"
 
 
 @dataclass

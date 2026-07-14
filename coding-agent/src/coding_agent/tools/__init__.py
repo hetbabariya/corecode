@@ -3,8 +3,10 @@
 from coding_agent.tools import (
     file_ops,  # noqa: F401 — registers file tools
     git,  # noqa: F401 — registers git tools
+    planning,  # noqa: F401 — registers planning tools
     search,  # noqa: F401 — registers search tools
     shell,  # noqa: F401 — registers shell tools
+    workspace,  # noqa: F401 — registers workspace tools
 )
 from coding_agent.tools.base import BaseTool, ToolResult
 from coding_agent.tools.registry import (
@@ -23,6 +25,7 @@ __all__ = [
     "file_ops",
     "git",
     "infer_schema",
+    "planning",
     "search",
     "shell",
     "tool",

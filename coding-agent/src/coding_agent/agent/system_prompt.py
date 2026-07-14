@@ -205,6 +205,24 @@ Common error patterns:
 - **Context too long**: Focus on recent context, summarize if needed"""
 
 
+def _planning_section() -> str:
+    return """\
+## Planning
+
+For multi-step tasks, use the planning tools:
+
+1. **Create a plan first.** Call `create_plan` with a goal and ordered steps.
+2. **Track progress.** Call `update_plan` to mark steps as in_progress, done, or failed.
+3. **Replan on failure.** If a step fails, assess whether to retry or create a new plan.
+
+A good plan has:
+- Clear, actionable steps (not vague)
+- 3-10 steps (fewer for simple tasks, more for complex ones)
+- Each step produces a verifiable result
+
+Don't over-plan. For simple tasks (read a file, make one edit), skip planning and just act."""
+
+
 def build_static_prompt() -> str:
     """Build the complete static (cacheable) prompt."""
     sections = [
@@ -216,6 +234,7 @@ def build_static_prompt() -> str:
         _safety_section(),
         _communication_section(),
         _error_handling_section(),
+        _planning_section(),
     ]
     return "\n\n".join(sections)
 
@@ -274,6 +293,20 @@ def _memory_section(memory_content: str = "") -> str:
     return f"## Memory\n\n{memory_content}"
 
 
+def _plan_section(plan_prompt: str = "") -> str:
+    """Dynamic section showing the current plan state."""
+    if not plan_prompt:
+        return ""
+    return plan_prompt
+
+
+def _workspace_index_section(index_summary: str = "") -> str:
+    """Dynamic section showing the workspace file tree."""
+    if not index_summary:
+        return ""
+    return f"## Workspace Files\n\n{index_summary}"
+
+
 # ============================================================================
 # Public builder
 # ============================================================================
@@ -284,6 +317,8 @@ def build_system_prompt(
     provider: str = "",
     workspace: Path | None = None,
     memory_content: str = "",
+    plan_prompt: str = "",
+    workspace_index_summary: str = "",
 ) -> str:
     """Build the complete system prompt.
 
@@ -291,10 +326,10 @@ def build_system_prompt(
 
         [static — cacheable]
           identity → principles → tools → editing → execution
-          → safety → communication → errors
+          → safety → communication → errors → planning
 
         [dynamic — per-session]
-          environment → project context → memory
+          environment → project context → memory → plan state → workspace files
 
     Parameters
     ----------
@@ -306,6 +341,10 @@ def build_system_prompt(
         Project root directory. Used to load AGENTS.md, README.md, git info.
     memory_content:
         Optional memory string from past conversations.
+    plan_prompt:
+        Optional serialized plan state from PlanManager.to_prompt().
+    workspace_index_summary:
+        Optional workspace file tree from WorkspaceIndex.to_summary().
     """
     static = build_static_prompt()
 
@@ -324,6 +363,16 @@ def build_system_prompt(
         mem = _memory_section(memory_content)
         if mem:
             dynamic_parts.append(mem)
+
+    if plan_prompt:
+        plan = _plan_section(plan_prompt)
+        if plan:
+            dynamic_parts.append(plan)
+
+    if workspace_index_summary:
+        idx = _workspace_index_section(workspace_index_summary)
+        if idx:
+            dynamic_parts.append(idx)
 
     if dynamic_parts:
         dynamic = "\n\n".join(dynamic_parts)

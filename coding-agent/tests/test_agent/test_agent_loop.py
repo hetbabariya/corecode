@@ -247,3 +247,58 @@ class TestAgentLoop:
 
         assert len(agent.context.messages) == 0
         assert agent.permissions.check("write_file", "write") is False
+
+    async def test_time_budget_exceeded(self):
+        """Loop stops when time budget is exceeded."""
+        llm = AsyncMock()
+        llm.model = "test"
+        llm.provider = "test"
+
+        tool_call_dict = {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "x.py"}),
+            },
+        }
+
+        async def fake_stream(messages, tools=None):
+            yield StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call_dict)
+            yield StreamEvent(type=StreamEventType.DONE)
+
+        llm.stream = fake_stream
+
+        agent = self._make_agent(llm_client=llm, max_iterations=10)
+        # Set max_time to -1 so elapsed (0) > -1 triggers immediately
+        agent.max_time = -1
+
+        events = [e async for e in agent.process_input("do something")]
+        budget_events = [e for e in events if e.type == EventType.BUDGET_EXCEEDED]
+        assert len(budget_events) == 1
+        assert budget_events[0].data["reason"] == "time"
+
+    async def test_cost_budget_exceeded(self):
+        """Loop stops when cost budget is exceeded."""
+        llm = AsyncMock()
+        llm.model = "test"
+        llm.provider = "test"
+
+        async def fake_stream(messages, tools=None):
+            yield StreamEvent(type=StreamEventType.TEXT, data="Hi")
+            yield StreamEvent(
+                type=StreamEventType.USAGE,
+                data={"prompt_tokens": 1000000, "completion_tokens": 0},
+            )
+            yield StreamEvent(type=StreamEventType.DONE)
+
+        llm.stream = fake_stream
+
+        agent = self._make_agent(llm_client=llm, max_iterations=10)
+        # Set max_cost to 0 so the first usage triggers it
+        agent.max_cost = 0.0
+
+        events = [e async for e in agent.process_input("expensive task")]
+        budget_events = [e for e in events if e.type == EventType.BUDGET_EXCEEDED]
+        assert len(budget_events) == 1
+        assert budget_events[0].data["reason"] == "cost"

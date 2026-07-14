@@ -173,4 +173,23 @@ Screen {
     border: solid $primary;
 }
 
+/* ── Debug / Log viewer panel ── */
+#debug-panel {
+    height: 1fr;
+    padding: 1;
+    border-left: solid $warning;
+    overflow-y: auto;
+}
+
+#debug-panel .log-viewer-title {
+    text-style: bold;
+    color: $warning;
+    padding: 0 0 1 0;
+}
+
+#log-viewer {
+    height: 1fr;
+    overflow-y: auto;
+}
+
 """

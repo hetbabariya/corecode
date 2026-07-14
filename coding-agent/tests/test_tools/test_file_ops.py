@@ -612,7 +612,7 @@ class TestListFiles:
 
 class TestRegistryIntegration:
     def test_all_tools_registered(self) -> None:
-        expected = {"read_file", "write_file", "edit_file", "list_files"}
+        expected = {"read_file", "write_file", "edit_file", "list_files", "apply_patch", "multi_edit"}
         registered = set(tool_registry.list_tools())
         assert expected.issubset(registered)
 
@@ -623,6 +623,8 @@ class TestRegistryIntegration:
         assert "write_file" in names
         assert "edit_file" in names
         assert "list_files" in names
+        assert "apply_patch" in names
+        assert "multi_edit" in names
 
     def test_read_file_permission(self) -> None:
         tool = tool_registry.get("read_file")
@@ -639,6 +641,14 @@ class TestRegistryIntegration:
     def test_list_files_permission(self) -> None:
         tool = tool_registry.get("list_files")
         assert tool.permission_level == "read"
+
+    def test_apply_patch_permission(self) -> None:
+        tool = tool_registry.get("apply_patch")
+        assert tool.permission_level == "write"
+
+    def test_multi_edit_permission(self) -> None:
+        tool = tool_registry.get("multi_edit")
+        assert tool.permission_level == "write"
 
     def test_read_file_schema_has_path(self) -> None:
         schema = tool_registry.get_schema("read_file")
@@ -663,3 +673,189 @@ class TestRegistryIntegration:
         props = schema["function"]["parameters"]["properties"]
         assert "path" in props
         assert "pattern" in props
+
+
+# ------------------------------------------------------------------
+# apply_patch tests
+# ------------------------------------------------------------------
+
+
+class TestApplyPatch:
+    """Tests for the apply_patch tool."""
+
+    async def test_apply_single_hunk(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("line1\nline2\nline3\n")  # type: ignore[union-attr]
+
+        patch = """@@ -1,3 +1,3 @@
+ line1
+-line2
++line2_modified
+ line3"""
+
+        result = await tool_registry.execute("apply_patch", {"path": str(file), "patch": patch})
+        assert result.success is True
+        assert "1 hunk" in result.output
+        assert file.read_text() == "line1\nline2_modified\nline3\n"  # type: ignore[union-attr]
+
+    async def test_apply_multi_hunk(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("aaa\nbbb\nccc\nddd\neee\n")  # type: ignore[union-attr]
+
+        patch = """@@ -1,2 +1,2 @@
+ aaa
+-bbb
++BBB
+@@ -4,2 +4,2 @@
+ ddd
+-eee
++EEE"""
+
+        result = await tool_registry.execute("apply_patch", {"path": str(file), "patch": patch})
+        assert result.success is True
+        assert "2 hunk" in result.output
+        assert file.read_text() == "aaa\nBBB\nccc\nddd\nEEE\n"  # type: ignore[union-attr]
+
+    async def test_file_not_found(self) -> None:
+        result = await tool_registry.execute("apply_patch", {"path": "/nonexistent/file.py", "patch": "@@ -0,0 +1 @@\n+hello"})
+        assert result.success is False
+        assert "not found" in result.error
+
+    async def test_directory_not_file(self, tmp_path: object) -> None:
+        result = await tool_registry.execute("apply_patch", {"path": str(tmp_path), "patch": "@@ -0,0 +1 @@\n+hello"})  # type: ignore[arg-type]
+        assert result.success is False
+        assert "directory" in result.error
+
+    async def test_no_hunks(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("hello\n")  # type: ignore[union-attr]
+
+        result = await tool_registry.execute("apply_patch", {"path": str(file), "patch": "this is not a diff"})
+        assert result.success is False
+        assert "No valid hunks" in result.error
+
+    async def test_hunk_does_not_match(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("hello\nworld\n")  # type: ignore[union-attr]
+
+        patch = """@@ -1,2 +1,2 @@
+ goodbye
+-world
++universe"""
+
+        result = await tool_registry.execute("apply_patch", {"path": str(file), "patch": patch})
+        assert result.success is False
+        assert "does not match" in result.error
+
+    async def test_preserves_trailing_newline(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("aaa\nbbb\n")  # type: ignore[union-attr]
+
+        patch = """@@ -1,2 +1,2 @@
+ aaa
+-bbb
++ccc"""
+
+        result = await tool_registry.execute("apply_patch", {"path": str(file), "patch": patch})
+        assert result.success is True
+        content = file.read_text()  # type: ignore[union-attr]
+        assert content.endswith("\n")
+        assert content == "aaa\nccc\n"
+
+
+# ------------------------------------------------------------------
+# multi_edit tests
+# ------------------------------------------------------------------
+
+
+class TestMultiEdit:
+    """Tests for the multi_edit tool."""
+
+    async def test_single_edit(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("def foo(): pass\n")  # type: ignore[union-attr]
+
+        result = await tool_registry.execute("multi_edit", {
+            "path": str(file),
+            "edits": [{"old_text": "def foo():", "new_text": "def bar():"}],
+        })
+        assert result.success is True
+        assert "1 edit" in result.output
+        assert file.read_text() == "def bar(): pass\n"  # type: ignore[union-attr]
+
+    async def test_multiple_edits(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("a = 1\nb = 2\nc = 3\n")  # type: ignore[union-attr]
+
+        edits = [
+            {"old_text": "a = 1", "new_text": "a = 10"},
+            {"old_text": "b = 2", "new_text": "b = 20"},
+            {"old_text": "c = 3", "new_text": "c = 30"},
+        ]
+        result = await tool_registry.execute("multi_edit", {"path": str(file), "edits": edits})
+        assert result.success is True
+        assert "3 edit" in result.output
+        assert file.read_text() == "a = 10\nb = 20\nc = 30\n"  # type: ignore[union-attr]
+
+    async def test_no_edits(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("hello\n")  # type: ignore[union-attr]
+
+        result = await tool_registry.execute("multi_edit", {"path": str(file), "edits": []})
+        assert result.success is False
+        assert "No edits" in result.error
+
+    async def test_old_text_not_found(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("hello\n")  # type: ignore[union-attr]
+
+        result = await tool_registry.execute("multi_edit", {
+            "path": str(file),
+            "edits": [{"old_text": "goodbye", "new_text": "hi"}],
+        })
+        assert result.success is False
+        assert "not found" in result.error
+
+    async def test_old_text_multiple_matches(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("a = 1\na = 2\n")  # type: ignore[union-attr]
+
+        result = await tool_registry.execute("multi_edit", {
+            "path": str(file),
+            "edits": [{"old_text": "a = ", "new_text": "b = "}],
+        })
+        assert result.success is False
+        assert "appears" in result.error
+
+    async def test_file_not_found(self) -> None:
+        result = await tool_registry.execute("multi_edit", {
+            "path": "/nonexistent/file.py",
+            "edits": [{"old_text": "a", "new_text": "b"}],
+        })
+        assert result.success is False
+        assert "not found" in result.error
+
+    async def test_validates_all_before_applying(self, tmp_path: object) -> None:
+        p = tmp_path  # type: ignore[assignment]
+        file = p / "test.py"  # type: ignore[union-attr]
+        file.write_text("hello\n")  # type: ignore[union-attr]
+
+        # Second edit will fail — first should not be applied
+        edits = [
+            {"old_text": "hello", "new_text": "world"},
+            {"old_text": "nonexistent", "new_text": "gone"},
+        ]
+        result = await tool_registry.execute("multi_edit", {"path": str(file), "edits": edits})
+        assert result.success is False
+        # File should be unchanged because validation happens before application
+        assert file.read_text() == "hello\n"  # type: ignore[union-attr]
