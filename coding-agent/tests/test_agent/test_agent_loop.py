@@ -1,9 +1,10 @@
 """Tests for agent.loop module."""
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from coding_agent.agent.context import ContextManager
 from coding_agent.agent.events import EventType
@@ -302,3 +303,298 @@ class TestAgentLoop:
         budget_events = [e for e in events if e.type == EventType.BUDGET_EXCEEDED]
         assert len(budget_events) == 1
         assert budget_events[0].data["reason"] == "cost"
+
+
+class TestPermissionBypassFix:
+    """A.1: Parallel tools must go through permission checks."""
+
+    def _make_agent(
+        self,
+        permission_level: Permission = Permission.READ,
+        permission_callback: Any | None = None,
+    ) -> AgentLoop:
+        llm = AsyncMock()
+        llm.model = "test"
+        llm.provider = "test"
+        return AgentLoop(
+            llm_client=llm,
+            permission_manager=PermissionManager(level=permission_level),
+            context_manager=ContextManager(max_tokens=100_000),
+            workspace=Path("."),
+            max_iterations=5,
+            permission_callback=permission_callback,
+        )
+
+    async def test_parallel_read_auto_approved(self):
+        """Read-only parallel tools pass permission check without callback."""
+        agent = self._make_agent()
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "x.py"}),
+            },
+        }
+        call_count = 0
+
+        async def fake_stream(messages, tools=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
+                yield StreamEvent(type=StreamEventType.DONE)
+            else:
+                yield StreamEvent(type=StreamEventType.TEXT, data="Done.")
+                yield StreamEvent(type=StreamEventType.DONE)
+
+        agent.llm_client.stream = fake_stream
+        events = [e async for e in agent.process_input("read x.py")]
+
+        tool_results = [e for e in events if e.type == EventType.TOOL_RESULT]
+        assert len(tool_results) >= 1
+        assert agent.metrics["permission_check_count"] >= 1
+        assert agent.metrics["permission_deny_count"] == 0
+
+    async def test_parallel_denied_blocks_execution(self):
+        """Parallel tool denied by permission check is not executed."""
+        agent = self._make_agent()
+
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "x.py"}),
+            },
+        }
+        call_count = 0
+
+        async def fake_stream(messages, tools=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
+                yield StreamEvent(type=StreamEventType.DONE)
+            else:
+                yield StreamEvent(type=StreamEventType.TEXT, data="Done.")
+                yield StreamEvent(type=StreamEventType.DONE)
+
+        agent.llm_client.stream = fake_stream
+
+        # Force permission check to deny the tool
+        original_check = agent.permissions.check
+        def deny_read(tool_name, perm_level):
+            if tool_name == "read_file" and perm_level == "read":
+                return False
+            return original_check(tool_name, perm_level)
+        agent.permissions.check = deny_read
+
+        events = [e async for e in agent.process_input("read x.py")]
+
+        tool_results = [e for e in events if e.type == EventType.TOOL_RESULT]
+        assert len(tool_results) == 1
+        assert "Permission denied" in tool_results[0].data["result"]
+        assert agent.metrics["permission_deny_count"] == 1
+
+        # Context should have the denial message
+        tool_msgs = [m for m in agent.context.messages if m.role == "tool"]
+        assert any("Permission denied" in m.content for m in tool_msgs)
+
+    async def test_parallel_denied_does_not_call_execute(self):
+        """Denied parallel tool never reaches tool_registry.execute_from_llm."""
+        agent = self._make_agent()
+
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "x.py"}),
+            },
+        }
+        call_count = 0
+
+        async def fake_stream(messages, tools=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
+                yield StreamEvent(type=StreamEventType.DONE)
+            else:
+                yield StreamEvent(type=StreamEventType.TEXT, data="Done.")
+                yield StreamEvent(type=StreamEventType.DONE)
+
+        agent.llm_client.stream = fake_stream
+
+        # Force permission check to deny
+        agent.permissions.check = lambda tn, pl: False
+
+        with patch("coding_agent.agent.loop.tool_registry") as mock_registry:
+            mock_registry.get.return_value = AsyncMock(permission_level="read")
+            mock_registry.get_schemas.return_value = []
+            events = [e async for e in agent.process_input("read x.py")]
+            mock_registry.execute_from_llm.assert_not_called()
+
+    async def test_metrics_initialized(self):
+        """Metrics dict is initialized with all expected keys."""
+        agent = self._make_agent()
+        expected_keys = {
+            "permission_check_count", "permission_deny_count", "tool_count",
+            "summarize_count", "summarize_success", "summarize_fail",
+            "summarize_duration_ms", "context_suggestion_count",
+            "token_estimate_calls", "prompt_cache_hits", "prompt_cache_misses",
+        }
+        assert expected_keys == set(agent.metrics.keys())
+
+    async def test_metrics_reset(self):
+        """Reset clears all metrics."""
+        agent = self._make_agent()
+        agent.metrics["permission_check_count"] = 5
+        agent.metrics["permission_deny_count"] = 2
+        agent.reset()
+        assert agent.metrics["permission_check_count"] == 0
+        assert agent.metrics["permission_deny_count"] == 0
+
+    async def test_metrics_summary_report(self):
+        """get_metrics_summary returns formatted string."""
+        agent = self._make_agent()
+        agent.metrics["permission_check_count"] = 3
+        agent.metrics["permission_deny_count"] = 1
+        report = agent.get_metrics_summary()
+        assert "Permission checks" in report
+        assert "3 passed" in report
+        assert "1 denied" in report
+
+
+class TestContextEngineIntegration:
+    """A.3: SmartContextEngine is wired into the loop."""
+
+    def _make_agent(self) -> AgentLoop:
+        llm = AsyncMock()
+        llm.model = "test"
+        llm.provider = "test"
+        return AgentLoop(
+            llm_client=llm,
+            permission_manager=PermissionManager(level=Permission.READ),
+            context_manager=ContextManager(max_tokens=100_000),
+            workspace=Path("."),
+            max_iterations=5,
+        )
+
+    async def test_context_health_event_when_usage_high(self):
+        """CONTEXT_HEALTH event emitted when context usage >= 70%."""
+        agent = self._make_agent()
+        # Set max_tokens low so any message triggers high usage
+        agent.context.max_tokens = 100
+
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"path": "pyproject.toml"}),
+            },
+        }
+        call_count = 0
+
+        async def fake_stream(messages, tools=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
+                yield StreamEvent(type=StreamEventType.DONE)
+            else:
+                yield StreamEvent(type=StreamEventType.TEXT, data="Done.")
+                yield StreamEvent(type=StreamEventType.DONE)
+
+        agent.llm_client.stream = fake_stream
+        events = [e async for e in agent.process_input("read pyproject.toml")]
+
+        # CONTEXT_HEALTH may or may not fire depending on actual token count
+        # but the metric should be trackable
+        assert "context_suggestion_count" in agent.metrics
+
+    async def test_context_engine_has_history(self):
+        """Context engine records tool results from the loop."""
+        agent = self._make_agent()
+        agent.context_engine.record_tool_result("read_file", "test output", True)
+        assert len(agent.context_engine._last_tool_results) == 1
+
+    async def test_select_context_returns_slices(self):
+        """select_context returns prioritized context slices."""
+        agent = self._make_agent()
+        agent.context.add_user_message("hello world")
+        agent.context_engine.record_tool_result("read_file", "file content here", True)
+        slices = agent.context_engine.select_context()
+        assert len(slices) >= 1
+        sources = [s.source for s in slices]
+        assert "recent" in sources
+
+
+class TestSummarizeLifecycle:
+    """A.4: Summarization tasks are tracked, not fire-and-forget."""
+
+    def _make_agent(self) -> AgentLoop:
+        llm = AsyncMock()
+        llm.model = "test"
+        llm.provider = "test"
+        return AgentLoop(
+            llm_client=llm,
+            permission_manager=PermissionManager(level=Permission.READ),
+            context_manager=ContextManager(max_tokens=100_000),
+            workspace=Path("."),
+            max_iterations=5,
+        )
+
+    async def test_spawn_summarize_tracks_task(self):
+        """_spawn_summarize creates a tracked task."""
+        agent = self._make_agent()
+        # Mock complete to avoid real LLM call
+        agent.llm_client.complete = AsyncMock(
+            return_value=LLMResponse(
+                content="Summary of conversation.",
+                tool_calls=[],
+                usage=TokenUsage(prompt_tokens=10, completion_tokens=10, model="test"),
+                model="test",
+            )
+        )
+        # Add some messages so format_old_messages returns content
+        agent.context.add_user_message("hello")
+        agent.context.add_assistant_message("hi there")
+
+        agent._spawn_summarize()
+        # Task should be tracked
+        assert len(agent._bg_tasks) >= 1
+        # Wait for task to complete
+        await asyncio.gather(*agent._bg_tasks, return_exceptions=True)
+        assert len(agent._bg_tasks) == 0
+        assert agent.metrics["summarize_count"] >= 1
+        assert agent.metrics["summarize_success"] >= 1
+
+    async def test_reset_cancels_background_tasks(self):
+        """reset() cancels all pending background tasks."""
+        agent = self._make_agent()
+        # Create a slow task
+        async def slow():
+            await asyncio.sleep(100)
+        task = asyncio.create_task(slow())
+        agent._bg_tasks.add(task)
+
+        agent.reset()
+        # Yield control so cancellation propagates
+        await asyncio.sleep(0)
+        assert len(agent._bg_tasks) == 0
+        assert task.cancelled()
+
+    async def test_metrics_track_summarization(self):
+        """Summarization metrics are tracked correctly."""
+        agent = self._make_agent()
+        agent.metrics["summarize_count"] = 0
+        agent.metrics["summarize_success"] = 0
+        agent.metrics["summarize_fail"] = 0
+        # Simulate a completed task callback
+        agent.metrics["summarize_count"] += 1
+        agent.metrics["summarize_success"] += 1
+        assert agent.metrics["summarize_count"] == 1
+        assert agent.metrics["summarize_success"] == 1

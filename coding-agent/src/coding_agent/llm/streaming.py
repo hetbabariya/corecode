@@ -63,9 +63,20 @@ class StreamParser:
         events: list[StreamEvent] = []
 
         if self._finished:
+            # Even after stream end, extract usage from final chunks
+            # (OmniRoute sends actual usage in a chunk after finish_reason)
+            usage_data: dict[str, Any] | None = chunk.get("usage")  # type: ignore[assignment]
+            if usage_data:
+                events.append(StreamEvent(type=StreamEventType.USAGE, data=usage_data))
             return events
 
         choices: list[dict[str, Any]] = chunk.get("choices", [])
+
+        # Usage can arrive in a chunk with empty choices (standard OpenAI behavior)
+        usage_data: dict[str, Any] | None = chunk.get("usage")  # type: ignore[assignment]
+        if usage_data:
+            events.append(StreamEvent(type=StreamEventType.USAGE, data=usage_data))
+
         if not choices:
             return events
 
@@ -118,10 +129,7 @@ class StreamParser:
                         events.append(
                             StreamEvent(type=StreamEventType.TOOL_CALL, data=tool_call)
                         )
-            # Emit usage if present
-            usage_data: dict[str, Any] | None = chunk.get("usage")  # type: ignore[assignment]
-            if usage_data:
-                events.append(StreamEvent(type=StreamEventType.USAGE, data=usage_data))
+            # Emit usage if present (already handled above for empty-choices chunks)
             events.append(StreamEvent(type=StreamEventType.DONE))
 
         return events

@@ -52,10 +52,10 @@ async def remember(
         Optional tags to categorise the memory (e.g. ["python", "style"]).
     """
     if _memory_manager is None:
-        return ToolResult(output="Memory system not initialised.", error=True)
+        return ToolResult(success=False, output="Memory system not initialised.", error="Memory system not initialised.")
 
     if not content.strip():
-        return ToolResult(output="Content cannot be empty.", error=True)
+        return ToolResult(success=False, output="Content cannot be empty.", error="Content cannot be empty.")
 
     row_id = await _memory_manager.store(
         content.strip(),
@@ -65,7 +65,7 @@ async def remember(
 
     tag_str = ", ".join(tags) if tags else "none"
     logger.info("memory_tool_remember", row_id=row_id, tags=tag_str)
-    return ToolResult(output=f"Remembered (id={row_id}): {content.strip()[:120]}")
+    return ToolResult(success=True, output=f"Remembered (id={row_id}): {content.strip()[:120]}")
 
 
 @tool(
@@ -91,12 +91,12 @@ async def recall(
         Maximum number of results to return (default 10).
     """
     if _memory_manager is None:
-        return ToolResult(output="Memory system not initialised.", error=True)
+        return ToolResult(success=False, output="Memory system not initialised.", error="Memory system not initialised.")
 
     memories = await _memory_manager.recall(query, limit=limit)
 
     if not memories:
-        return ToolResult(output="No memories found.")
+        return ToolResult(success=True, output="No memories found.")
 
     lines: list[str] = []
     for m in memories:
@@ -105,4 +105,4 @@ async def recall(
 
     output = "\n".join(lines)
     logger.info("memory_tool_recall", query=query, count=len(memories))
-    return ToolResult(output=output)
+    return ToolResult(success=True, output=output)

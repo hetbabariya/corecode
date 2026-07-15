@@ -38,19 +38,19 @@ def get_undo_stack() -> UndoStack | None:
 async def undo() -> ToolResult:
     """Undo the most recent file change."""
     if _undo_stack is None:
-        return ToolResult(output="Undo system not initialised.", error=True)
+        return ToolResult(success=False, output="Undo system not initialised.", error="Undo system not initialised.")
 
     entry = _undo_stack.undo()
     if entry is None:
-        return ToolResult(output="Nothing to undo.")
+        return ToolResult(success=True, output="Nothing to undo.")
 
     try:
         UndoStack.apply_entry(entry, redo=False)
         desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
-        return ToolResult(output=f"Undone: {desc}")
+        return ToolResult(success=True, output=f"Undone: {desc}")
     except Exception as e:
         logger.error("undo_apply_failed", error=str(e), file=entry.file_path)
-        return ToolResult(output=f"Undo failed: {e}", error=True)
+        return ToolResult(success=False, output=f"Undo failed: {e}", error=f"Undo failed: {e}")
 
 
 @tool(
@@ -64,16 +64,16 @@ async def undo() -> ToolResult:
 async def redo() -> ToolResult:
     """Re-apply the most recently undone change."""
     if _undo_stack is None:
-        return ToolResult(output="Undo system not initialised.", error=True)
+        return ToolResult(success=False, output="Undo system not initialised.", error="Undo system not initialised.")
 
     entry = _undo_stack.redo()
     if entry is None:
-        return ToolResult(output="Nothing to redo.")
+        return ToolResult(success=True, output="Nothing to redo.")
 
     try:
         UndoStack.apply_entry(entry, redo=True)
         desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
-        return ToolResult(output=f"Redone: {desc}")
+        return ToolResult(success=True, output=f"Redone: {desc}")
     except Exception as e:
         logger.error("redo_apply_failed", error=str(e), file=entry.file_path)
-        return ToolResult(output=f"Redo failed: {e}", error=True)
+        return ToolResult(success=False, output=f"Redo failed: {e}", error=f"Redo failed: {e}")

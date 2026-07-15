@@ -9,7 +9,9 @@ class TestEventType:
             "text",
             "tool_start",
             "tool_result",
+            "loop_start",
             "perm_req",
+            "perm_check",
             "perm_res",
             "usage",
             "done",
@@ -20,6 +22,7 @@ class TestEventType:
             "verification",
             "stuck_detected",
             "ask_user",
+            "context_health",
         }
         actual = {e.value for e in EventType}
         assert actual == expected

@@ -32,13 +32,10 @@ class TestConfigCommand:
 
 
 class TestRunCommand:
-    def test_run_without_prompt_launches_tui(self) -> None:
-        from unittest.mock import patch
-
-        with patch("coding_agent.main._launch_tui") as mock_tui:
-            result = runner.invoke(app, ["run"])
-            assert result.exit_code == 0
-            mock_tui.assert_called_once()
+    def test_run_without_prompt_shows_error(self) -> None:
+        result = runner.invoke(app, ["run"])
+        assert result.exit_code == 1
+        assert "No prompt provided" in result.output
 
     def test_run_with_prompt_shows_settings(self) -> None:
         result = runner.invoke(app, ["run", "--prompt", "test"])

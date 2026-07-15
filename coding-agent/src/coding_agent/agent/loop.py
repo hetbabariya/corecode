@@ -90,7 +90,8 @@ class AgentLoop:
         permission_manager: PermissionManager,
         context_manager: ContextManager,
         workspace: Path,
-        max_iterations: int = 20,
+        max_iterations: int = 0,
+        max_iterations_safety: int = 500,
         permission_callback: PermissionCallback | None = None,
         summary_llm_client: LLMClient | None = None,
         max_cost: float = 5.0,
@@ -103,7 +104,8 @@ class AgentLoop:
         self.permissions = permission_manager
         self.context = context_manager
         self.workspace = workspace
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations  # 0 = unlimited
+        self.max_iterations_safety = max_iterations_safety
         self.permission_callback = permission_callback
         self.summary_llm_client = summary_llm_client
         self.max_cost = max_cost
@@ -146,19 +148,34 @@ class AgentLoop:
         # Error recovery and stuck detection
         self.error_tracker = ErrorTracker()
 
+        # Phase A metrics
+        self.metrics: dict[str, int | float] = {
+            "permission_check_count": 0,
+            "permission_deny_count": 0,
+            "tool_count": 0,
+            "summarize_count": 0,
+            "summarize_success": 0,
+            "summarize_fail": 0,
+            "summarize_duration_ms": 0.0,
+            "context_suggestion_count": 0,
+            "token_estimate_calls": 0,
+            "prompt_cache_hits": 0,
+            "prompt_cache_misses": 0,
+        }
+
         # Smart context engine
         self.context_engine = SmartContextEngine(
             context=self.context,
             error_tracker=self.error_tracker,
         )
 
+        # Background task tracking (prevent fire-and-forget)
+        self._bg_tasks: set[asyncio.Task[None]] = set()
+        self._summarize_lock = asyncio.Lock()
+
         # Build and inject the system prompt
-        self.context.system_prompt = build_system_prompt(
-            model=llm_client.model,
-            provider=llm_client.provider,
-            workspace=workspace,
-            workspace_index_summary=self.workspace_index.to_summary(),
-        )
+        self._cached_system_prompt: str | None = None
+        self.context.system_prompt = self._build_system_prompt_cached()
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -172,7 +189,8 @@ class AgentLoop:
 
         The loop runs until one of:
         * The LLM produces a response with **no** tool calls (task complete).
-        * The iteration counter reaches *max_iterations*.
+        * Budget (cost/time) is exceeded.
+        * The safety net iteration limit is reached (should never happen).
         """
         # Load cross-session memories into the system prompt
         if self.memory_manager is not None:
@@ -180,12 +198,8 @@ class AgentLoop:
                 workspace=str(self.workspace),
             )
             if memory_content:
-                self.context.system_prompt = build_system_prompt(
-                    model=self.llm_client.model,
-                    provider=self.llm_client.provider,
-                    workspace=self.workspace,
+                self.context.system_prompt = self._build_system_prompt_cached(
                     memory_content=memory_content,
-                    workspace_index_summary=self.workspace_index.to_summary(),
                 )
 
         self.context.add_user_message(user_input)
@@ -214,13 +228,52 @@ class AgentLoop:
             provider=self.llm_client.provider,
             workspace=str(self.workspace),
             max_iterations=self.max_iterations,
+            max_iterations_safety=self.max_iterations_safety,
             max_cost=self.max_cost,
             max_time=self.max_time,
             input_length=len(user_input),
         )
 
-        for iteration in range(self.max_iterations):
-            logger.info("agent_iteration", iteration=iteration + 1)
+        _iteration = 0
+        while True:
+            _iteration += 1
+            logger.info("agent_iteration", iteration=_iteration)
+            yield AgentEvent(
+                type=EventType.LOOP_START,
+                data={"iteration": _iteration},
+            )
+
+            # --- Check safety net ---
+            if (
+                self.max_iterations_safety > 0
+                and _iteration >= self.max_iterations_safety
+            ):
+                logger.critical(
+                    "agent_safety_net_hit",
+                    iteration=_iteration,
+                    max_safety=self.max_iterations_safety,
+                )
+                yield AgentEvent(
+                    type=EventType.MAX_ITERATIONS,
+                    data={"reason": "safety_net", "iteration": _iteration},
+                )
+                return
+
+            # --- Check user-configured limit (0 = unlimited) ---
+            if (
+                self.max_iterations > 0
+                and _iteration >= self.max_iterations
+            ):
+                logger.warning(
+                    "agent_max_iterations",
+                    max_iterations=self.max_iterations,
+                    iteration=_iteration,
+                )
+                yield AgentEvent(
+                    type=EventType.MAX_ITERATIONS,
+                    data={"reason": "user_limit", "iteration": _iteration},
+                )
+                return
 
             # --- Check budget ---
             elapsed = time.monotonic() - self._start_time
@@ -233,7 +286,13 @@ class AgentLoop:
                 )
                 yield AgentEvent(
                     type=EventType.BUDGET_EXCEEDED,
-                    data={"reason": "time", "elapsed": elapsed, "limit": self.max_time},
+                    data={
+                        "reason": "time",
+                        "elapsed": elapsed,
+                        "limit": self.max_time,
+                        "can_continue": True,
+                        "iteration": _iteration,
+                    },
                 )
                 return
             if self._accumulated_cost >= self.max_cost:
@@ -249,6 +308,8 @@ class AgentLoop:
                         "reason": "cost",
                         "cost": self._accumulated_cost,
                         "limit": self.max_cost,
+                        "can_continue": True,
+                        "iteration": _iteration,
                     },
                 )
                 return
@@ -256,12 +317,8 @@ class AgentLoop:
             # --- Inject plan state into system prompt ---
             if self.plan_manager.has_plan:
                 plan_prompt = self.plan_manager.to_prompt()
-                self.context.system_prompt = build_system_prompt(
-                    model=self.llm_client.model,
-                    provider=self.llm_client.provider,
-                    workspace=self.workspace,
+                self.context.system_prompt = self._build_system_prompt_cached(
                     plan_prompt=plan_prompt,
-                    workspace_index_summary=self.workspace_index.to_summary(),
                 )
 
                 # Check if replanning is needed
@@ -354,15 +411,22 @@ class AgentLoop:
                 logger.info(
                     "agent_session_end",
                     duration_s=round(duration, 1),
-                    iterations=iteration + 1,
+                    iterations=_iteration,
                     tool_count=self._tool_count,
                     total_cost=round(self._accumulated_cost, 4),
                     status="completed",
                 )
+                # Log Phase A metrics
+                self.metrics["tool_count"] = self._tool_count
+                logger.info(
+                    "session_metrics",
+                    **{k: v for k, v in self.metrics.items()},  # type: ignore[arg-type]
+                )
+                print(self.get_metrics_summary())
 
                 # Save episodic memory (session summary)
                 if self.memory_manager is not None:
-                    summary = self._build_session_summary(full_text, iteration + 1)
+                    summary = self._build_session_summary(full_text, _iteration)
                     await self.memory_manager.save_episodic(
                         summary,
                         workspace=str(self.workspace),
@@ -404,7 +468,7 @@ class AgentLoop:
             for pc in parsed_calls:
                 yield AgentEvent(
                     type=EventType.TOOL_START,
-                    data={"name": pc["name"], "args": pc["args"]},
+                    data={"name": pc["name"], "args": pc["args"], "tc_id": pc["tc_id"]},
                 )
 
             # Group into parallel-safe batch and sequential calls
@@ -418,6 +482,8 @@ class AgentLoop:
 
             # Execute parallel-safe tools concurrently
             if parallel_batch:
+                # Permission gate for parallel tools
+                approved_parallel: list[dict[str, Any]] = []
                 for pc in parallel_batch:
                     logger.debug(
                         "tool_call_args",
@@ -425,67 +491,51 @@ class AgentLoop:
                         args=pc["args"],
                         tc_id=pc["tc_id"],
                     )
+                    perm_level = self._resolve_permission_level(pc)
 
-                async def _exec_one(pc: dict[str, Any]) -> tuple[dict[str, Any], ToolResult]:
-                    return pc, await tool_registry.execute_from_llm(pc["tc"])
+                    if not self.permissions.check(pc["name"], perm_level):
+                        logger.info(
+                            "permission_check",
+                            tool=pc["name"],
+                            approved=False,
+                            path="parallel",
+                        )
+                        self.metrics["permission_deny_count"] += 1
+                        async for event in self._emit_permission_deny(pc):
+                            yield event
+                        continue
+                    logger.info(
+                        "permission_check",
+                        tool=pc["name"],
+                        approved=True,
+                        path="parallel",
+                    )
+                    self.metrics["permission_check_count"] += 1
+                    yield AgentEvent(
+                        type=EventType.PERMISSION_CHECK,
+                        data={"tool_name": pc["name"], "approved": True},
+                    )
+                    approved_parallel.append(pc)
 
-                results = await asyncio.gather(
-                    *[_exec_one(pc) for pc in parallel_batch],
-                    return_exceptions=True,
-                )
+                if approved_parallel:
+                    async def _exec_one(pc: dict[str, Any]) -> tuple[dict[str, Any], ToolResult]:
+                        return pc, await tool_registry.execute_from_llm(pc["tc"])
+
+                    results = await asyncio.gather(
+                        *[_exec_one(pc) for pc in approved_parallel],
+                        return_exceptions=True,
+                    )
+                else:
+                    results = []
+
                 for item in results:
                     if isinstance(item, Exception):
                         logger.error("tool_parallel_error", error=str(item))
                         continue
                     pc, result = item
-                    event, output = self._process_tool_result(pc, result)
-                    yield event
-                    self.context.add_tool_result(
-                        tool_call_id=pc["tc_id"],
-                        name=pc["name"],
-                        result=output,
-                    )
-                    # Log full tool result
-                    logger.debug(
-                        "tool_result",
-                        name=pc["name"],
-                        success=result.success,
-                        output_preview=output[:300] if output else "",
-                        output_length=len(output) if output else 0,
-                        error=result.error or "",
-                    )
-                    # Track tool call in plan
-                    if self.plan_manager.has_plan and self.plan_manager.plan:
-                        active = self.plan_manager.plan.active_step
-                        if active is not None:
-                            idx = self.plan_manager.plan.current_step
-                            self.plan_manager.add_tool_call(idx, {
-                                "name": pc["name"],
-                                "args": pc["args"],
-                                "success": result.success,
-                            })
-                    # Record in error tracker
-                    self.error_tracker.record_tool_call(
-                        pc["name"],
-                        pc["args"],
-                        success=result.success,
-                        error=result.error or "",
-                    )
-                    # Record in context engine
-                    self.context_engine.record_tool_result(
-                        pc["name"], output, success=result.success,
-                    )
-                    # Persist tool operation
-                    if self.session_manager is not None and self.session_id is not None:
-                        await self.session_manager.save_operation(
-                            self.session_id, pc["name"], pc["args"],
-                            output[:500], success=result.success,
-                        )
-                    # Verify after edit
-                    verify_event = await self._verify_after_edit(pc["name"], pc["args"], result)
-                    if verify_event is not None:
-                        yield verify_event
-                self._tool_count += len(parallel_batch)
+                    async for event in self._finalize_tool_execution(pc, result):
+                        yield event
+                self._tool_count += len(approved_parallel)
 
             # Execute sequential tools one at a time
             for pc in sequential_calls:
@@ -497,13 +547,20 @@ class AgentLoop:
                     tc_id=pc["tc_id"],
                 )
                 # Permission check
-                try:
-                    tool_obj = tool_registry.get(pc["name"])
-                    perm_level: str = tool_obj.permission_level
-                except KeyError:
-                    perm_level = "read"
+                perm_level = self._resolve_permission_level(pc)
 
                 if not self.permissions.check(pc["name"], perm_level):
+                    logger.info(
+                        "permission_check",
+                        tool=pc["name"],
+                        approved=False,
+                        path="sequential",
+                    )
+                    self.metrics["permission_deny_count"] += 1
+                    yield AgentEvent(
+                        type=EventType.PERMISSION_CHECK,
+                        data={"tool_name": pc["name"], "approved": False},
+                    )
                     yield AgentEvent(
                         type=EventType.PERMISSION_REQUEST,
                         data={
@@ -526,95 +583,111 @@ class AgentLoop:
                             tool=pc["name"],
                             args=pc["args"],
                         )
-                        self.context.add_tool_result(
-                            tool_call_id=pc["tc_id"],
-                            name=pc["name"],
-                            result=(
-                                "Permission denied by user. "
-                                "Try a different approach that doesn't "
-                                "require this operation."
-                            ),
-                        )
-                        yield AgentEvent(
-                            type=EventType.TOOL_RESULT,
-                            data={
-                                "name": pc["name"],
-                                "result": "Permission denied by user.",
-                            },
-                        )
+                        async for event in self._emit_permission_deny(pc):
+                            yield event
                         continue
 
                     self.permissions.approve_tool(pc["name"])
+                    yield AgentEvent(
+                        type=EventType.PERMISSION_CHECK,
+                        data={"tool_name": pc["name"], "approved": True},
+                    )
+                else:
+                    self.metrics["permission_check_count"] += 1
+                    yield AgentEvent(
+                        type=EventType.PERMISSION_CHECK,
+                        data={"tool_name": pc["name"], "approved": True},
+                    )
 
                 result = await tool_registry.execute_from_llm(pc["tc"])
                 tool_duration_ms = (time.monotonic() - tool_start) * 1000
-                event, output = self._process_tool_result(pc, result)
-                yield event
                 self._tool_count += 1
-                self.context.add_tool_result(
-                    tool_call_id=pc["tc_id"],
-                    name=pc["name"],
-                    result=output,
-                )
-                # Log full tool result
-                logger.debug(
-                    "tool_result",
-                    name=pc["name"],
-                    success=result.success,
-                    output_preview=output[:300] if output else "",
-                    output_length=len(output) if output else 0,
-                    error=result.error or "",
-                    duration_ms=round(tool_duration_ms, 1),
-                )
-                # Track tool call in plan
-                if self.plan_manager.has_plan and self.plan_manager.plan:
-                    active = self.plan_manager.plan.active_step
-                    if active is not None:
-                        idx = self.plan_manager.plan.current_step
-                        self.plan_manager.add_tool_call(idx, {
-                            "name": pc["name"],
-                            "args": pc["args"],
-                            "success": result.success,
-                        })
-                # Record in error tracker
-                self.error_tracker.record_tool_call(
-                    pc["name"],
-                    pc["args"],
-                    success=result.success,
-                    error=result.error or "",
-                )
-                # Record in context engine
-                self.context_engine.record_tool_result(
-                    pc["name"], output, success=result.success,
-                )
-                # Persist tool operation
-                if self.session_manager is not None and self.session_id is not None:
-                    await self.session_manager.save_operation(
-                        self.session_id, pc["name"], pc["args"],
-                        output[:500], success=result.success,
-                    )
-                # Verify after edit
-                verify_event = await self._verify_after_edit(pc["name"], pc["args"], result)
-                if verify_event is not None:
-                    yield verify_event
+                async for event in self._finalize_tool_execution(pc, result, tool_duration_ms):
+                    yield event
 
             # --- Check context budget (progressive thresholds) ---
-            self._check_context_usage()
+            usage_ratio = await self._check_context_usage()
 
-        # Iteration budget exhausted
-        duration = time.monotonic() - self._start_time
-        logger.warning(
-            "agent_max_iterations",
-            max_iterations=self.max_iterations,
-            duration_s=round(duration, 1),
-            tool_count=self._tool_count,
-            total_cost=round(self._accumulated_cost, 4),
-        )
-        yield AgentEvent(type=EventType.MAX_ITERATIONS)
+            # --- Smart context engine: select prioritized context ---
+            slices = self.context_engine.select_context(
+                include_error_context=True,
+                include_verification=True,
+                include_plan=self.plan_manager.has_plan,
+                plan_text=self.plan_manager.to_prompt() if self.plan_manager.has_plan else "",
+            )
+            if slices:
+                context_summary = self.context_engine.format_selected_context(slices)
+                total_est = self.context_engine.get_total_tokens(slices)
+                self.metrics["context_suggestion_count"] += 1
+                logger.info(
+                    "context_engine_selection",
+                    slice_count=len(slices),
+                    total_tokens=total_est,
+                    usage_ratio=f"{usage_ratio:.1%}",
+                )
+                # Inject as system-level context so the LLM sees prioritized info
+                self.context.set_context_summary(context_summary[:2000])
+                yield AgentEvent(
+                    type=EventType.CONTEXT_HEALTH,
+                    data={
+                        "usage_ratio": usage_ratio,
+                        "slice_count": len(slices),
+                        "total_tokens": total_est,
+                        "sources": [s.source for s in slices],
+                    },
+                )
 
     # ------------------------------------------------------------------
     # Tool result processing
     # ------------------------------------------------------------------
+
+    def _resolve_permission_level(self, pc: dict[str, Any]) -> str:
+        """Look up the permission level for a tool call."""
+        try:
+            return tool_registry.get(pc["name"]).permission_level
+        except KeyError:
+            return "read"
+
+    async def _emit_permission_deny(self, pc: dict[str, Any]) -> AsyncIterator[AgentEvent]:
+        """Yield events for a permission denial (shared by parallel and sequential paths)."""
+        yield AgentEvent(
+            type=EventType.PERMISSION_CHECK,
+            data={"tool_name": pc["name"], "approved": False},
+        )
+        self.context.add_tool_result(
+            tool_call_id=pc["tc_id"],
+            name=pc["name"],
+            result=(
+                "Permission denied by user. "
+                "Try a different approach that doesn't "
+                "require this operation."
+            ),
+        )
+        yield AgentEvent(
+            type=EventType.TOOL_RESULT,
+            data={
+                "name": pc["name"],
+                "result": "Permission denied by user.",
+                "tc_id": pc["tc_id"],
+            },
+        )
+
+    async def _finalize_tool_execution(
+        self,
+        pc: dict[str, Any],
+        result: ToolResult,
+        tool_duration_ms: float | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Shared post-execute processing: emit event, add to context, run side effects."""
+        event, output = self._process_tool_result(pc, result)
+        yield event
+        self.context.add_tool_result(
+            tool_call_id=pc["tc_id"],
+            name=pc["name"],
+            result=output,
+        )
+        async for sub_event in self._post_tool_actions(pc, result, output, tool_duration_ms):
+            yield sub_event
 
     def _process_tool_result(
         self, pc: dict[str, Any], result: ToolResult
@@ -622,7 +695,7 @@ class AgentLoop:
         """Process a tool result: truncate, inject instructions, return event + output."""
         event = AgentEvent(
             type=EventType.TOOL_RESULT,
-            data={"name": pc["name"], "result": result},
+            data={"name": pc["name"], "result": result, "tc_id": pc["tc_id"]},
         )
 
         output = result.output
@@ -643,6 +716,66 @@ class AgentLoop:
         self._update_index_after_tool(pc["name"], pc["args"], result)
 
         return event, output
+
+    async def _post_tool_actions(
+        self,
+        pc: dict[str, Any],
+        result: ToolResult,
+        output: str,
+        tool_duration_ms: float | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Shared post-execution side effects for both parallel and sequential paths.
+
+        Handles: logging, plan tracking, error recording, context engine,
+        session persistence, and verification.
+        """
+        # Log full tool result
+        log_kwargs: dict[str, Any] = {
+            "name": pc["name"],
+            "success": result.success,
+            "output_preview": output[:300] if output else "",
+            "output_length": len(output) if output else 0,
+            "error": result.error or "",
+        }
+        if tool_duration_ms is not None:
+            log_kwargs["duration_ms"] = round(tool_duration_ms, 1)
+        logger.debug("tool_result", **log_kwargs)
+
+        # Track tool call in plan
+        if self.plan_manager.has_plan and self.plan_manager.plan:
+            active = self.plan_manager.plan.active_step
+            if active is not None:
+                idx = self.plan_manager.plan.current_step
+                self.plan_manager.add_tool_call(idx, {
+                    "name": pc["name"],
+                    "args": pc["args"],
+                    "success": result.success,
+                })
+
+        # Record in error tracker
+        self.error_tracker.record_tool_call(
+            pc["name"],
+            pc["args"],
+            success=result.success,
+            error=result.error or "",
+        )
+
+        # Record in context engine
+        self.context_engine.record_tool_result(
+            pc["name"], output, success=result.success,
+        )
+
+        # Persist tool operation
+        if self.session_manager is not None and self.session_id is not None:
+            await self.session_manager.save_operation(
+                self.session_id, pc["name"], pc["args"],
+                output[:500], success=result.success,
+            )
+
+        # Verify after edit
+        verify_event = await self._verify_after_edit(pc["name"], pc["args"], result)
+        if verify_event is not None:
+            yield verify_event
 
     def _update_index_after_tool(
         self, tool_name: str, args: dict[str, Any], result: ToolResult
@@ -725,6 +858,33 @@ class AgentLoop:
     # Summarization
     # ------------------------------------------------------------------
 
+    def _spawn_summarize(self) -> None:
+        """Spawn a tracked summarization task with lock to prevent concurrent runs."""
+        if self._summarize_lock.locked():
+            logger.debug("summarize_skipped", reason="already_in_progress")
+            return
+        task = asyncio.create_task(self._summarize_with_lock())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._on_summarize_done)
+
+    async def _summarize_with_lock(self) -> None:
+        """Summarize context under lock to prevent concurrent mutations."""
+        async with self._summarize_lock:
+            await self._summarize_context()
+
+    def _on_summarize_done(self, task: asyncio.Task[None]) -> None:
+        """Callback when summarization task completes."""
+        self._bg_tasks.discard(task)
+        self.metrics["summarize_count"] += 1
+        if task.cancelled():
+            self.metrics["summarize_fail"] += 1
+            logger.warning("summarize_cancelled")
+        elif task.exception() is not None:
+            self.metrics["summarize_fail"] += 1
+            logger.error("summarize_failed", error=str(task.exception()))
+        else:
+            self.metrics["summarize_success"] += 1
+
     async def _summarize_context(self) -> None:
         """Generate a summary of old messages using the LLM."""
         old_text = self.context.format_old_messages()
@@ -749,31 +909,38 @@ class AgentLoop:
             },
         ]
 
+        start = time.monotonic()
+        logger.info("summarize_start")
         try:
             response = await client.complete(summary_messages)
             self.context.summarize_old_messages(response.content)
+            duration_ms = (time.monotonic() - start) * 1000
+            self.metrics["summarize_duration_ms"] += duration_ms
             logger.info(
-                "agent_context_summarized",
+                "summarize_complete",
                 summary_length=len(response.content),
+                duration_ms=round(duration_ms, 1),
             )
         except Exception as e:
-            logger.error("agent_summarize_failed", error=str(e))
+            logger.error("summarize_failed", error=str(e))
+            raise
 
     # ------------------------------------------------------------------
     # Context usage checking (progressive thresholds)
     # ------------------------------------------------------------------
 
-    def _check_context_usage(self) -> float:
+    async def _check_context_usage(self) -> float:
         """Check context usage and trigger summarization at progressive thresholds.
 
         Thresholds:
         - 70%: Soft warning (log only)
-        - 85%: Trigger summarization of old messages
-        - 95%: Aggressive summarization + emit warning event
+        - 85%: Fire-and-forget summarization with lock
+        - 95%: Await summarization (blocking) + emit warning event
 
         Returns the current usage ratio (0.0 - 1.0+).
         """
         tokens = self.context.estimate_tokens()
+        self.metrics["token_estimate_calls"] += 1
         max_tokens = self.context.max_tokens
         if max_tokens <= 0:
             return 0.0
@@ -787,8 +954,11 @@ class AgentLoop:
                 max=max_tokens,
                 ratio=f"{ratio:.1%}",
             )
-            # Aggressive: summarize immediately
-            asyncio.create_task(self._summarize_context())
+            # Critical: await summarization to prevent context overflow
+            async with self._summarize_lock:
+                await self._summarize_context()
+                self.metrics["summarize_count"] += 1
+                self.metrics["summarize_success"] += 1
         elif ratio >= 0.85:
             logger.info(
                 "context_usage_high",
@@ -797,7 +967,7 @@ class AgentLoop:
                 ratio=f"{ratio:.1%}",
             )
             # Trigger summarization
-            asyncio.create_task(self._summarize_context())
+            self._spawn_summarize()
         elif ratio >= 0.70:
             logger.debug(
                 "context_usage_elevated",
@@ -815,6 +985,11 @@ class AgentLoop:
 
     def reset(self) -> None:
         """Clear conversation state for a fresh session."""
+        # Cancel background tasks
+        for task in self._bg_tasks:
+            task.cancel()
+        self._bg_tasks.clear()
+
         self.context.clear()
         self.permissions.reset()
         self.plan_manager.reset()
@@ -823,6 +998,47 @@ class AgentLoop:
         self.session_id = None
         if self.memory_manager is not None:
             self.memory_manager.clear_working()
+        # Reset metrics
+        for key in self.metrics:
+            self.metrics[key] = 0 if isinstance(self.metrics[key], int) else 0.0
+
+    # ------------------------------------------------------------------
+    # System prompt caching
+    # ------------------------------------------------------------------
+
+    def _build_system_prompt_cached(
+        self, plan_prompt: str = "", memory_content: str = ""
+    ) -> str:
+        """Build system prompt with caching of static sections.
+
+        The static prompt (identity, tools, safety, etc.) and workspace-dependent
+        sections (environment, project context) are cached. Only plan and memory
+        changes trigger a rebuild.
+        """
+        if self._cached_system_prompt is None:
+            self._cached_system_prompt = build_system_prompt(
+                model=self.llm_client.model,
+                provider=self.llm_client.provider,
+                workspace=self.workspace,
+                workspace_index_summary=self.workspace_index.to_summary(),
+            )
+            self.metrics["prompt_cache_misses"] += 1
+            logger.debug("prompt_cache_miss")
+        else:
+            self.metrics["prompt_cache_hits"] += 1
+
+        # Append dynamic sections (plan, memory) that may change per iteration
+        base = self._cached_system_prompt
+        if plan_prompt:
+            base += f"\n\n## Current Plan\n\n{plan_prompt}"
+        if memory_content:
+            base += f"\n\n## Memory\n\n{memory_content}"
+
+        return base
+
+    def invalidate_prompt_cache(self) -> None:
+        """Force prompt rebuild on next call (e.g. after workspace changes)."""
+        self._cached_system_prompt = None
 
     # ------------------------------------------------------------------
     # Session summary for episodic memory
@@ -840,3 +1056,22 @@ class AgentLoop:
             if preview:
                 parts.append(f"Result: {preview}")
         return " ".join(parts)
+
+    # ------------------------------------------------------------------
+    # Metrics summary report
+    # ------------------------------------------------------------------
+
+    def get_metrics_summary(self) -> str:
+        """Return a formatted summary of Phase A metrics for this session."""
+        m = self.metrics
+        lines = [
+            "=== Session Metrics ===",
+            f"  Permission checks:   {m['permission_check_count']} passed, {m['permission_deny_count']} denied",
+            f"  Tools executed:      {m['tool_count']}",
+            f"  Summarizations:      {m['summarize_count']} total, {m['summarize_success']} ok, {m['summarize_fail']} failed",
+            f"  Summarize avg time:  {m['summarize_duration_ms'] / max(m['summarize_count'], 1):.0f}ms",
+            f"  Context suggestions: {m['context_suggestion_count']}",
+            f"  Token estimate calls:{m['token_estimate_calls']}",
+            f"  Prompt cache:        {m['prompt_cache_hits']} hits, {m['prompt_cache_misses']} misses",
+        ]
+        return "\n".join(lines)

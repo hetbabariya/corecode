@@ -131,8 +131,8 @@ def _is_binary(data: bytes, check_bytes: int = 8192) -> bool:
 )
 async def read_file(
     path: str,
-    offset: int | None = None,
-    limit: int | None = None,
+    offset: int | str | None = None,
+    limit: int | str | None = None,
 ) -> ToolResult:
     """Read a file and return its contents with line numbers."""
     p = Path(path).resolve()
@@ -160,8 +160,18 @@ async def read_file(
 
     lines = text.splitlines()
 
-    start = max((offset or 1) - 1, 0)
-    end = (start + limit) if limit else len(lines)
+    # Coerce to int (LLM may send strings)
+    try:
+        offset_int = int(offset) if offset is not None else None
+    except (ValueError, TypeError):
+        offset_int = None
+    try:
+        limit_int = int(limit) if limit is not None else None
+    except (ValueError, TypeError):
+        limit_int = None
+
+    start = max((offset_int or 1) - 1, 0)
+    end = (start + limit_int) if limit_int else len(lines)
     selected = lines[start:end]
 
     numbered = [f"{i + 1}: {line}" for i, line in enumerate(selected, start=start)]

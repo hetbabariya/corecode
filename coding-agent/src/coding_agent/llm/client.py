@@ -1,4 +1,4 @@
-"""LLM client with provider abstraction (Gemini / OpenRouter), key-pool rotation, and streaming."""
+"""LLM client with provider abstraction (Gemini / OpenRouter / Cerebras / ZenMux / OmniRoute), key-pool rotation, and streaming."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ from coding_agent.logging import logger
 # ---------------------------------------------------------------------------
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_CEREBRAS_BASE_URL = "https://api.cerebras.ai"
+_ZENMUX_BASE_URL = "https://zenmux.ai/api/v1"
+_OMNIROUTE_BASE_URL = "http://localhost:20128/v1"
 
 
 def _is_rate_limit(exc: Exception) -> bool:
@@ -68,9 +71,12 @@ class LLMResponse:
 class LLMClient:
     """Async LLM client with key-pool rotation and streaming support.
 
-    Supports two providers:
+    Supports five providers:
     - ``gemini``: Google GenAI SDK (default)
     - ``openrouter``: OpenRouter HTTP API (OpenAI-compatible)
+    - ``cerebras``: Cerebras HTTP API (OpenAI-compatible)
+    - ``zenmux``: ZenMux HTTP API (OpenAI-compatible)
+    - ``omniroute``: OmniRoute gateway (OpenAI-compatible, SSE for all responses)
 
     When multiple API keys are provided, the client rotates to the next key
     on 429 / 404 errors and retries immediately.  After all keys are exhausted
@@ -101,16 +107,24 @@ class LLMClient:
         self.genai_aclient: Any = None
         self._old_clients: list[Any] = []
 
-        # OpenRouter uses httpx
+        # OpenRouter, Cerebras, ZenMux, and OmniRoute use httpx
         self._http_client: httpx.AsyncClient | None = None
+        self._zenmux_base_url: str = _ZENMUX_BASE_URL
+        self._omniroute_base_url: str = _OMNIROUTE_BASE_URL
 
         if provider == "gemini":
             self._init_gemini()
         elif provider == "openrouter":
             self._init_openrouter()
+        elif provider == "cerebras":
+            self._init_cerebras()
+        elif provider == "zenmux":
+            self._init_zenmux()
+        elif provider == "omniroute":
+            self._init_omniroute()
         else:
             raise ValueError(
-                f"Unknown provider: {provider!r}. Use 'gemini' or 'openrouter'."
+                f"Unknown provider: {provider!r}. Use 'gemini', 'openrouter', 'cerebras', 'zenmux', or 'omniroute'."
             )
 
     # ------------------------------------------------------------------
@@ -129,6 +143,36 @@ class LLMClient:
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://github.com/coding-agent",
                 "X-Title": "coding-agent",
+            },
+            timeout=httpx.Timeout(120.0),
+        )
+
+    def _init_cerebras(self) -> None:
+        self._http_client = httpx.AsyncClient(
+            base_url=_CEREBRAS_BASE_URL,
+            headers={
+                "Authorization": f"Bearer {self._current_api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=httpx.Timeout(120.0),
+        )
+
+    def _init_zenmux(self) -> None:
+        self._http_client = httpx.AsyncClient(
+            base_url=self._zenmux_base_url,
+            headers={
+                "Authorization": f"Bearer {self._current_api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=httpx.Timeout(120.0),
+        )
+
+    def _init_omniroute(self) -> None:
+        self._http_client = httpx.AsyncClient(
+            base_url=self._omniroute_base_url,
+            headers={
+                "Authorization": f"Bearer {self._current_api_key}",
+                "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(120.0),
         )
@@ -153,6 +197,39 @@ class LLMClient:
                     "Content-Type": "application/json",
                     "HTTP-Referer": "https://github.com/coding-agent",
                     "X-Title": "coding-agent",
+                },
+                timeout=httpx.Timeout(120.0),
+            )
+            self._old_clients.append(old)
+        elif self.provider == "cerebras" and self._http_client is not None:
+            old = self._http_client
+            self._http_client = httpx.AsyncClient(
+                base_url=_CEREBRAS_BASE_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(120.0),
+            )
+            self._old_clients.append(old)
+        elif self.provider == "zenmux" and self._http_client is not None:
+            old = self._http_client
+            self._http_client = httpx.AsyncClient(
+                base_url=self._zenmux_base_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(120.0),
+            )
+            self._old_clients.append(old)
+        elif self.provider == "omniroute" and self._http_client is not None:
+            old = self._http_client
+            self._http_client = httpx.AsyncClient(
+                base_url=self._omniroute_base_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
                 },
                 timeout=httpx.Timeout(120.0),
             )
@@ -301,6 +378,7 @@ class LLMClient:
             payload["tools"] = tools
         if stream:
             payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
 
         assert self._http_client is not None
         response = await self._http_client.post("/chat/completions", json=payload)
@@ -308,6 +386,204 @@ class LLMClient:
 
         if stream:
             return response
+        return response.json()
+
+    async def _raw_call_cerebras(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+    ) -> Any:
+        """Single raw call to Cerebras via httpx — no retries, no rotation."""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": self._max_output_tokens,
+        }
+        if tools:
+            payload["tools"] = tools
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
+        assert self._http_client is not None
+        response = await self._http_client.post("/v1/chat/completions", json=payload)
+        response.raise_for_status()
+
+        if stream:
+            return response
+        return response.json()
+
+    async def _raw_call_zenmux(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+    ) -> Any:
+        """Single raw call to ZenMux via httpx — no retries, no rotation."""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": self._max_output_tokens,
+        }
+        if tools:
+            payload["tools"] = tools
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
+        assert self._http_client is not None
+        response = await self._http_client.post("/chat/completions", json=payload)
+        response.raise_for_status()
+
+        if stream:
+            return response
+        return response.json()
+
+    # ------------------------------------------------------------------
+    # SSE helper — OmniRoute returns text/event-stream for all responses
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_sse_response(body: str) -> dict[str, Any]:
+        """Parse OmniRoute SSE response into an OpenAI-format dict.
+
+        OmniRoute returns text/event-stream for ALL chat completions (even
+        non-streaming). This reassembles the chunks into a single response.
+        """
+        content_parts: list[str] = []
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+        finish_reason: str = "stop"
+        usage: dict[str, Any] = {}
+        model: str = ""
+        chunk: dict[str, Any] = {}
+
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+
+            if not model and chunk.get("model"):
+                model = chunk["model"]
+
+            choices = chunk.get("choices", [])
+            if not choices:
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                continue
+
+            delta = choices[0].get("delta", {})
+            fr = choices[0].get("finish_reason")
+            if fr:
+                finish_reason = fr
+
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+
+            if delta.get("tool_calls"):
+                for tc in delta["tool_calls"]:
+                    idx = tc.get("index", 0)
+                    if idx not in tool_calls_by_index:
+                        tool_calls_by_index[idx] = {
+                            "id": tc.get("id", f"call_{idx}"),
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    entry = tool_calls_by_index[idx]
+                    fn_delta = tc.get("function", {})
+                    if fn_delta.get("name"):
+                        entry["function"]["name"] = fn_delta["name"]
+                    if fn_delta.get("arguments"):
+                        entry["function"]["arguments"] += fn_delta["arguments"]
+
+        # Usage is at the top level of the final chunk
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+
+        content = "".join(content_parts) if content_parts else None
+        tool_calls = list(tool_calls_by_index.values()) if tool_calls_by_index else None
+
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tool_calls,
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": usage,
+            "model": model,
+        }
+
+    # ------------------------------------------------------------------
+    # Raw LLM call — OmniRoute
+    # ------------------------------------------------------------------
+
+    async def _raw_call_omniroute(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+    ) -> Any:
+        """Single raw call to OmniRoute via httpx — no retries, no rotation.
+
+        OmniRoute returns SSE for all responses. For non-streaming calls we
+        parse the SSE body into a dict. If the configured model returns 400/404,
+        we retry once with ``model="auto"``.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": self._max_output_tokens,
+        }
+        if tools:
+            payload["tools"] = tools
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
+        assert self._http_client is not None
+        try:
+            if stream:
+                # Use stream() context manager for proper SSE streaming
+                response = await self._http_client.send(
+                    self._http_client.build_request("POST", "/chat/completions", json=payload),
+                    stream=True,
+                )
+                response.raise_for_status()
+            else:
+                response = await self._http_client.post("/chat/completions", json=payload)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Fallback: if model 400/404 and not already "auto", retry with "auto"
+            if exc.response.status_code in (400, 404) and self.model != "auto":
+                logger.warning(
+                    "omniroute_model_fallback",
+                    model=self.model,
+                    status=exc.response.status_code,
+                )
+                fallback_payload = {**payload, "model": "auto"}
+                response = await self._http_client.post("/chat/completions", json=fallback_payload)
+                response.raise_for_status()
+            else:
+                raise
+
+        if stream:
+            return response
+
+        content_type = response.headers.get("content-type", "")
+        if "text/event-stream" in content_type:
+            return self._parse_sse_response(response.text)
         return response.json()
 
     # ------------------------------------------------------------------
@@ -333,6 +609,12 @@ class LLMClient:
         try:
             if self.provider == "gemini":
                 result = await self._raw_call_gemini(messages, tools=tools, stream=stream)
+            elif self.provider == "cerebras":
+                result = await self._raw_call_cerebras(messages, tools=tools, stream=stream)
+            elif self.provider == "zenmux":
+                result = await self._raw_call_zenmux(messages, tools=tools, stream=stream)
+            elif self.provider == "omniroute":
+                result = await self._raw_call_omniroute(messages, tools=tools, stream=stream)
             else:
                 result = await self._raw_call_openrouter(messages, tools=tools, stream=stream)
             latency_ms = (time.monotonic() - call_start) * 1000
@@ -565,7 +847,7 @@ class LLMClient:
         """Parse a provider response into OpenAI-format dict."""
         if self.provider == "gemini":
             return self._parse_gemini_response(response)
-        # OpenRouter — response is already a dict
+        # OpenRouter, Cerebras, ZenMux, OmniRoute — response is already a dict
         data: dict[str, Any] = dict(response) if response else {}
         return self._parse_openrouter_response(data)
 
@@ -654,19 +936,127 @@ class LLMClient:
         )
 
         parser = StreamParser()
+        response_text_parts: list[str] = []
 
         if self.provider == "gemini":
+            chunk_count = 0
             async for chunk in response_stream:
                 chunk_dict = self._parse_gemini_stream_chunk(chunk)
+                chunk_count += 1
+                if chunk_count % 50 == 0 or "usage" in chunk_dict:
+                    logger.debug(
+                        "stream_chunk_gemini",
+                        chunk_num=chunk_count,
+                        has_usage="usage" in chunk_dict,
+                        choices_count=len(chunk_dict.get("choices", [])),
+                    )
                 for event in parser.feed(chunk_dict):
+                    # Accumulate usage from stream events
+                    if event.type == StreamEventType.USAGE and isinstance(event.data, dict):
+                        self.total_usage = TokenUsage(
+                            prompt_tokens=self.total_usage.prompt_tokens
+                            + int(event.data.get("prompt_tokens", 0)),
+                            completion_tokens=self.total_usage.completion_tokens
+                            + int(event.data.get("completion_tokens", 0)),
+                            model=self.model,
+                        )
+                        logger.info(
+                            "stream_usage_received_gemini",
+                            prompt_tokens=event.data.get("prompt_tokens", 0),
+                            completion_tokens=event.data.get("completion_tokens", 0),
+                        )
+                    if event.type == StreamEventType.TEXT and isinstance(event.data, str):
+                        response_text_parts.append(event.data)
                     yield event
+            logger.debug(
+                "stream_finished_gemini",
+                chunk_count=chunk_count,
+                total_prompt=self.total_usage.prompt_tokens,
+                total_completion=self.total_usage.completion_tokens,
+            )
         else:
-            # OpenRouter — httpx Response with SSE stream
+            # OpenRouter / Cerebras / ZenMux / OmniRoute — httpx Response with SSE stream
+            chunk_count = 0
             async for line in response_stream.aiter_lines():
                 chunk_dict = self._parse_openrouter_stream_line(line)
                 if chunk_dict is not None:
+                    chunk_count += 1
+                    # Debug: log every 50th chunk + any chunk with usage
+                    if chunk_count % 50 == 0 or "usage" in chunk_dict:
+                        logger.debug(
+                            "stream_chunk",
+                            chunk_num=chunk_count,
+                            has_usage="usage" in chunk_dict,
+                            choices_count=len(chunk_dict.get("choices", [])),
+                        )
                     for event in parser.feed(chunk_dict):
+                        # Accumulate usage from stream events
+                        if event.type == StreamEventType.USAGE and isinstance(event.data, dict):
+                            self.total_usage = TokenUsage(
+                                prompt_tokens=self.total_usage.prompt_tokens
+                                + int(event.data.get("prompt_tokens", 0)),
+                                completion_tokens=self.total_usage.completion_tokens
+                                + int(event.data.get("completion_tokens", 0)),
+                                model=self.model,
+                            )
+                            logger.info(
+                                "stream_usage_received",
+                                prompt_tokens=event.data.get("prompt_tokens", 0),
+                                completion_tokens=event.data.get("completion_tokens", 0),
+                            )
+                        if event.type == StreamEventType.TEXT and isinstance(event.data, str):
+                            response_text_parts.append(event.data)
                         yield event
+            logger.debug(
+                "stream_finished",
+                chunk_count=chunk_count,
+                total_prompt=self.total_usage.prompt_tokens,
+                total_completion=self.total_usage.completion_tokens,
+            )
+
+        # --- Fallback: estimate tokens when provider didn't send usage ---
+        if self.total_usage.prompt_tokens == 0 and self.total_usage.completion_tokens == 0:
+            try:
+                from coding_agent.llm.tokens import count_tokens
+
+                prompt_estimate = 0
+                for msg in messages:
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        prompt_estimate += count_tokens(content, self.model)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and "text" in part:
+                                prompt_estimate += count_tokens(part["text"], self.model)
+                    # Estimate ~4 tokens per tool schema
+                if tools:
+                    prompt_estimate += len(tools) * 4
+
+                completion_text = "".join(response_text_parts)
+                completion_estimate = count_tokens(completion_text, self.model) if completion_text else 0
+
+                # Yield as USAGE event so agent loop accumulates correctly
+                usage_data = {
+                    "prompt_tokens": prompt_estimate,
+                    "completion_tokens": completion_estimate,
+                }
+                self.total_usage = TokenUsage(
+                    prompt_tokens=self.total_usage.prompt_tokens + prompt_estimate,
+                    completion_tokens=self.total_usage.completion_tokens + completion_estimate,
+                    model=self.model,
+                )
+                logger.info(
+                    "stream_usage_estimated",
+                    prompt_tokens=prompt_estimate,
+                    completion_tokens=completion_estimate,
+                    method="tiktoken_fallback",
+                )
+                yield StreamEvent(type=StreamEventType.USAGE, data=usage_data)
+            except Exception as exc:
+                logger.warning(
+                    "stream_usage_estimate_failed",
+                    error=str(exc),
+                )
 
         if not parser.is_finished:
             yield StreamEvent(type=StreamEventType.DONE)

@@ -13,7 +13,9 @@ class EventType(Enum):
     TEXT = "text"
     TOOL_START = "tool_start"
     TOOL_RESULT = "tool_result"
+    LOOP_START = "loop_start"
     PERMISSION_REQUEST = "perm_req"
+    PERMISSION_CHECK = "perm_check"
     PERMISSION_RESPONSE = "perm_res"
     USAGE = "usage"
     DONE = "done"
@@ -24,6 +26,7 @@ class EventType(Enum):
     VERIFICATION = "verification"
     STUCK_DETECTED = "stuck_detected"
     ASK_USER = "ask_user"
+    CONTEXT_HEALTH = "context_health"
 
 
 @dataclass

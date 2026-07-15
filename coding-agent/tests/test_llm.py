@@ -899,3 +899,297 @@ class TestOpenRouterClient:
             result = await client.complete(messages=[{"role": "user", "content": "Hi"}])
             assert result.content == "Hello from OR"
             assert result.usage.prompt_tokens == 5
+
+
+# ===================================================================
+# Settings.get_cerebras_api_keys tests
+# ===================================================================
+
+
+class TestGetCerebrasApiKeys:
+    def test_comma_separated(self) -> None:
+        settings = Settings(cerebras_api_keys="csk1,csk2,csk3")
+        assert settings.get_cerebras_api_keys() == ["csk1", "csk2", "csk3"]
+
+    def test_single_key_fallback(self) -> None:
+        settings = Settings(cerebras_api_key="csk-single", cerebras_api_keys="")
+        assert settings.get_cerebras_api_keys() == ["csk-single"]
+
+    def test_pool_takes_precedence(self) -> None:
+        settings = Settings(cerebras_api_key="old", cerebras_api_keys="new1,new2")
+        assert settings.get_cerebras_api_keys() == ["new1", "new2"]
+
+    def test_empty_returns_empty(self) -> None:
+        settings = Settings(cerebras_api_keys="", cerebras_api_key="")
+        assert settings.get_cerebras_api_keys() == []
+
+
+# ===================================================================
+# Cerebras provider tests
+# ===================================================================
+
+
+class TestCerebrasClient:
+    def test_init_creates_http_client(self) -> None:
+        client = LLMClient(
+            model="llama-3.3-70b",
+            api_key="csk-test",
+            provider="cerebras",
+        )
+        assert client.provider == "cerebras"
+        assert client._http_client is not None
+
+    def test_parse_cerebras_stream_line_data(self) -> None:
+        line = 'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}'
+        result = LLMClient._parse_openrouter_stream_line(line)
+        assert result is not None
+        assert result["choices"][0]["delta"]["content"] == "Hi"
+
+    def test_parse_cerebras_stream_line_done(self) -> None:
+        result = LLMClient._parse_openrouter_stream_line("data: [DONE]")
+        assert result is not None
+        assert result["choices"][0]["finish_reason"] == "stop"
+
+    def test_parse_cerebras_response_passthrough(self) -> None:
+        data = {
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            "model": "llama-3.3-70b",
+        }
+        result = LLMClient._parse_openrouter_response(data)
+        assert result["choices"][0]["message"]["content"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_cerebras_complete(self) -> None:
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "Hello from Cerebras"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            "model": "llama-3.3-70b",
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch.object(LLMClient, "_init_cerebras"):
+            client = LLMClient(
+                model="llama-3.3-70b",
+                api_key="csk-test",
+                provider="cerebras",
+            )
+            client._http_client = mock_client  # type: ignore[assignment]
+
+            result = await client.complete(messages=[{"role": "user", "content": "Hi"}])
+            assert result.content == "Hello from Cerebras"
+            assert result.usage.prompt_tokens == 5
+
+
+# ===================================================================
+# Settings.get_zenmux_api_keys tests
+# ===================================================================
+
+
+class TestGetZenMuxApiKeys:
+    def test_comma_separated(self) -> None:
+        settings = Settings(zenmux_api_keys="sk1,sk2,sk3")
+        assert settings.get_zenmux_api_keys() == ["sk1", "sk2", "sk3"]
+
+    def test_single_key_fallback(self) -> None:
+        settings = Settings(zenmux_api_key="sk-single", zenmux_api_keys="")
+        assert settings.get_zenmux_api_keys() == ["sk-single"]
+
+    def test_pool_takes_precedence(self) -> None:
+        settings = Settings(zenmux_api_key="old", zenmux_api_keys="new1,new2")
+        assert settings.get_zenmux_api_keys() == ["new1", "new2"]
+
+    def test_empty_returns_empty(self) -> None:
+        settings = Settings(zenmux_api_keys="", zenmux_api_key="")
+        assert settings.get_zenmux_api_keys() == []
+
+
+# ===================================================================
+# ZenMux provider tests
+# ===================================================================
+
+
+class TestZenMuxClient:
+    def test_init_creates_http_client(self) -> None:
+        client = LLMClient(
+            model="stepfun/step-3.7-flash-free",
+            api_key="sk-ai-v1-test",
+            provider="zenmux",
+        )
+        assert client.provider == "zenmux"
+        assert client._http_client is not None
+
+    def test_parse_zenmux_stream_line_data(self) -> None:
+        line = 'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}'
+        result = LLMClient._parse_openrouter_stream_line(line)
+        assert result is not None
+        assert result["choices"][0]["delta"]["content"] == "Hi"
+
+    def test_parse_zenmux_stream_line_done(self) -> None:
+        result = LLMClient._parse_openrouter_stream_line("data: [DONE]")
+        assert result is not None
+        assert result["choices"][0]["finish_reason"] == "stop"
+
+    def test_parse_zenmux_response_passthrough(self) -> None:
+        data = {
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            "model": "stepfun/step-3.7-flash-free",
+        }
+        result = LLMClient._parse_openrouter_response(data)
+        assert result["choices"][0]["message"]["content"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_zenmux_complete(self) -> None:
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "Hello from ZenMux"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            "model": "stepfun/step-3.7-flash-free",
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch.object(LLMClient, "_init_zenmux"):
+            client = LLMClient(
+                model="stepfun/step-3.7-flash-free",
+                api_key="sk-ai-v1-test",
+                provider="zenmux",
+            )
+            client._http_client = mock_client  # type: ignore[assignment]
+
+            result = await client.complete(messages=[{"role": "user", "content": "Hi"}])
+            assert result.content == "Hello from ZenMux"
+            assert result.usage.prompt_tokens == 5
+
+
+# ===================================================================
+# OmniRoute config tests
+# ===================================================================
+
+
+class TestGetOmniRouteApiKeys:
+    def test_comma_separated(self) -> None:
+        settings = Settings(omniroute_api_keys="sk1,sk2,sk3")
+        assert settings.get_omniroute_api_keys() == ["sk1", "sk2", "sk3"]
+
+    def test_single_key_fallback(self) -> None:
+        settings = Settings(omniroute_api_key="sk-single", omniroute_api_keys="")
+        assert settings.get_omniroute_api_keys() == ["sk-single"]
+
+    def test_pool_takes_precedence(self) -> None:
+        settings = Settings(omniroute_api_key="old", omniroute_api_keys="new1,new2")
+        assert settings.get_omniroute_api_keys() == ["new1", "new2"]
+
+    def test_empty_returns_empty(self) -> None:
+        settings = Settings(omniroute_api_keys="", omniroute_api_key="")
+        assert settings.get_omniroute_api_keys() == []
+
+
+# ===================================================================
+# OmniRoute provider tests
+# ===================================================================
+
+
+class TestOmniRouteClient:
+    def test_init_creates_http_client(self) -> None:
+        client = LLMClient(
+            model="auto",
+            api_key="sk-ae37c-test",
+            provider="omniroute",
+        )
+        assert client.provider == "omniroute"
+        assert client._http_client is not None
+
+    def test_init_custom_base_url(self) -> None:
+        client = LLMClient(
+            model="oc/big-pickle",
+            api_key="sk-ae37c-test",
+            provider="omniroute",
+        )
+        assert client._omniroute_base_url == "http://localhost:20128/v1"
+
+    def test_parse_sse_response_content(self) -> None:
+        sse = (
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n\n'
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n\n'
+            "data: [DONE]\n\n"
+        )
+        result = LLMClient._parse_sse_response(sse)
+        assert result["choices"][0]["message"]["content"] == "Hello"
+        assert result["choices"][0]["finish_reason"] == "stop"
+        assert result["model"] == "oc/big-pickle"
+        assert result["usage"]["prompt_tokens"] == 10
+
+    def test_parse_sse_response_tool_calls(self) -> None:
+        sse = (
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}\n\n'
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"read_file","arguments":"{\\"path\\": \\"src/main.py\\"}"}}]},"finish_reason":null}]}\n\n'
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        result = LLMClient._parse_sse_response(sse)
+        tool_calls = result["choices"][0]["message"]["tool_calls"]
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["function"]["name"] == "read_file"
+        assert "src/main.py" in tool_calls[0]["function"]["arguments"]
+
+    def test_parse_sse_response_empty(self) -> None:
+        result = LLMClient._parse_sse_response("data: [DONE]\n\n")
+        assert result["choices"][0]["message"]["content"] is None
+        assert result["choices"][0]["message"]["tool_calls"] is None
+        assert result["choices"][0]["finish_reason"] == "stop"
+
+    def test_parse_sse_stream_line_data(self) -> None:
+        line = 'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}'
+        result = LLMClient._parse_openrouter_stream_line(line)
+        assert result is not None
+        assert result["choices"][0]["delta"]["content"] == "Hi"
+
+    @pytest.mark.asyncio
+    async def test_omniroute_complete(self) -> None:
+        sse_body = (
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{"content":"Hello from OmniRoute"},"finish_reason":null}]}\n\n'
+            'data: {"id":"gen-1","model":"oc/big-pickle","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}\n\n'
+            "data: [DONE]\n\n"
+        )
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "text/event-stream"}
+        mock_response.text = sse_body
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch.object(LLMClient, "_init_omniroute"):
+            client = LLMClient(
+                model="oc/big-pickle",
+                api_key="sk-ae37c-test",
+                provider="omniroute",
+            )
+            client._http_client = mock_client  # type: ignore[assignment]
+
+            result = await client.complete(messages=[{"role": "user", "content": "Hi"}])
+            assert result.content == "Hello from OmniRoute"
+            assert result.usage.prompt_tokens == 5

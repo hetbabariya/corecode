@@ -64,18 +64,18 @@ class QueueCallback:
 class PromptCallback:
     """Asks the user via terminal ``input()``."""
 
-    def __init__(self) -> None:
-        self._pending: asyncio.Queue[bool] = asyncio.Queue()
-
     async def __call__(
         self, tool_name: str, args: dict[str, Any], permission_level: str
     ) -> bool:
-        return await self._pending.get()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._prompt_user, tool_name, args, permission_level
+        )
 
-    def prompt_user(
+    def _prompt_user(
         self, tool_name: str, args: dict[str, Any], permission_level: str
     ) -> bool:
-        """Synchronous helper that asks via stdin (call from a thread)."""
+        """Synchronous prompt via stdin."""
         print(f"\n  Permission required: {permission_level}")
         print(f"  Tool: {tool_name}")
         print(f"  Args: {args}")

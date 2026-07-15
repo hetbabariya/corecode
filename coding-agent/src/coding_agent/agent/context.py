@@ -62,6 +62,7 @@ class ContextManager:
         self.project_context: str = ""
         self.messages: list[ConversationMessage] = []
         self._summary: str = ""
+        self._context_summary: str = ""
 
     # ------------------------------------------------------------------
     # Building the message list for the LLM
@@ -80,6 +81,14 @@ class ContextManager:
 
         if self.system_prompt:
             result.append({"role": "system", "content": self.system_prompt})
+
+        if self._context_summary:
+            result.append(
+                {
+                    "role": "system",
+                    "content": f"[Context Summary]\n{self._context_summary}",
+                }
+            )
 
         if self.project_context:
             result.append({"role": "system", "content": self.project_context})
@@ -136,13 +145,33 @@ class ContextManager:
             )
         )
 
+    def set_context_summary(self, summary: str) -> None:
+        """Set prioritized context summary from SmartContextEngine.
+
+        This is injected as a system message after the system prompt
+        so the LLM sees prioritized context (errors, verifications, etc.).
+        """
+        self._context_summary = summary
+
     # ------------------------------------------------------------------
     # Token tracking
     # ------------------------------------------------------------------
 
     def estimate_tokens(self) -> int:
-        """Estimate total tokens in the conversation (heuristic: chars / 4)."""
+        """Estimate total tokens in the full message list sent to the LLM.
+
+        Includes system prompt, project context, summary, and all messages.
+        This matches what build_messages() actually sends.
+        """
         total = 0
+        if self.system_prompt:
+            total += count_tokens(self.system_prompt)
+        if self._context_summary:
+            total += count_tokens(self._context_summary)
+        if self.project_context:
+            total += count_tokens(self.project_context)
+        if self._summary:
+            total += count_tokens(self._summary)
         for msg in self.messages:
             total += count_tokens(msg.content)
             if msg.tool_calls:

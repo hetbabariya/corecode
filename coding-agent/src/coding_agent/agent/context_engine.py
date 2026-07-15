@@ -12,6 +12,7 @@ from typing import Any
 
 from coding_agent.agent.context import ContextManager, ConversationMessage
 from coding_agent.agent.error_recovery import ErrorTracker
+from coding_agent.llm.tokens import count_tokens
 
 
 @dataclass
@@ -258,5 +259,5 @@ class SmartContextEngine:
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        """Rough token estimate (4 chars per token)."""
-        return len(text) // 4
+        """Estimate token count using tiktoken (falls back to len//4)."""
+        return count_tokens(text)

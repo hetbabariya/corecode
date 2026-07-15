@@ -22,6 +22,10 @@ from coding_agent.logging import logger
 # Marker that separates static (cacheable) from dynamic (per-session) content.
 DYNAMIC_BOUNDARY = "__DYNAMIC_BOUNDARY__"
 
+# Module-level cache for the static prompt (rebuilt only when model changes).
+_STATIC_CACHE: str | None = None
+_STATIC_CACHE_MODEL: str | None = None
+
 
 # ============================================================================
 # Static sections — identical across all sessions
@@ -294,6 +298,21 @@ def build_static_prompt(model: str = "") -> str:
     return "\n\n".join(sections)
 
 
+def get_static_prompt(model: str = "") -> str:
+    """Return cached static prompt, rebuilding only if model changes.
+
+    This avoids rebuilding the ~1500-token static section every session.
+    """
+    global _STATIC_CACHE, _STATIC_CACHE_MODEL
+    if _STATIC_CACHE is None or _STATIC_CACHE_MODEL != model:
+        _STATIC_CACHE = build_static_prompt(model=model)
+        _STATIC_CACHE_MODEL = model
+        logger.debug("static_prompt_cache_miss", model=model)
+    else:
+        logger.debug("static_prompt_cache_hit", model=model)
+    return _STATIC_CACHE
+
+
 # ============================================================================
 # Dynamic sections — per-session
 # ============================================================================
@@ -401,7 +420,7 @@ def build_system_prompt(
     workspace_index_summary:
         Optional workspace file tree from WorkspaceIndex.to_summary().
     """
-    static = build_static_prompt(model=model)
+    static = get_static_prompt(model=model)
 
     dynamic_parts: list[str] = []
 

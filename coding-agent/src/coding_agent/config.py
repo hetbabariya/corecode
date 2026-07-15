@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # LLM
     llm_provider: str = Field(
-        default="gemini", description="LLM provider: gemini | openrouter"
+        default="gemini", description="LLM provider: gemini | openrouter | cerebras | zenmux | omniroute"
     )
     llm_model: str = Field(default="gemini-2.5-flash", description="LLM model name")
     llm_api_key: str = Field(default="", description="LLM API key (single)")
@@ -31,8 +31,48 @@ class Settings(BaseSettings):
         default="openai/gpt-4o-mini", description="OpenRouter model name"
     )
 
+    # Cerebras
+    cerebras_api_key: str = Field(default="", description="Cerebras API key")
+    cerebras_api_keys: str = Field(
+        default="", description="Comma-separated Cerebras keys for pool rotation"
+    )
+    cerebras_model: str = Field(
+        default="llama-3.3-70b", description="Cerebras model name"
+    )
+
+    # ZenMux
+    zenmux_api_key: str = Field(default="", description="ZenMux API key")
+    zenmux_api_keys: str = Field(
+        default="", description="Comma-separated ZenMux keys for pool rotation"
+    )
+    zenmux_model: str = Field(
+        default="stepfun/step-3.7-flash-free", description="ZenMux model name"
+    )
+    zenmux_base_url: str = Field(
+        default="https://zenmux.ai/api/v1", description="ZenMux API base URL"
+    )
+
+    # OmniRoute
+    omniroute_api_key: str = Field(default="", description="OmniRoute API key")
+    omniroute_api_keys: str = Field(
+        default="", description="Comma-separated OmniRoute keys for pool rotation"
+    )
+    omniroute_model: str = Field(
+        default="auto", description="OmniRoute model (auto = gateway picks best)"
+    )
+    omniroute_base_url: str = Field(
+        default="http://localhost:20128/v1", description="OmniRoute API base URL"
+    )
+
     # Agent
-    max_iterations: int = Field(default=20, description="Max agent loop iterations")
+    max_iterations: int = Field(
+        default=0,
+        description="Max agent loop iterations (0 = unlimited, budget is primary limit)",
+    )
+    max_iterations_safety: int = Field(
+        default=500,
+        description="Hard safety net for agent loop iterations (should never be hit)",
+    )
     max_tokens: int = Field(default=100_000, description="Max context window tokens")
     permission_level: str = Field(
         default="write", description="Default permission level"
@@ -139,6 +179,36 @@ class Settings(BaseSettings):
             return [self.openrouter_api_key.strip()]
         return []
 
+    def get_cerebras_api_keys(self) -> list[str]:
+        """Return parsed list of Cerebras API keys."""
+        if self.cerebras_api_keys:
+            keys = [k.strip() for k in self.cerebras_api_keys.split(",") if k.strip()]
+            if keys:
+                return keys
+        if self.cerebras_api_key and self.cerebras_api_key.strip():
+            return [self.cerebras_api_key.strip()]
+        return []
+
+    def get_zenmux_api_keys(self) -> list[str]:
+        """Return parsed list of ZenMux API keys."""
+        if self.zenmux_api_keys:
+            keys = [k.strip() for k in self.zenmux_api_keys.split(",") if k.strip()]
+            if keys:
+                return keys
+        if self.zenmux_api_key and self.zenmux_api_key.strip():
+            return [self.zenmux_api_key.strip()]
+        return []
+
+    def get_omniroute_api_keys(self) -> list[str]:
+        """Return parsed list of OmniRoute API keys."""
+        if self.omniroute_api_keys:
+            keys = [k.strip() for k in self.omniroute_api_keys.split(",") if k.strip()]
+            if keys:
+                return keys
+        if self.omniroute_api_key and self.omniroute_api_key.strip():
+            return [self.omniroute_api_key.strip()]
+        return []
+
     def get_db_path(self) -> Path:
         return Path(self.db_path).expanduser()
 
@@ -146,6 +216,12 @@ class Settings(BaseSettings):
         """Return the model name for the active provider."""
         if self.llm_provider == "openrouter":
             return self.openrouter_model
+        if self.llm_provider == "cerebras":
+            return self.cerebras_model
+        if self.llm_provider == "zenmux":
+            return self.zenmux_model
+        if self.llm_provider == "omniroute":
+            return self.omniroute_model
         return self.llm_model
 
     def get_summary_model(self) -> tuple[str, str]:
@@ -158,6 +234,12 @@ class Settings(BaseSettings):
         if not model:
             if provider == "openrouter":
                 model = self.openrouter_model
+            elif provider == "cerebras":
+                model = self.cerebras_model
+            elif provider == "zenmux":
+                model = self.zenmux_model
+            elif provider == "omniroute":
+                model = self.omniroute_model
             else:
                 model = self.llm_model
         return provider, model
