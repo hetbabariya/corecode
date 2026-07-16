@@ -41,6 +41,7 @@ def get_memory_manager() -> Any:
 async def remember(
     content: str,
     tags: list[str] | None = None,
+    importance: float = 0.5,
 ) -> ToolResult:
     """Store a memory for future recall.
 
@@ -50,6 +51,9 @@ async def remember(
         The fact, preference, or lesson to remember.
     tags:
         Optional tags to categorise the memory (e.g. ["python", "style"]).
+    importance:
+        Importance score from 0.0 to 1.0 (default 0.5).
+        Use higher values for critical facts the agent must not forget.
     """
     if _memory_manager is None:
         return ToolResult(success=False, output="Memory system not initialised.", error="Memory system not initialised.")
@@ -57,14 +61,16 @@ async def remember(
     if not content.strip():
         return ToolResult(success=False, output="Content cannot be empty.", error="Content cannot be empty.")
 
+    importance = max(0.0, min(importance, 1.0))
     row_id = await _memory_manager.store(
         content.strip(),
         memory_type="semantic",
         tags=tags,
+        importance=importance,
     )
 
     tag_str = ", ".join(tags) if tags else "none"
-    logger.info("memory_tool_remember", row_id=row_id, tags=tag_str)
+    logger.info("memory_tool_remember", row_id=row_id, tags=tag_str, importance=importance)
     return ToolResult(success=True, output=f"Remembered (id={row_id}): {content.strip()[:120]}")
 
 

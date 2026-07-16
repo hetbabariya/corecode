@@ -52,11 +52,10 @@ class TestExecuteCommand:
         result = await tool_registry.execute("execute_command", {"command": "   "})
         assert result.success is False
 
-    async def test_cwd_parameter(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
+    async def test_cwd_parameter(self, tmp_path: Path) -> None:
         result = await tool_registry.execute(
             "execute_command",
-            {"command": "pwd" if sys.platform != "win32" else "cd", "cwd": str(p)},
+            {"command": "pwd" if sys.platform != "win32" else "cd", "cwd": str(tmp_path)},
         )
         assert result.success is True
 
@@ -78,6 +77,6 @@ class TestExecuteCommand:
 
     async def test_windows_command(self) -> None:
         if sys.platform != "win32":
-            return  # type: ignore[misc]
+            return
         result = await tool_registry.execute("execute_command", {"command": "dir"})
         assert result.success is True

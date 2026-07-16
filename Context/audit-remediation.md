@@ -24,6 +24,10 @@ This plan addresses the **10 significant gaps** identified in the architecture a
 | 2025-07-15 | A.2 | Deduplicated tool processing: extracted `_resolve_permission_level()`, `_emit_permission_deny()`, `_finalize_tool_execution()` shared methods |
 | 2025-07-15 | A.3 | SmartContextEngine wired: `select_context()` always called with error/verification/plan params, injected as system message via `set_context_summary()` |
 | 2025-07-15 | A.6 | Prompt caching: `_STATIC_CACHE` + `_STATIC_CACHE_MODEL` in `system_prompt.py`, `get_static_prompt()` returns cached static section |
+| 2025-07-16 | B.1 | Reflector (signal-only): `agent/reflector.py` with Assessment enum, rule-based heuristics, `REFLECTION` event type, TUI rendering |
+| 2025-07-16 | B.2 | Auto-replanning: `_generate_replan()` via LLM, `_parse_plan_response()` JSON parsing, `PlanManager.replace_plan()` |
+| 2025-07-16 | B.3 | Outcome assessment: `Reflector.assess_outcome()` with optional LLM-based comparison, falls back to heuristics |
+| 2025-07-16 | B.4 | Progress evaluation: `_evaluate_progress()` every N iterations, `STUCK_DETECTED` when stalled |
 
 ---
 
@@ -502,446 +506,113 @@ For Gemini: use `cached_content` parameter in `GenerateContentConfig` when avail
 
 ---
 
-## 3. Phase B: Intelligence Layer
+## 3. Phase B: Intelligence Layer ✅ COMPLETE
 
 **Goal:** Add reflection, automatic replanning, and outcome assessment.
 
 **Duration:** Week 3-5 (4 working days)
 **Expected score after:** 6.5 → 7.5/10
 
-- [ ] B.1 Add reflection hook after tool use
-- [ ] B.2 Add automatic replanning
-- [ ] B.3 Add outcome assessment
-- [ ] B.4 Add progress evaluation
+- [x] B.1 Add reflection hook after tool use (signal-only, no suggestions)
+- [x] B.2 Add automatic replanning
+- [x] B.3 Add outcome assessment
+- [x] B.4 Add progress evaluation
 
 ---
 
-### B.1 Add Reflection Hook After Tool Use
+### B.1 Add Reflection Hook After Tool Use ✅ DONE
 
 **Why:** Agent never evaluates whether its actions achieved the intended goal. This is the biggest gap in the system (Reflection: 1/10).
 
-**What to build:**
+**What was built:**
 
-New module `agent/reflector.py`:
+New module `agent/reflector.py` with:
+- `Assessment` enum (SUCCESS/PARTIAL/FAILURE/UNEXPECTED)
+- `ReflectionResult` dataclass (assessment, reason, confidence) — signal-only, no suggestions
+- `Reflector` class with rule-based heuristics: file not found, permission denied, syntax error, consecutive failures, search no results, etc.
+- `REFLECTION` event type added to `events.py`
+- TUI rendering in `main.py` (both clean and raw formats)
 
-```python
-"""Post-action reflection for the agent loop.
+Integration in `loop.py`:
+- `Reflector` initialized in `AgentLoop.__init__`
+- `_post_tool_actions()` calls `reflector.reflect_on_tool()` after each tool execution
+- Yields `REFLECTION` event with assessment, reason, confidence
 
-Evaluates whether tool calls achieved their intended purpose
-and suggests next steps.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from enum import Enum
-from typing import Any
-
-from coding_agent.logging import logger
-
-
-class Assessment(str, Enum):
-    """Outcome assessment of a tool call."""
-    SUCCESS = "success"
-    PARTIAL = "partial"
-    FAILURE = "failure"
-    UNEXPECTED = "unexpected"
-
-
-class Suggestion(str, Enum):
-    """Suggested next action based on reflection."""
-    CONTINUE = "continue"
-    RETRY = "retry"
-    REPLAN = "replan"
-    ASK_USER = "ask_user"
-
-
-@dataclass
-class ReflectionResult:
-    """Result of reflecting on a tool call."""
-    assessment: Assessment
-    reason: str
-    suggestion: Suggestion
-    confidence: float  # 0.0 - 1.0
-
-
-class Reflector:
-    """Post-action reflection for the agent loop.
-    
-    Uses rule-based heuristics for common patterns and optionally
-    an LLM call for complex assessments.
-    """
-    
-    def __init__(self, llm_client: Any | None = None) -> None:
-        self._llm_client = llm_client
-    
-    async def reflect_on_tool(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        result: Any,  # ToolResult
-        context_messages: list[dict[str, Any]],
-    ) -> ReflectionResult:
-        """Evaluate whether a tool call achieved its purpose.
-        
-        Parameters
-        ----------
-        tool_name:
-            Name of the tool that was called.
-        args:
-            Arguments passed to the tool.
-        result:
-            ToolResult returned by the tool.
-        context_messages:
-            Current conversation context for additional analysis.
-        
-        Returns
-        -------
-        ReflectionResult with assessment, reason, and suggestion.
-        """
-        # Rule-based assessment for common patterns
-        if not result.success:
-            return self._assess_failure(tool_name, args, result)
-        
-        return self._assess_success(tool_name, args, result)
-    
-    def _assess_failure(
-        self, tool_name: str, args: dict, result: Any
-    ) -> ReflectionResult:
-        """Assess a failed tool call."""
-        error = (result.error or "").lower()
-        
-        # File not found — check if path is wrong
-        if "not found" in error or "no such file" in error:
-            return ReflectionResult(
-                assessment=Assessment.FAILURE,
-                reason=f"File not found: {error}",
-                suggestion=Suggestion.RETRY,
-                confidence=0.8,
-            )
-        
-        # Permission denied
-        if "permission denied" in error:
-            return ReflectionResult(
-                assessment=Assessment.FAILURE,
-                reason=f"Permission denied: {error}",
-                suggestion=Suggestion.ASK_USER,
-                confidence=0.9,
-            )
-        
-        # Syntax error in edit
-        if "syntax" in error or "parse" in error:
-            return ReflectionResult(
-                assessment=Assessment.FAILURE,
-                reason=f"Syntax error: {error}",
-                suggestion=Suggestion.RETRY,
-                confidence=0.9,
-            )
-        
-        # Generic failure
-        return ReflectionResult(
-            assessment=Assessment.FAILURE,
-            reason=f"Tool failed: {error}",
-            suggestion=Suggestion.REPLAN,
-            confidence=0.5,
-        )
-    
-    def _assess_success(
-        self, tool_name: str, args: dict, result: Any
-    ) -> ReflectionResult:
-        """Assess a successful tool call."""
-        output = (result.output or "").lower()
-        
-        # Read file — check if content is meaningful
-        if tool_name == "read_file":
-            if not output or len(output.strip()) < 10:
-                return ReflectionResult(
-                    assessment=Assessment.PARTIAL,
-                    reason="File appears empty or minimal",
-                    suggestion=Suggestion.CONTINUE,
-                    confidence=0.6,
-                )
-            return ReflectionResult(
-                assessment=Assessment.SUCCESS,
-                reason="File read successfully",
-                suggestion=Suggestion.CONTINUE,
-                confidence=0.9,
-            )
-        
-        # Edit/write file — success
-        if tool_name in ("edit_file", "write_file", "apply_patch", "multi_edit"):
-            return ReflectionResult(
-                assessment=Assessment.SUCCESS,
-                reason="File modified successfully",
-                suggestion=Suggestion.CONTINUE,
-                confidence=0.9,
-            )
-        
-        # Search — check if results found
-        if tool_name in ("search_content", "search_files"):
-            if "no results" in output or not output.strip():
-                return ReflectionResult(
-                    assessment=Assessment.PARTIAL,
-                    reason="No search results found",
-                    suggestion=Suggestion.REPLAN,
-                    confidence=0.7,
-                )
-            return ReflectionResult(
-                assessment=Assessment.SUCCESS,
-                reason="Search returned results",
-                suggestion=Suggestion.CONTINUE,
-                confidence=0.8,
-            )
-        
-        # Execute command — check exit code
-        if tool_name == "execute_command":
-            if "error" in output or "failed" in output:
-                return ReflectionResult(
-                    assessment=Assessment.PARTIAL,
-                    reason="Command may have errors",
-                    suggestion=Suggestion.CONTINUE,
-                    confidence=0.6,
-                )
-            return ReflectionResult(
-                assessment=Assessment.SUCCESS,
-                reason="Command executed",
-                suggestion=Suggestion.CONTINUE,
-                confidence=0.7,
-            )
-        
-        # Default: success
-        return ReflectionResult(
-            assessment=Assessment.SUCCESS,
-            reason="Tool completed",
-            suggestion=Suggestion.CONTINUE,
-            confidence=0.7,
-        )
-```
-
-**Integration in `loop.py`:**
-
-```python
-# In AgentLoop.__init__
-from coding_agent.agent.reflector import Reflector
-self.reflector = Reflector()
-
-# After each tool execution (in _execute_and_process_tool)
-reflection = await self.reflector.reflect_on_tool(
-    pc["name"], pc["args"], result, self.context.messages
-)
-logger.debug(
-    "tool_reflection",
-    tool=pc["name"],
-    assessment=reflection.assessment.value,
-    suggestion=reflection.suggestion.value,
-    confidence=reflection.confidence,
-)
-
-# Record reflection for context engine
-self.context_engine.record_verification(
-    check_type="reflection",
-    passed=reflection.assessment == Assessment.SUCCESS,
-    message=f"{reflection.assessment.value}: {reflection.reason}",
-)
-```
-
-**Files to create/modify:**
-- `src/coding_agent/agent/reflector.py` (NEW — ~150 lines)
+**Files created/modified:**
+- `src/coding_agent/agent/reflector.py` (NEW — ~230 lines)
 - `src/coding_agent/agent/loop.py` — integrate reflector
-- `tests/test_agent/test_reflector.py` (NEW)
+- `src/coding_agent/agent/events.py` — add REFLECTION event type
+- `src/coding_agent/main.py` — render REFLECTION events
+- `tests/test_agent/test_reflector.py` (NEW — 26 tests)
 
-**Verification:** After a failed file edit, reflection logs "FAILURE" with reason and suggestion.
+**Verification:** All 26 reflector tests pass. Live test shows `[Reflect: search_content -> partial: No search results found]`.
 
-**Complexity:** High (12 hours)
-
----
-
-### B.2 Add Automatic Replanning
-
-**Why:** `PlanManager.needs_replan()` detects failed steps but doesn't act on it. The agent just emits a PLAN_UPDATE event and continues with the same broken plan.
-
-**What to build:**
-
-When `needs_replan()` returns True, automatically generate a new plan using the LLM:
-
-```python
-# In loop.py
-async def _generate_replan(self) -> Plan | None:
-    """Generate a new plan based on current state."""
-    if self._llm_client is None:
-        return None
-    
-    # Build replanning prompt
-    current_state = self.plan_manager.to_prompt()
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a planning assistant. Given the current state of a task, "
-                "generate a new plan. The previous plan failed at a step. "
-                "Create a new plan that accounts for what was already accomplished."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Current state:\n{current_state}\n\n"
-                f"Generate a new plan with 3-10 steps to complete the task."
-            ),
-        },
-    ]
-    
-    try:
-        response = await self._llm_client.complete(messages)
-        # Parse response into Plan
-        # (LLM returns structured plan with goal and steps)
-        return self._parse_plan_response(response.content)
-    except Exception as e:
-        logger.error("replan_failed", error=str(e))
-        return None
-
-# In loop.py, after needs_replan() check
-if self.plan_manager.needs_replan():
-    new_plan = await self._generate_replan()
-    if new_plan:
-        self.plan_manager.replace_plan(new_plan)
-        yield AgentEvent(
-            type=EventType.PLAN_UPDATE,
-            data={"action": "replanned", "plan": new_plan.to_dict()},
-        )
-    else:
-        # Replanning failed — ask user
-        yield AgentEvent(
-            type=EventType.ASK_USER,
-            data={"message": "I'm stuck and couldn't generate a new plan. Please help."},
-        )
-        return
-```
-
-**Files to modify:**
-- `src/coding_agent/agent/planner.py` — add `replace_plan()` method
-- `src/coding_agent/agent/loop.py` — add replanning logic
-
-**Verification:** After a failed plan step, agent generates a new plan and continues.
-
-**Complexity:** Medium (8 hours)
+**Complexity:** High (12 hours) — done 2025-07-16
 
 ---
 
-### B.3 Add Outcome Assessment
+### B.2 Add Automatic Replanning ✅ DONE
 
-**Why:** No check whether tool results actually accomplished the goal. The agent might think it succeeded when it didn't.
+**Why:** `PlanManager.needs_replan()` detects failed steps but doesn't act on it.
 
-**What to build:**
+**What was built:**
 
-Extend the Reflector to compare tool results against expected outcomes:
+1. `PlanManager.replace_plan(plan)` — replaces current plan with a new one
+2. `AgentLoop._generate_replan()` — uses LLM to generate a new plan when a step fails, with structured JSON prompt
+3. `AgentLoop._parse_plan_response(content)` — parses LLM response into Plan object, handles markdown-wrapped JSON
+4. Wired into the `needs_replan()` check: auto-generates new plan, updates system prompt, emits `PLAN_UPDATE` with `action: "replanned"`
 
-```python
-async def assess_outcome(
-    self,
-    tool_name: str,
-    args: dict[str, Any],
-    result: Any,
-    expected_outcome: str | None = None,
-) -> ReflectionResult:
-    """Assess whether the tool call achieved the expected outcome.
-    
-    Parameters
-    ----------
-    expected_outcome:
-        Optional description of what was expected.
-        If None, uses heuristics.
-    """
-    if expected_outcome:
-        # LLM-based assessment
-        return await self._llm_assess(tool_name, args, result, expected_outcome)
-    
-    # Heuristic assessment
-    return self.reflect_on_tool(tool_name, args, result)
-```
+**Files modified:**
+- `src/coding_agent/agent/planner.py` — added `replace_plan()`, fixed `create_plan()` return
+- `src/coding_agent/agent/loop.py` — added `_generate_replan()`, `_parse_plan_response()`, wired into needs_replan check
+- `tests/test_agent/test_replan_and_progress.py` (NEW)
 
-**Files to modify:**
-- `src/coding_agent/agent/reflector.py` — add `assess_outcome()`
+**Verification:** All planner + replan tests pass. Handles valid JSON, markdown-wrapped JSON, empty steps, invalid JSON.
 
-**Verification:** After editing a file, agent checks if the edit matches the intended change.
-
-**Complexity:** Medium (6 hours)
+**Complexity:** Medium (8 hours) — done 2025-07-16
 
 ---
 
-### B.4 Add Progress Evaluation
+### B.3 Add Outcome Assessment ✅ DONE
 
-**Why:** No periodic assessment of task progress vs plan. The agent might be spinning its wheels without making forward progress.
+**Why:** No check whether tool results actually accomplished the goal.
 
-**What to build:**
+**What was built:**
 
-Every N iterations (configurable, default 5), evaluate progress:
+Extended `Reflector` with `assess_outcome()` method:
+- Takes optional `expected_outcome` and `llm_client` params
+- If no expected outcome or no LLM client → falls back to rule-based `reflect_on_tool()`
+- If both provided → sends expected vs actual to LLM, parses JSON response
+- Handles markdown-wrapped JSON, falls back to heuristics on LLM failure
 
-```python
-# In loop.py
-_progress_eval_interval: int = 5  # Evaluate every 5 iterations
+**Files modified:**
+- `src/coding_agent/agent/reflector.py` — added `assess_outcome()`
+- `tests/test_agent/test_reflector.py` — added 6 outcome assessment tests
 
-def _evaluate_progress(self) -> ProgressReport:
-    """Evaluate progress toward the goal."""
-    completed = 0
-    failed = 0
-    total = 0
-    
-    if self.plan_manager.has_plan and self.plan_manager.plan:
-        plan = self.plan_manager.plan
-        completed = len(plan.completed_steps)
-        failed = len(plan.failed_steps)
-        total = len(plan.steps)
-    
-    # Calculate progress ratio
-    progress_ratio = completed / total if total > 0 else 0.0
-    
-    # Check if we're making forward progress
-    is_stalled = (
-        self._tool_count > 0
-        and self.error_tracker.is_stuck()
-    )
-    
-    # Check cost/time efficiency
-    elapsed = time.monotonic() - self._start_time
-    cost_per_step = self._accumulated_cost / max(completed, 1)
-    
-    return ProgressReport(
-        completed=completed,
-        failed=failed,
-        total=total,
-        progress_ratio=progress_ratio,
-        is_stalled=is_stalled,
-        cost_per_step=cost_per_step,
-        elapsed=elapsed,
-    )
+**Verification:** All outcome assessment tests pass. LLM-based and heuristic paths both tested.
 
-# In loop.py, after tool execution
-if iteration > 0 and iteration % self._progress_eval_interval == 0:
-    progress = self._evaluate_progress()
-    logger.info(
-        "progress_evaluation",
-        completed=progress.completed,
-        total=progress.total,
-        ratio=progress.progress_ratio,
-        stalled=progress.is_stalled,
-    )
-    if progress.is_stalled:
-        yield AgentEvent(
-            type=EventType.STUCK_DETECTED,
-            data={
-                "message": "Progress appears stalled. Consider a different approach.",
-                "progress": progress.__dict__,
-            },
-        )
-```
+**Complexity:** Medium (6 hours) — done 2025-07-16
 
-**Files to modify:**
-- `src/coding_agent/agent/loop.py` — add progress evaluation
+---
 
-**Verification:** After 5 iterations with no progress, agent emits STUCK_DETECTED.
+### B.4 Add Progress Evaluation ✅ DONE
 
-**Complexity:** Low (4 hours)
+**Why:** No periodic assessment of task progress vs plan.
+
+**What was built:**
+
+1. `_evaluate_progress()` — returns completed/failed/total counts, progress_ratio, is_stalled flag, cost_per_step, elapsed time
+2. Runs every N iterations (default 5) after tool execution
+3. Emits `STUCK_DETECTED` event when stalled (tool_count > 0 and error_tracker.is_stuck())
+4. Configurable via `_progress_eval_interval`
+
+**Files modified:**
+- `src/coding_agent/agent/loop.py` — added `_evaluate_progress()`, wired into iteration loop
+- `tests/test_agent/test_replan_and_progress.py` — 4 progress evaluation tests
+
+**Verification:** All progress evaluation tests pass. Handles all-done, partial, stalled, and no-plan scenarios.
+
+**Complexity:** Low (4 hours) — done 2025-07-16
 
 ---
 

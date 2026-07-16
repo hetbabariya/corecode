@@ -1,1324 +1,1783 @@
-# CoreCode Implementation Plan
+# CoreCode — Phase-by-Phase Implementation Plan
 
-## From 3.5/10 to Production-Grade
-
-This document is the actionable, phase-by-phase build plan to take CoreCode from its current state to a system that competes with Claude Code, Cursor Agent, Gemini CLI, and OpenCode.
-
-Each phase is ordered by dependency and ROI. No phase depends on something that hasn't been built yet. Every phase produces a measurable improvement.
-
-> **TUI Overhaul:** A separate 39-item plan for TUI improvements exists at [`Context/tui-implementation-plan.md`](tui-implementation-plan.md). It covers theme system recovery, widget restoration, streaming performance, and UX polish across 5 phases (69-87 hours).
+> This document details every missing feature from the Claude Code audit, organized into phases. Each feature includes: what it is, why it matters, how it should work, what components to create/modify, dependencies, acceptance criteria, and estimated effort.
 
 ---
 
-## Phase 1: Critical Fixes & Foundation Hardening (Week 1-2)
+## Table of Contents
 
-**Goal:** Fix bugs that make the agent broken today. Add the basic infrastructure every subsequent phase depends on.
-
-**Expected score after:** 3.5 → 5/10
-
-**Status: ✅ COMPLETE (7/7)**
-
-- [x] 1.1 Fix Gemini System Prompt Bug
-- [x] 1.2 tiktoken-Based Token Counting
-- [x] 1.3 Tool Result Truncation
-- [x] 1.4 Parallel Tool Execution
-- [x] 1.5 Streaming Tool Call Emission
-- [x] 1.6 Session Persistence (SQLite)
-- [x] 1.7 Cost & Time Budget Limits
+- [Phase A — Critical Fixes (1-2 weeks)](#phase-a--critical-fixes-1-2-weeks)
+- [Phase B — Foundation (2-3 weeks)](#phase-b--foundation-2-3-weeks)
+- [Phase C — Intelligence (2-3 weeks)](#phase-c--intelligence-2-3-weeks)
+- [Phase D — UX (2-3 weeks)](#phase-d--ux-2-3-weeks)
+- [Phase E — Advanced (3-4 weeks)](#phase-e--advanced-3-4-weeks)
+- [Phase F — Claude Code Parity (4-6 weeks)](#phase-f--claude-code-parity-4-6-weeks)
+- [Phase G — Beyond Claude Code (6-8 weeks)](#phase-g--beyond-claude-code-6-8-weeks)
 
 ---
 
-### 1.1 Fix Gemini System Prompt Bug [CRITICAL]
+## Phase A — Critical Fixes (1-2 weeks)
 
-**Why:** The agent sends zero instructions to Gemini. Every Gemini response ignores the system prompt. This is a ship-blocker.
-
-**What to build:**
-- Modify `llm/client.py` → `_convert_messages()` to inject system content as the first `user` message with a `model` response following (Google GenAI's system message pattern)
-- Alternatively, use Gemini's `system_instruction` parameter in `GenerateContentConfig`
-- Add a test that verifies system prompt content appears in the request payload
-
-**Files to modify:**
-- `src/coding_agent/llm/client.py` — `_convert_messages()`, `_raw_call_gemini()`
-- `tests/test_llm.py` — new test for system prompt injection
-
-**Verification:** Agent follows system prompt rules when running on Gemini.
-
-**Complexity:** Low (1-2 hours)
-**Impact:** Critical (agent is currently broken on primary provider)
+These are the highest-impact, lowest-effort items. They fix security holes, prevent data loss, and make the agent actually usable as a daily tool.
 
 ---
 
-### 1.2 Implement tiktoken-Based Token Counting
+### A.1 Dangerous Command Detection
 
-**Why:** `chars // 4` is off by 2-3x for code. This causes context overflow or wasted budget.
+**What:** Block shell commands that can cause irreversible damage before they execute.
 
-**What to build:**
-- New module `llm/tokens_v2.py` with tiktoken-based counting
-- Fall back to `chars // 4` if tiktoken can't load the model's encoding
-- Cache encoding objects (they're expensive to create)
-- Replace `count_tokens()` calls in `context.py` and anywhere else it's used
+**Why:** CoreCode currently passes any command to the Docker sandbox or host shell. A prompt injection in a cloned repo could execute `rm -rf /` or `git push --force origin main`. This is a security-critical gap.
 
-**Files to create/modify:**
-- `src/coding_agent/llm/tokens_v2.py` (NEW — ~80 lines)
-- `src/coding_agent/llm/tokens.py` — replace `count_tokens` implementation
-- `pyproject.toml` — add `tiktoken` dependency
-- `tests/test_llm.py` — tests for accuracy against known strings
+**How it should work:**
 
-**Verification:** `count_tokens("hello world")` returns ~2, not ~2.
+1. Create a new file `src/coding_agent/sandbox/danger_patterns.py` containing:
+   - A list of blocked command patterns (regex-based): `rm -rf /`, `rm -rf ~`, `git push --force`, `DROP TABLE`, `DELETE FROM`, `FORMAT`, `mkfs`, `dd if=`, `shutdown`, `reboot`, `:(){ :|:& };:` (fork bomb), etc.
+   - Case-insensitive matching with whitespace normalization to prevent bypasses like `rm  -rf  /`.
+   - A function `check_dangerous_command(command: str) -> tuple[bool, str]` that returns `(is_dangerous, reason)`.
 
-**Complexity:** Low (2-3 hours)
-**Impact:** High (prevents context overflow)
+2. Integrate into `tools/shell.py`:
+   - Before executing any command via `execute_command`, run it through `check_dangerous_command()`.
+   - If dangerous, return a `ToolResult(success=False, error="Blocked: <reason>")` without executing.
+   - Log the blocked command as a warning.
 
----
+3. Add a config option `CODING_AGENT_BLOCK_DANGEROUS=true` (default) in `config.py` to allow users to disable the check if needed.
 
-### 1.3 Add Tool Result Truncation
+**Components to create/modify:**
+- Create: `src/coding_agent/sandbox/danger_patterns.py`
+- Modify: `src/coding_agent/tools/shell.py`
+- Modify: `src/coding_agent/config.py`
 
-**Why:** A single `read_file` on a 10k-line file dumps everything into context. One tool call can consume 50% of the context window.
+**Acceptance criteria:**
+- `rm -rf /` is blocked regardless of spacing/casing.
+- `git push --force origin main` is blocked.
+- `DROP TABLE users` is blocked.
+- `echo "rm -rf /"` is NOT blocked (it's inside quotes, not a real command — but note this is a limitation; the check should be on the raw command string, not parsed).
+- Safe commands like `ls`, `git status`, `python -m pytest` pass through.
+- The check adds less than 1ms overhead.
 
-**What to build:**
-- New module `agent/context_limits.py` with configurable limits
-- `MAX_TOOL_RESULT_TOKENS = 8000` (configurable)
-- `MAX_TOOL_RESULT_LINES = 500`
-- Truncation function that preserves the first and last N lines with a `[truncated: X lines omitted]` message
-- Apply in `agent/loop.py` before adding tool results to context
-- For `read_file`: always include first 50 and last 50 lines, truncate middle
-- For `search_content`: limit to 20 results
-- For `execute_command`: limit stdout to 200 lines
-
-**Files to create/modify:**
-- `src/coding_agent/agent/context_limits.py` (NEW — ~60 lines)
-- `src/coding_agent/agent/loop.py` — apply truncation before `add_tool_result()`
-- `tests/test_agent/test_context_limits.py` (NEW)
-
-**Verification:** `read_file` on a 1000-line file returns ~100 lines with truncation notice.
-
-**Complexity:** Medium (3-4 hours)
-**Impact:** High (prevents context explosion)
+**Effort:** 3-5 hours
 
 ---
 
-### 1.4 Implement Parallel Tool Execution
+### A.2 Protected Files and Directories
 
-**Why:** Sequential execution wastes 5x time when LLM requests multiple independent tool calls.
+**What:** Prevent the agent from modifying critical configuration files and directories.
 
-**What to build:**
-- In `agent/loop.py`, replace the sequential `for tc in tool_calls` with `asyncio.gather()`
-- Group tool calls: reads can be parallel, writes to the same file must be sequential
-- Simple heuristic: all `read_*` and `search_*` tools are parallel-safe; all `write_*`, `edit_*`, `execute_*` are sequential
-- Emit `TOOL_START` events for all tools before any execution begins
+**Why:** Without this, the agent could overwrite `.gitconfig`, `.bashrc`, `.ssh/authorized_keys`, or `.env` files containing secrets. This is especially dangerous because the agent operates autonomously.
 
-**Files to modify:**
-- `src/coding_agent/agent/loop.py` — replace sequential loop with parallel dispatch
-- `tests/test_agent/test_agent_loop.py` — test parallel execution
+**How it should work:**
 
-**Verification:** Two `read_file` calls in the same LLM turn execute concurrently (measurable wall-clock improvement).
+1. Create `src/coding_agent/sandbox/protected_paths.py` containing:
+   - A set of protected file patterns: `.gitconfig`, `.bashrc`, `.zshrc`, `.profile`, `.ssh/*`, `.gnupg/*`, `.env`, `.env.*`, `.mcp.json`, `.claude.json`, etc.
+   - A set of protected directories: `.git/`, `.vscode/`, `.idea/`, `.claude/`, `node_modules/`, `.venv/`, etc.
+   - A function `is_protected_path(path: str) -> tuple[bool, str]` that returns `(is_protected, reason)`.
+   - Case-insensitive normalization for cross-platform safety.
 
-**Complexity:** Medium (4-6 hours)
-**Impact:** High (5x speed on multi-file reads)
+2. Integrate into `tools/file_ops.py`:
+   - Before `write_file` and `edit_file`, check if the target path is protected.
+   - If protected, return `ToolResult(success=False, error="Protected path: <reason>")`.
+   - Add a config option `CODING_AGENT_PROTECTED_PATHS=true` (default) to allow override.
 
----
+3. The protected paths list should be extensible via a config file or environment variable so users can add their own protected paths.
 
-### 1.5 Add Streaming Tool Call Emission
+**Components to create/modify:**
+- Create: `src/coding_agent/sandbox/protected_paths.py`
+- Modify: `src/coding_agent/tools/file_ops.py`
+- Modify: `src/coding_agent/config.py`
 
-**Why:** Tool calls are only emitted after the entire stream finishes. Should emit as soon as each tool call is fully parsed.
+**Acceptance criteria:**
+- Writing to `~/.gitconfig` is blocked.
+- Writing to `.env` is blocked.
+- Writing to `.ssh/authorized_keys` is blocked.
+- Writing to `.git/` directory is blocked.
+- Writing to `src/main.py` (normal file) is allowed.
+- The check is path-normalized (handles `../`, `./`, absolute vs relative).
 
-**What to build:**
-- Modify `StreamParser.feed()` to emit `TOOL_CALL` events incrementally (as soon as name + args are complete)
-- Modify `AgentLoop.process_input()` to handle tool calls arriving mid-stream
-- Start executing completed tool calls while the stream is still producing text
-
-**Files to modify:**
-- `src/coding_agent/llm/streaming.py` — incremental tool call emission
-- `src/coding_agent/agent/loop.py` — handle mid-stream tool calls
-
-**Verification:** Tool execution starts before the LLM finishes generating text.
-
-**Complexity:** Medium (4-6 hours)
-**Impact:** Medium (faster perceived response)
+**Effort:** 2-3 hours
 
 ---
 
-### 1.6 Add Session Persistence (SQLite)
+### A.3 Max Output Tokens Recovery
 
-**Why:** Zero persistence means every session starts from scratch. This blocks memory, undo, and history.
+**What:** When the LLM hits its max output token limit mid-response, feed the partial response back and ask the model to continue.
 
-**What to build:**
-- Implement `session/manager.py` with actual SQLite operations
-- `SessionManager.create_session()` — create new session record
-- `SessionManager.save_message()` — persist each message
-- `SessionManager.save_operation()` — persist tool calls for undo
-- `SessionManager.list_sessions()` — show past sessions
-- `SessionManager.load_session()` — resume a session
-- `SessionManager.get_operations()` — get operation history for undo
-- Run schema migrations on startup
+**Why:** Without this, if a response is cut off at 4096 tokens, the agent loses the rest of the response and may produce incomplete work. Claude Code handles this by feeding the partial back and asking the model to continue where it left off.
 
-**Files to create/modify:**
-- `src/coding_agent/session/manager.py` (REWRITE — ~200 lines)
-- `src/coding_agent/session/history.py` (NEW — ~100 lines for undo)
-- `src/coding_agent/agent/loop.py` — call session manager after each message/tool
-- `tests/test_session.py` (REWRITE — comprehensive tests)
+**How it should work:**
 
-**Verification:** Can create session, add messages, close, reopen, resume.
+1. In `agent/loop.py`, after the streaming loop completes, check the `stop_reason` from the LLM response.
+   - If `stop_reason == "max_tokens"` (or equivalent for non-Anthropic providers), the response was truncated.
+   - Store the partial text and partial tool calls.
 
-**Complexity:** High (6-8 hours)
-**Impact:** High (enables memory, undo, history)
+2. If truncated:
+   - Append the partial assistant message to the context.
+   - Add a user message: "Your response was cut off. Please continue from where you left off."
+   - Loop again (the next iteration will continue the response).
+   - Track a `_max_tokens_recovery_count` to prevent infinite loops (max 3 retries).
 
----
+3. For providers that don't expose `stop_reason`:
+   - Heuristic: if the last message ends mid-sentence or mid-JSON, treat it as truncated.
+   - Or: if `completion_tokens >= model_max_output_tokens`, treat as truncated.
 
-### 1.7 Add Cost & Time Budget Limits
+**Components to modify:**
+- Modify: `src/coding_agent/agent/loop.py` (add stop_reason checking and recovery loop)
+- Modify: `src/coding_agent/llm/streaming.py` (expose stop_reason in StreamEvent)
+- Modify: `src/coding_agent/llm/client.py` (return stop_reason from complete())
 
-**Why:** No way to stop the agent from burning money or time.
+**Acceptance criteria:**
+- When a response is truncated at max tokens, the agent automatically continues.
+- The continuation is seamless (no visible gap in the response).
+- Maximum 3 continuation attempts before giving up.
+- The recovery is logged with a `max_tokens_recovery` event.
 
-**What to build:**
-- `max_cost_per_session` config (default: $5.00)
-- `max_time_per_task` config (default: 300 seconds)
-- Check budget at the start of each iteration
-- Yield `BUDGET_EXCEEDED` event and stop
-- Track cumulative cost and time in the agent loop
-
-**Files to create/modify:**
-- `src/coding_agent/agent/loop.py` — budget checks
-- `src/coding_agent/config.py` — new settings
-- `src/coding_agent/agent/events.py` — new `BUDGET_EXCEEDED` event type
-
-**Verification:** Agent stops after spending $5 or running 5 minutes.
-
-**Complexity:** Low (2-3 hours)
-**Impact:** Medium (prevents runaway costs)
+**Effort:** 3-5 hours
 
 ---
 
-## Phase 2: Intelligence Layer (Week 3-6)
+### A.4 Prompt Too Long Recovery (Reactive Compact)
 
-**Goal:** Add the subsystems that make the agent actually smart — planning, verification, workspace understanding, and error recovery.
+**What:** When the API returns a `prompt_too_long` or `context_length_exceeded` error, compress the context and retry instead of failing.
 
-**Expected score after:** 5 → 7/10
+**Why:** Without this, long sessions that exceed the context window crash the agent. Claude Code has a layered recovery: try overflow flush first, then reactive compact, with a circuit breaker.
 
-**Status: ✅ COMPLETE (7/7)**
+**How it should work:**
 
-- [x] 2.1 Workspace Index (File Tree + Basic Symbols)
-- [x] 2.2 Planning System (Create/Update/Query Plans)
-- [x] 2.3 Post-Edit Verification
-- [x] 2.4 Error Recovery (Retry/Fallback/Graceful Degradation)
-- [x] 2.5 Smart Context Engine (File Prioritization + Summarization)
-- [x] 2.6 Stuck Detection (Loop Detection + User Escalation)
-- [x] 2.7 Apply-Patch Tool (Multi-File Edits + AST-Aware)
+1. In `agent/loop.py`, catch the specific API error for context overflow.
+   - Error patterns: `prompt_too_long`, `context_length_exceeded`, `maximum context length`, HTTP 400 with context-related message.
 
----
+2. When caught:
+   - **Step 1 (cheap):** Drop the oldest tool results from the conversation history (keep only their summaries). This is the "overflow flush."
+   - **Step 2 (heavier):** If Step 1 isn't enough, trigger a full summarization of all messages except the last 3 (not 5 — be more aggressive).
+   - **Step 3:** Retry the API call with the compressed context.
 
-### 2.1 Workspace Index (File Tree + Basic Symbols)
+3. Track `_reactive_compact_count`. If it fails 3 times consecutively, give up and surface the error to the user.
 
-**Why:** The agent has zero awareness of what's in the workspace. It discovers everything through tools, which is slow and wasteful.
+4. Add a `REACTIVE_COMPACT` event type to `events.py` for TUI visibility.
 
-**What to build:**
-- New module `agent/workspace_index.py`
-- On startup, scan workspace: build file tree, count files, detect languages
-- Maintain a lightweight in-memory index:
-  ```
-  {
-    "tree": { "src/": { "agent/": ["loop.py", "context.py"], "llm/": [...] } },
-    "languages": { "python": 45, "markdown": 12 },
-    "total_files": 57,
-    "total_lines": 4200
-  }
-  ```
-- Inject file tree summary into system prompt (first 100 files, grouped by directory)
-- Update index when files are created/deleted
-- Add `refresh_index` tool for the agent to re-scan when needed
+**Components to modify:**
+- Modify: `src/coding_agent/agent/loop.py` (add try/catch around LLM call, reactive compact logic)
+- Modify: `src/coding_agent/agent/context.py` (add `drop_oldest_tool_results()` method)
+- Modify: `src/coding_agent/agent/events.py` (add `REACTIVE_COMPACT` event type)
 
-**Files to create/modify:**
-- `src/coding_agent/agent/workspace_index.py` (NEW — ~150 lines)
-- `src/coding_agent/agent/system_prompt.py` — inject file tree
-- `src/coding_agent/agent/loop.py` — initialize and refresh index
-- `tests/test_agent/test_workspace_index.py` (NEW)
+**Acceptance criteria:**
+- When the API returns context overflow, the agent recovers automatically.
+- The recovery is logged and visible in the TUI.
+- Maximum 3 recovery attempts before failing.
+- The compressed context preserves the most recent messages and the system prompt.
 
-**Verification:** System prompt contains accurate file tree. Agent can list files without calling `list_files`.
-
-**Complexity:** Medium (6-8 hours)
-**Impact:** High (agent knows what exists)
+**Effort:** 1 day
 
 ---
 
-### 2.2 Planning System
+### A.5 Interactive REPL
 
-**Why:** The agent dives into execution without a plan. It wastes iterations on wrong approaches.
+**What:** A persistent, interactive terminal interface where the user can send multiple messages in a conversation loop, see streaming responses, and interact with the agent in real time.
 
-**What to build:**
-- New module `agent/planner.py`
-- New tool `create_plan` — agent calls this to create an explicit step-by-step plan
-- New tool `update_plan` — agent marks steps as done/in-progress/failed
-- Plan is stored in a `Plan` dataclass:
-  ```python
-  @dataclass
-  class Plan:
-      goal: str
-      steps: list[PlanStep]
-      current_step: int
-      status: str  # "planning" | "executing" | "completed" | "failed"
+**Why:** This is the single most critical missing feature. Without a REPL, CoreCode is a one-shot script, not a tool. Every other feature (slash commands, checkpointing, vim mode, etc.) depends on having a conversation loop.
 
-  @dataclass
-  class PlanStep:
-      description: str
-      status: str  # "pending" | "in_progress" | "done" | "failed"
-      tool_calls: list[dict]  # tools used for this step
-      result: str
-  ```
-- Inject current plan into system prompt on each iteration
-- When all steps are done → yield DONE
-- When a step fails → replan (regenerate from current step)
+**How it should work:**
 
-**Files to create/modify:**
-- `src/coding_agent/agent/planner.py` (NEW — ~200 lines)
-- `src/coding_agent/agent/loop.py` — integrate planner
-- `src/coding_agent/agent/system_prompt.py` — add planning instructions
-- `src/coding_agent/agent/events.py` — add PLAN_UPDATE event
-- `tests/test_agent/test_planner.py` (NEW)
+1. Create `src/coding_agent/tui/repl.py` — the main REPL component.
+   - Uses Textual for the TUI framework (already attempted, needs proper implementation).
+   - Main loop: prompt user → send to agent → stream response → display results → prompt again.
+   - The agent's `process_input()` is an async iterator — the REPL consumes events and renders them.
 
-**Verification:** Agent creates a plan before executing, updates it as it works, stops when plan is complete.
+2. Component structure:
+   ```
+   REPL
+   ├── Header (model, provider, workspace, branch)
+   ├── MessageArea (scrollable conversation history)
+   │   ├── UserMessage
+   │   ├── AssistantMessage (streaming text)
+   │   ├── ToolCallBlock (tool name, args, result)
+   │   ├── ThinkingBlock (if reasoning model)
+   │   └── SystemMessage (errors, warnings)
+   ├── InputArea (user input with history)
+   └── StatusBar (tokens, cost, context %, iteration)
+   ```
 
-**Complexity:** High (10-12 hours)
-**Impact:** Critical (structured task decomposition)
+3. Input handling:
+   - Enter sends the message.
+   - Shift+Enter or Alt+Enter inserts a newline.
+   - Up/Down navigates input history.
+   - Ctrl+C interrupts the current agent turn (keeps work done so far).
+   - Ctrl+D exits.
 
----
+4. Streaming display:
+   - Text tokens are rendered character-by-character as they arrive.
+   - Tool calls show a spinner while executing.
+   - Tool results appear inline with syntax highlighting for code.
 
-### 2.3 Post-Edit Verification System
+5. The REPL should handle the agent's async event stream and render each event type appropriately.
 
-**Why:** The agent makes changes and hopes they work. No verification = broken code shipped.
+**Components to create/modify:**
+- Create: `src/coding_agent/tui/repl.py`
+- Create: `src/coding_agent/tui/widgets.py` (message components)
+- Create: `src/coding_agent/tui/theme.py` (colors, styles)
+- Modify: `src/coding_agent/main.py` (add `repl` command that launches the TUI)
+- Modify: `src/coding_agent/agent/loop.py` (ensure clean async iterator protocol)
 
-**What to build:**
-- New module `agent/verifier.py`
-- After every `edit_file` or `write_file` call, automatically:
-  1. Run syntax check (for Python: `py_compile`; for JS/TS: `node --check`)
-  2. Run project linter if configured (`ruff check` for Python)
-  3. Run relevant tests if a test file exists for the changed file
-- Verification results fed back to LLM as a tool result
-- If verification fails, agent is told to fix the issue
-- Configurable: `verify_after_edit = true/false`
+**Dependencies:** Textual library (already in project history, needs re-integration).
 
-**Files to create/modify:**
-- `src/coding_agent/agent/verifier.py` (NEW — ~180 lines)
-- `src/coding_agent/agent/loop.py` — call verifier after file writes
-- `src/coding_agent/config.py` — `verify_after_edit` setting
-- `tests/test_agent/test_verifier.py` (NEW)
+**Acceptance criteria:**
+- User can start a REPL session with `coding-agent repl`.
+- User can type messages and see streaming responses.
+- Tool calls are displayed with progress indicators.
+- The conversation persists across multiple turns.
+- Ctrl+C interrupts gracefully without crashing.
+- The REPL handles terminal resize events.
 
-**Verification:** After editing a Python file with a syntax error, agent receives error feedback and attempts to fix it.
-
-**Complexity:** High (8-10 hours)
-**Impact:** Critical (prevents broken code)
+**Effort:** 3-5 days
 
 ---
 
-### 2.4 Error Recovery Strategies
+### A.6 Checkpointing and Rewind
 
-**Why:** Currently, errors are just fed back to the LLM with no strategy. The agent often loops on the same failing approach.
+**What:** Automatically snapshot file state before each edit, and provide a `/rewind` command to restore previous states.
 
-**What to build:**
-- New module `agent/error_recovery.py`
-- Track error history per iteration: what tool failed, what error, what was tried
-- Detect "stuck" state: same tool + same error 3 times in a row
-- On stuck detection:
-  1. Summarize what was tried
-  2. Ask the LLM to try a completely different approach
-  3. If still stuck after 2 attempts, ask the user for help
-- Categorize errors:
-  - **Transient**: rate limit, timeout → retry with backoff
-  - **Permanent**: file not found, permission denied → don't retry, try alternative
-  - **Logic**: wrong file, wrong approach → suggest different strategy
-- Feed structured error context to LLM (not just the error message)
+**Why:** Without checkpointing, users are afraid to let the agent make large-scale changes because there's no undo beyond the in-memory UndoStack (which is lost on restart). Claude Code's checkpointing system is what makes users comfortable letting the agent work autonomously.
 
-**Files to create/modify:**
-- `src/coding_agent/agent/error_recovery.py` (NEW — ~150 lines)
-- `src/coding_agent/agent/loop.py` — integrate error tracking
-- `tests/test_agent/test_error_recovery.py` (NEW)
+**How it should work:**
 
-**Verification:** After 3 failed attempts to edit a file, agent switches strategy or asks user.
+1. Create `src/coding_agent/agent/checkpoint.py`:
+   - `Checkpoint` dataclass: `id`, `timestamp`, `file_snapshots: dict[str, bytes]`, `message_index`.
+   - `CheckpointManager` class:
+     - `create_checkpoint()` — captures current content of all modified files since last checkpoint.
+     - `restore_checkpoint(checkpoint_id)` — reverts files to their state at that checkpoint.
+     - `list_checkpoints()` — returns recent checkpoints (max 100).
+     - Ring buffer: automatically evicts checkpoints beyond 100.
 
-**Complexity:** Medium (6-8 hours)
-**Impact:** High (prevents infinite loops)
+2. Integration into `agent/loop.py`:
+   - Before each file-modifying tool call (`write_file`, `edit_file`), create a checkpoint.
+   - Store the checkpoint alongside the message index so rewinding can restore both code and conversation.
 
----
+3. Rewind command:
+   - `/rewind` — shows a numbered list of recent checkpoints with timestamps and descriptions.
+   - `/rewind <n>` — restores checkpoint n, reverting both files and conversation to that point.
+   - Options: "Restore code only", "Restore conversation only", "Restore both".
 
-### 2.5 Smart Context Selection
+4. Persistence:
+   - Store checkpoint metadata in SQLite (via `SessionManager`).
+   - Store file snapshots as blobs in SQLite or as files in `~/.coding-agent/checkpoints/`.
+   - Checkpoints survive session restart.
 
-**Why:** The agent dumps entire files into context. For large files, this wastes the entire context window.
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/checkpoint.py`
+- Modify: `src/coding_agent/agent/loop.py` (create checkpoints before edits)
+- Modify: `src/coding_agent/session/manager.py` (add checkpoint tables)
+- Modify: `src/coding_agent/agent/events.py` (add `CHECKPOINT` event type)
 
-**What to build:**
-- New module `agent/context_engine.py`
-- When `read_file` is called on a large file (>200 lines):
-  1. Only return requested lines (already implemented via offset/limit)
-  2. Add instruction: "File is N lines. Use offset/limit to read specific sections."
-- When multiple files are read, prioritize by relevance:
-  - Files mentioned by name in the user's request → highest priority
-  - Files recently read → higher priority
-  - Files with errors → higher priority
-- Implement `context_budget` tracking: estimate remaining context budget after each message
-- Before each LLM call, check if context is getting full:
-  - If >70% full: suggest the agent focus on recent context
-  - If >85% full: trigger summarization
-  - If >95% full: force summarization and warn the agent
+**Acceptance criteria:**
+- Before every file edit, a checkpoint is created.
+- `/rewind` shows the last 10 checkpoints.
+- `/rewind 3` restores the 3rd checkpoint, reverting files and conversation.
+- Checkpoints survive session restart.
+- The ring buffer caps at 100 checkpoints.
+- Restoring a checkpoint correctly reverts file contents (verified by checksum).
 
-**Files to create/modify:**
-- `src/coding_agent/agent/context_engine.py` (NEW — ~120 lines)
-- `src/coding_agent/agent/context.py` — integrate budget tracking
-- `tests/test_agent/test_context_engine.py` (NEW)
-
-**Verification:** Reading a 5000-line file doesn't consume the entire context budget.
-
-**Complexity:** Medium (6-8 hours)
-**Impact:** High (preserves context for real work)
-
-**Implementation Notes (Gap Fill):**
-- SmartContextEngine wired into loop.py — records tool results, verification, errors
-- Large-file instruction injection in `_process_tool_result` when read_file returns partial content
-- Progressive threshold summarization: 70% (log), 85% (summarize), 95% (aggressive + warning)
-- Context engine cleared on reset
+**Effort:** 3-5 days
 
 ---
 
-### 2.6 Stuck Detection & Backtracking
+## Phase B — Foundation (2-3 weeks)
 
-**Why:** The agent can loop forever on the same failing approach.
-
-**What to build:**
-- New module `agent/stuck_detector.py`
-- Track a sliding window of the last 10 tool calls
-- Detect stuck patterns:
-  - Same tool + same arguments called 3+ times
-  - Same error 3+ times
-  - No progress (no new files read, no edits made) for 5 iterations
-- When stuck:
-  1. Emit `STUCK_DETECTED` event
-  2. Add a system message: "You appear stuck. Previous approaches failed. Try something completely different."
-  3. If still stuck after 2 more iterations, yield `ASK_USER` event
-- Implement rollback: save context snapshot before risky operations, restore on failure
-
-**Files to create/modify:**
-- `src/coding_agent/agent/stuck_detector.py` (NEW — ~100 lines)
-- `src/coding_agent/agent/loop.py` — integrate detector
-- `src/coding_agent/agent/events.py` — add STUCK_DETECTED, ASK_USER events
-- `tests/test_agent/test_stuck_detector.py` (NEW)
-
-**Verification:** After repeating the same failed edit 3 times, agent tries a different approach or asks user.
-
-**Complexity:** Medium (4-6 hours)
-**Impact:** High (prevents infinite loops)
+These features improve robustness, extensibility, and correctness of the existing systems.
 
 ---
 
-### 2.7 Apply-Patch Tool (AST-Aware Editing)
+### B.1 Micro-Compact (Old Tool Results)
 
-**Why:** `edit_file` with exact string replacement is fragile and breaks on whitespace changes.
+**What:** Clear or compress old tool results in the conversation history to free up context space.
 
-**What to build:**
-- New tool `apply_patch` — accepts unified diff format
-- New tool `multi_edit` — applies multiple edits to the same file in one call (like Claude Code's `replace` tool with multiple needles)
-- Keep existing `edit_file` for backward compatibility
-- Add validation: after applying patch, verify the file is valid (syntax check)
+**Why:** Tool results can be massive (a `read_file` of a 500-line file = ~5000 tokens). Over many iterations, these accumulate and fill the context window. Claude Code's micro-compact replaces old tool results with `[Old tool result content cleared]` to reclaim space.
 
-**Files to create/modify:**
-- `src/coding_agent/tools/file_ops.py` — add `apply_patch`, `multi_edit`
-- `tests/test_tools/test_file_ops.py` — tests for new tools
+**How it should work:**
 
-**Verification:** Can apply a multi-hunk diff to a file in one call.
+1. In `agent/loop.py`, after each iteration, identify tool results that are:
+   - More than 10 messages old (not in the recent window).
+   - Larger than 500 tokens.
 
-**Complexity:** Medium (6-8 hours)
-**Impact:** High (more reliable editing)
+2. Replace their content with a compact marker:
+   ```
+   [Old tool result for read_file(src/main.py) cleared to save context space]
+   ```
 
-**Implementation Notes (Gap Fill):**
-- AST validation via new `agent/ast_check.py` module
-- Uses tree-sitter for supported languages when available, falls back to `ast.parse` for Python, bracket matching for others
-- Validation runs after every write_file, edit_file, apply_patch, multi_edit
-- Syntax warnings included in tool output but don't block the edit (soft validation)
-- `tree-sitter` and `tree-sitter-languages` added as optional `[ast]` dependency
+3. The marker preserves: tool name, arguments (truncated), success/failure status.
 
----
+4. This runs as a lightweight pass — no LLM call required.
 
-## Phase 3: Memory & Learning (Week 7-9)
+5. Track how many tokens were reclaimed via metrics.
 
-**Goal:** Make the agent remember things across sessions. Learn project conventions. Support undo.
+**Components to modify:**
+- Modify: `src/coding_agent/agent/context.py` (add `compact_old_tool_results()` method)
+- Modify: `src/coding_agent/agent/loop.py` (call compact after each iteration)
 
-**Expected score after:** 7 → 8.5/10
+**Acceptance criteria:**
+- Tool results older than 10 messages are replaced with compact markers.
+- The compaction preserves tool name, path/args, and success status.
+- No LLM call is needed for micro-compact.
+- At least 20% of context is reclaimed in a typical 20-iteration session.
+- Recent tool results (last 10 messages) are never compacted.
 
-**Status: ✅ COMPLETE (4/4)**
-
-- [x] 3.1 Cross-Session Memory
-- [x] 3.2 Undo/Redo System
-- [x] 3.3 Session History Viewer
-- [x] 3.4 Adaptive System Prompt
+**Effort:** 1 day
 
 ---
 
-### 3.1 Cross-Session Memory
+### B.2 Sibling Abort (Parallel Tool Cancellation)
 
-**Why:** The agent forgets everything between sessions. It can't learn project conventions.
+**What:** When a parallel tool call fails, cancel all sibling parallel tool calls that are still running.
 
-**What to build:**
-- New module `agent/memory.py`
-- Three memory types:
-  1. **Episodic** — what was done in past sessions (stored in SQLite)
-     - "Session abc123: Fixed bug in parser.py, added tests"
-     - Auto-generated summary at session end
-  2. **Semantic** — learned facts about the project
-     - "This project uses pytest, not unittest"
-     - "The main entry point is src/main.py"
-     - "Config is in pyproject.toml"
-     - Stored in `~/.coding-agent/memory.json`
-  3. **Working** — current task state
-     - "Currently fixing the login bug, have read auth.py and user.py"
-     - Ephemeral, cleared at session start
-- Memory retrieval: inject relevant past session summaries into system prompt
-- Memory update: after each session, extract key learnings and store them
-- New tools: `remember` (store a fact), `recall` (search past memories)
+**Why:** Without this, if one parallel read fails (e.g., file not found), the others continue wastefully. Claude Code uses an abort controller to cancel siblings, which saves time and tokens.
 
-**Files to create/modify:**
-- `src/coding_agent/agent/memory.py` (NEW — ~250 lines)
-- `src/coding_agent/agent/system_prompt.py` — inject memory
-- `src/coding_agent/agent/loop.py` — memory read/write at session boundaries
-- `src/coding_agent/session/manager.py` — session summary storage
-- `tests/test_agent/test_memory.py` (NEW)
+**How it should work:**
 
-**Verification:** After session 1 edits `config.py`, session 2 knows about the config file without being told.
+1. In `agent/loop.py`, wrap parallel tool execution in a try/catch:
+   ```python
+   async def _exec_one(pc, abort_event):
+       if abort_event.is_set():
+           return pc, ToolResult(success=False, error="Cancelled")
+       result = await tool_registry.execute_from_llm(pc["tc"])
+       return pc, result
+   ```
 
-**Complexity:** High (12-15 hours)
-**Impact:** Critical (persistent learning)
+2. Create an `asyncio.Event` as the abort signal.
+   - If any tool in the parallel batch fails, set the abort event.
+   - Remaining tools check the event before executing and after each await point.
+   - Tools that are already running continue to completion (can't interrupt synchronous operations) but their results are discarded.
 
----
+3. For tools that support cancellation (async I/O operations), add an optional `cancel()` method to `BaseTool`.
 
-### 3.2 Undo/Redo System
+**Components to modify:**
+- Modify: `src/coding_agent/agent/loop.py` (add abort event to parallel execution)
+- Modify: `src/coding_agent/tools/base.py` (add optional `cancel()` method)
 
-**Why:** Users can't safely let the agent make changes if there's no undo.
+**Acceptance criteria:**
+- If one parallel tool fails, siblings that haven't started yet are skipped.
+- Siblings that are already running continue but their results are marked as cancelled.
+- The abort event is properly cleaned up after each parallel batch.
+- No resource leaks (tasks are properly awaited or cancelled).
 
-**What to build:**
-- New module `agent/undo.py`
-- `UndoStack` class:
-  - `push(operation)` — save operation with before/after state
-  - `undo()` — revert last operation
-  - `redo()` — re-apply last undone operation
-  - `can_undo()` / `can_redo()` — check availability
-- Operations to track:
-  - `edit_file`: save before_content and after_content
-  - `write_file`: save before_content (None if new file)
-  - `git_commit`: save commit hash for `git revert`
-- New tool `undo` — agent can undo its own changes
-- New tool `redo` — agent can redo
-- User can also trigger undo via TUI keybinding (Ctrl+Z)
-
-**Files to create/modify:**
-- `src/coding_agent/agent/undo.py` (NEW — ~150 lines)
-- `src/coding_agent/tools/file_ops.py` — capture before-state
-- `src/coding_agent/agent/loop.py` — integrate undo stack
-- `src/coding_agent/tui/app.py` — Ctrl+Z binding
-- `tests/test_agent/test_undo.py` (NEW)
-
-**Verification:** Agent edits a file, user presses Ctrl+Z, file reverts.
-
-**Complexity:** Medium (6-8 hours)
-**Impact:** High (safe experimentation)
+**Effort:** 3-5 hours
 
 ---
 
-### 3.3 Session History Viewer
+### B.3 Tool Timeouts
 
-**Why:** No way to see what the agent did in past sessions.
+**What:** Add configurable timeouts to all tool executions, not just shell commands.
 
-**What to build:**
-- New TUI screen `screens/history.py`
-- List past sessions with: date, model, tokens used, cost, summary
-- Select a session to see: full conversation, tool calls, file changes
-- Can resume a past session (load context)
-- New CLI command: `coding-agent history` — list past sessions
+**Why:** `read_file` on a network mount, `search_content` on a massive monorepo, or a hung `git diff` can block the agent indefinitely. Claude Code has a 120-second default timeout for bash and applies timeouts to other operations.
 
-**Files to create/modify:**
-- `src/coding_agent/tui/screens/history.py` (NEW — ~200 lines)
-- `src/coding_agent/tui/app.py` — add history screen
-- `src/coding_agent/main.py` — add `history` command
-- `src/coding_agent/session/manager.py` — query methods
+**How it should work:**
 
-**Verification:** `coding-agent history` shows list of past sessions.
+1. Add a `timeout_seconds` field to the `@tool` decorator:
+   ```python
+   @tool(name="read_file", timeout=30)
+   async def read_file(path: str) -> str:
+       ...
+   ```
 
-**Complexity:** Medium (6-8 hours)
-**Impact:** Medium (visibility into agent behavior)
+2. Default timeout: 30 seconds for file operations, 60 seconds for search, 120 seconds for shell.
 
----
+3. In `tools/registry.py`, wrap tool execution with `asyncio.wait_for()`:
+   ```python
+   result = await asyncio.wait_for(
+       tool.execute(**arguments),
+       timeout=tool.timeout_seconds
+   )
+   ```
 
-### 3.4 Adaptive System Prompt
+4. On timeout, return `ToolResult(success=False, error="Tool timed out after Xs")`.
 
-**Why:** Same prompt regardless of task complexity, model, or project.
+5. Make timeouts configurable via `config.py` (global defaults that tools can override).
 
-**What to build:**
-- Modify `agent/system_prompt.py` to be dynamic:
-  - **Simple tasks** (single file read): skip detailed editing rules
-  - **Complex tasks** (multi-file changes): include full planning instructions
-  - **Gemini-specific**: adjust prompt style (Gemini prefers shorter, more direct instructions)
-  - **Claude-specific**: leverage Claude's instruction-following strengths
-- Add prompt compression: remove redundant sections based on task type
-- Cache static sections per model (use `DYNAMIC_BOUNDARY` marker)
+**Components to modify:**
+- Modify: `src/coding_agent/tools/base.py` (add `timeout_seconds` field)
+- Modify: `src/coding_agent/tools/registry.py` (wrap execution with timeout)
+- Modify: `src/coding_agent/config.py` (add timeout defaults)
+- Modify: `src/coding_agent/tools/shell.py` (use configurable timeout instead of hardcoded)
 
-**Files to create/modify:**
-- `src/coding_agent/agent/system_prompt.py` — rewrite builder
-- `tests/test_agent/test_system_prompt.py` — test variants
+**Acceptance criteria:**
+- Every tool call has a timeout (configurable, with sensible defaults).
+- On timeout, a clear error message is returned to the LLM.
+- Timeouts are logged for debugging.
+- Shell commands still use the existing sandbox timeout (whichever is shorter).
 
-**Verification:** Prompt for "read this file" is shorter than "refactor the auth module."
-
-**Complexity:** Medium (6-8 hours)
-**Impact:** Medium (better LLM performance)
+**Effort:** 2-3 hours
 
 ---
 
-## Phase 4: Production Hardening (Week 10-14)
+### B.4 Fuzzy Edit Matching
 
-**Goal:** Make it production-ready. Add extensibility, security, monitoring, and polish.
+**What:** When the `edit_file` tool's exact text match fails, fall back to fuzzy matching to find the closest match.
 
-**Expected score after:** 8.5 → 9.5/10
+**Why:** The current `edit_file` requires byte-exact matching of `old_text`. If the file has slightly different whitespace, encoding, or the user provides slightly wrong text, the edit fails. Claude Code uses fuzzy matching as a fallback.
 
-**Status: 🔄 IN PROGRESS (0/9)**
+**How it should work:**
 
-- [ ] 4.1 Prompt Caching
-- [ ] 4.2 Anthropic SDK
-- [ ] 4.3 MCP Integration
-- [ ] 4.4 Sub-Agent Orchestration
-- [ ] 4.5 Network-Isolated Sandbox
-- [ ] 4.6 Structured Logging & Monitoring
-- [ ] 4.7 TUI Polish
-- [ ] 4.8 Integration Test Suite
-- [ ] 4.9 Documentation
+1. In `tools/file_ops.py`, when `old_text` is not found exactly:
+   - Normalize whitespace (collapse multiple spaces, strip trailing whitespace) and try again.
+   - If still not found, use `difflib.get_close_matches()` to find the closest substring.
+   - If a close match is found (similarity > 0.8), use it and log a warning.
+   - If no close match is found, return the original error.
 
----
+2. The fuzzy fallback should:
+   - Never silently change code that wasn't requested to change.
+   - Show the matched text in the response so the user can verify.
+   - Be opt-in via a `fuzzy: true` parameter (default: false for safety).
 
-### 4.1 Prompt Caching
+**Components to modify:**
+- Modify: `src/coding_agent/tools/file_ops.py` (add fuzzy matching fallback in `edit_file`)
 
-**Why:** 50-80% cost reduction on repeated calls. Free performance.
+**Acceptance criteria:**
+- Exact matches work as before (no regression).
+- With `fuzzy: true`, whitespace differences are tolerated.
+- With `fuzzy: true`, close matches are found with >80% similarity.
+- Fuzzy matches are logged with the matched text for transparency.
+- Fuzzy matching never silently changes unrelated code.
 
-**What to build:**
-- Gemini: use `cached_content` parameter for system prompt + tool schemas
-- Anthropic: use `cache_control` breakpoint on system prompt
-- OpenRouter: cache key based on system prompt hash
-- Cache invalidation: when system prompt changes (new session, different project)
-- Track cache hit/miss metrics
-
-**Files to create/modify:**
-- `src/coding_agent/llm/client.py` — cache integration
-- `src/coding_agent/llm/prompt_cache.py` (NEW — ~100 lines)
-
-**Verification:** Second call to same model shows cached token count.
-
-**Complexity:** Medium (6-8 hours)
-**Impact:** High (50-80% cost reduction)
+**Effort:** 1 day
 
 ---
 
-### 4.2 Anthropic SDK Support
+### B.5 Hooks System
 
-**Why:** Native Claude access with extended thinking, prompt caching, tool use.
+**What:** Let users inject deterministic code at lifecycle events — shell commands that fire automatically before/after tool calls, on session start, etc.
 
-**What to build:**
-- Add `anthropic` SDK as a provider option
-- Implement `AnthropicClient` with native tool use
-- Support extended thinking (Claude's chain-of-thought)
-- Support prompt caching with `cache_control`
-- Update config: `llm_provider` can be `"anthropic"`
+**Why:** "You can't hope the AI remembers to lint your files." Hooks give deterministic control over a probabilistic system. They enforce formatting, security rules, testing requirements, and audit logging without relying on the model.
 
-**Files to create/modify:**
-- `src/coding_agent/llm/anthropic_client.py` (NEW — ~300 lines)
-- `src/coding_agent/config.py` — add `anthropic` provider
-- `pyproject.toml` — add `anthropic` dependency
+**How it should work:**
 
-**Verification:** Agent runs on Claude with native tool use and prompt caching.
+1. Create `src/coding_agent/hooks/` package:
+   - `manager.py` — `HookManager` class that loads, validates, and executes hooks.
+   - `types.py` — Hook event types, hook configurations, hook results.
+   - `executor.py` — Runs hook commands with timeout and error handling.
 
-**Complexity:** High (10-12 hours)
-**Impact:** High (access to Claude's best features)
+2. Hook events (start with the most useful):
+   - `PreToolUse` — fires before a tool executes. Exit code 2 = block the tool.
+   - `PostToolUse` — fires after a tool executes. Can modify the result.
+   - `SessionStart` — fires when the REPL starts.
+   - `SessionEnd` — fires when the REPL exits.
+   - `UserPromptSubmit` — fires when the user submits a prompt. Exit code 2 = block submission.
 
----
+3. Hook configuration (stored in `~/.coding-agent/hooks.json`):
+   ```json
+   {
+     "hooks": {
+       "PostToolUse": [
+         {
+           "matcher": "write_file|edit_file",
+           "hooks": [
+             {
+               "type": "command",
+               "command": "ruff check $TOOL_PATH",
+               "timeout": 10000
+             }
+           ]
+         }
+       ]
+     }
+   }
+   ```
 
-### 4.3 MCP Tool Integration
+4. Hook execution:
+   - Environment variables passed to the hook: `$TOOL_NAME`, `$TOOL_ARGS`, `$TOOL_PATH`, `$TOOL_RESULT`, `$WORKSPACE`.
+   - Exit code 0 = success, 1 = warning (log but continue), 2 = block (prevent the action).
+   - Timeout: configurable per hook (default 10s).
 
-**Why:** Extensibility. Users can add custom tools.
+5. Integration into `agent/loop.py`:
+   - Before tool execution: run PreToolUse hooks. If any returns exit code 2, block the tool.
+   - After tool execution: run PostToolUse hooks. If any returns exit code 2, mark the result as blocked.
 
-**What to build:**
-- New module `tools/mcp.py`
-- MCP client that connects to MCP servers via stdio or SSE
-- Dynamic tool registration: MCP server tools added to `tool_registry`
-- Support for custom MCP servers via config:
-  ```toml
-  [[mcp_servers]]
-  name = "database"
-  command = "uvx"
-  args = ["mcp-server-sqlite", "--db-path", "./data.db"]
-  ```
-- MCP tools get permission levels based on their declared capabilities
+**Components to create/modify:**
+- Create: `src/coding_agent/hooks/__init__.py`
+- Create: `src/coding_agent/hooks/manager.py`
+- Create: `src/coding_agent/hooks/types.py`
+- Create: `src/coding_agent/hooks/executor.py`
+- Modify: `src/coding_agent/agent/loop.py` (integrate hook calls)
+- Modify: `src/coding_agent/config.py` (add hooks config path)
 
-**Files to create/modify:**
-- `src/coding_agent/tools/mcp.py` (NEW — ~200 lines)
-- `src/coding_agent/config.py` — MCP server config
-- `src/coding_agent/agent/loop.py` — initialize MCP connections
-- `pyproject.toml` — add `mcp` dependency
+**Acceptance criteria:**
+- Hooks are loaded from `~/.coding-agent/hooks.json`.
+- PreToolUse hook with exit code 2 blocks the tool call.
+- PostToolUse hook runs after every tool call.
+- Hooks have a configurable timeout (default 10s).
+- Hook failures are logged but don't crash the agent.
+- Environment variables are passed to hooks correctly.
 
-**Verification:** Can connect to an MCP server and use its tools.
-
-**Complexity:** High (12-15 hours)
-**Impact:** High (extensibility)
-
----
-
-### 4.4 Sub-Agent Orchestration
-
-**Why:** Complex tasks benefit from parallel sub-agents. One agent can't do everything.
-
-**What to build:**
-- New module `agent/subagent.py`
-- `SubAgent` class:
-  - Has its own context, tools, and LLM client
-  - Can be spawned for specific subtasks
-  - Reports progress back to parent agent
-- Parent agent can spawn sub-agents for:
-  - Research: "explore the codebase and report findings"
-  - Testing: "run the test suite and report failures"
-  - Verification: "check that all edits compile"
-- Sub-agents run in parallel (asyncio.Task)
-- Results aggregated and fed back to parent
-
-**Files to create/modify:**
-- `src/coding_agent/agent/subagent.py` (NEW — ~200 lines)
-- `src/coding_agent/agent/loop.py` — sub-agent spawning
-- `tests/test_agent/test_subagent.py` (NEW)
-
-**Verification:** Agent spawns a research sub-agent while making edits in parallel.
-
-**Complexity:** High (15-20 hours)
-**Impact:** Medium (parallel task execution)
+**Effort:** 3-5 days
 
 ---
 
-### 4.5 Network-Isolated Sandbox
+### B.6 Streaming Display in REPL
 
-**Why:** The sandbox has full network access. Security risk.
+**What:** Render LLM response tokens character-by-character in real time as they arrive from the API.
 
-**What to build:**
-- Modify Docker run command to add `--network none` option
-- Config option: `sandbox_network = "none" | "host" | "bridge"`
-- For commands that need network (npm install, pip install), allow explicit network access per command
-- Add `--cap-drop=ALL` and only add necessary capabilities
+**Why:** Without streaming display, users stare at a blank screen for seconds waiting for responses. Streaming provides immediate feedback that the agent is working.
 
-**Files to create/modify:**
-- `src/coding_agent/sandbox/docker.py` — network config
-- `src/coding_agent/config.py` — `sandbox_network` setting
+**How it should work:**
 
-**Verification:** `curl http://example.com` fails in sandbox with `--network none`.
+1. The REPL consumes the agent's async event stream.
+2. When a `TEXT` event arrives, append the token to the current assistant message widget.
+3. Use Textual's `Timer` or `call_later` to batch token updates (every 50ms) to avoid excessive re-renders.
+4. Tool calls show a spinner widget while executing, replaced by the result when done.
+5. Thinking/reasoning tokens (if available) are displayed in a dimmed style.
 
-**Complexity:** Low (2-3 hours)
-**Impact:** Medium (security)
+**Components to modify:**
+- Modify: `src/coding_agent/tui/repl.py` (consume streaming events)
+- Modify: `src/coding_agent/tui/widgets.py` (streaming message widget)
 
----
+**Acceptance criteria:**
+- Text appears character-by-character as tokens arrive.
+- No visible flicker or lag.
+- Tool calls show progress indicators.
+- The display updates at least every 100ms during streaming.
 
-### 4.6 Structured Logging & Monitoring
-
-**Why:** No visibility into agent behavior in production.
-
-**What to build:**
-- Structured event logging for every agent action:
-  - LLM request/response (model, tokens, latency, cost)
-  - Tool call (name, args, result, duration)
-  - Permission check (tool, result)
-  - Context state (messages, tokens, summarization events)
-  - Errors (type, recovery action)
-- New module `agent/telemetry.py`
-- Export to file or stdout in JSON format
-- New TUI panel showing recent events (debug mode)
-
-**Files to create/modify:**
-- `src/coding_agent/agent/telemetry.py` (NEW — ~150 lines)
-- `src/coding_agent/agent/loop.py` — emit telemetry events
-- `src/coding_agent/tui/widgets/debug.py` (NEW — optional debug panel)
-
-**Verification:** JSON log file contains structured entries for every tool call.
-
-**Complexity:** Medium (6-8 hours)
-**Impact:** Medium (debuggability)
+**Effort:** 1-2 days
 
 ---
 
-### 4.7 TUI Polish & UX Improvements
+### B.7 Permission Modes
 
-**Why:** The TUI is functional but rough.
+**What:** Multiple permission modes that control how aggressively the agent auto-approves tool calls.
 
-**What to build:**
-- **Diff viewer**: syntax-highlighted side-by-side diff for file edits
-- **Progress indicators**: show which plan step is executing, time elapsed
-- **Keyboard shortcuts**: Ctrl+Y to approve permission, Ctrl+N to deny, Ctrl+Z for undo
-- **In-place streaming**: update widget text without remove/remount
-- **Session selector**: quick switch between recent sessions
-- **Cost warning**: show warning when approaching budget limit
-- **Theme system**: light/dark mode support
+**Why:** The current system has a binary approve/deny per tool name. Claude Code has 5 modes that give users fine-grained control over agent autonomy.
 
-**Files to create/modify:**
-- `src/coding_agent/tui/widgets/diff_viewer.py` (NEW)
-- `src/coding_agent/tui/widgets/chat.py` — in-place streaming
-- `src/coding_agent/tui/app.py` — keyboard shortcuts
-- `src/coding_agent/tui/theme.py` — dark/light themes
+**How it should work:**
 
-**Verification:** Streaming doesn't cause flicker. Diff viewer shows syntax-highlighted changes.
+1. Add permission modes to `agent/permissions.py`:
+   - `default` (`>`) — Ask for all non-read tools. Current behavior.
+   - `acceptEdits` (`>>`) — Auto-allow file edits in the current workspace. Only ask for shell commands.
+   - `plan` (`?`) — Pause after every tool call. Show the result and ask "Continue?"
+   - `bypassPermissions` (`!`) — Skip all permission checks. (Dangerous, requires confirmation to enter.)
+   - `auto` (future) — LLM classifier decides based on risk assessment.
 
-**Complexity:** Medium (8-10 hours)
-**Impact:** Medium (user experience)
+2. The mode is set at REPL startup and can be changed via `/permissions` slash command.
 
----
+3. `acceptEdits` mode:
+   - Auto-allow `write_file`, `edit_file` when the path is within the workspace directory.
+   - Still ask for `execute_command`, `git_commit`, and tools with `dangerous` permission level.
 
-### 4.8 Integration Test Suite
+4. `plan` mode:
+   - After every tool call, yield a `PERMISSION_REQUEST` event and wait for user input.
+   - The REPL shows the tool result and prompts "Continue? [Y/n]".
 
-**Why:** No end-to-end tests. Can't verify the full system works.
+5. `bypassPermissions` mode:
+   - Enter with `!` prefix or `/permissions bypass`.
+   - Show a warning: "All permission checks are disabled. The agent can modify any file and run any command."
+   - Auto-disable after session end.
 
-**What to build:**
-- New directory `tests/integration/`
-- Tests that exercise the full flow with mocked LLM:
-  1. User asks to read a file → agent reads it → returns content
-  2. User asks to fix a bug → agent plans → reads code → edits → verifies
-  3. User asks to run tests → agent executes → reports results
-  4. Agent hits an error → recovers → completes task
-  5. Agent creates a plan → executes steps → marks done
-  6. Agent undoes a change → file reverts
-- Performance benchmarks:
-  - Context build time < 100ms
-  - Tool dispatch < 10ms
-  - Stream parse < 5ms per chunk
+**Components to modify:**
+- Modify: `src/coding_agent/agent/permissions.py` (add modes)
+- Modify: `src/coding_agent/agent/loop.py` (check mode before permission gate)
 
-**Files to create/modify:**
-- `tests/integration/` (NEW directory with ~10 test files)
-- `tests/benchmarks/` (NEW directory)
+**Acceptance criteria:**
+- `/permissions` shows the current mode.
+- `/permissions default` switches to default mode.
+- `/permissions acceptEdits` auto-allows file edits in workspace.
+- `/permissions plan` pauses after every tool call.
+- `/permissions bypass` shows a warning and disables all checks.
+- Mode changes take effect immediately.
 
-**Verification:** `pytest tests/integration/` passes all end-to-end scenarios.
-
-**Complexity:** High (10-12 hours)
-**Impact:** High (confidence in system)
+**Effort:** 1-2 days
 
 ---
 
-### 4.9 Documentation & Onboarding
+## Phase C — Intelligence (2-3 weeks)
 
-**Why:** No developer documentation for contributing.
+These features make the agent smarter about how it works — better context management, session continuity, and task decomposition.
 
-**What to build:**
-- `docs/architecture.md` — rewrite with actual architecture (not the planned one)
-- `docs/development.md` — how to set up dev environment, run tests, contribute
-- `docs/tools.md` — how to add new tools (with examples)
-- `docs/config.md` — all config options explained
-- Inline docstrings for all public APIs
-- Type annotations complete and passing pyright strict
+---
 
-**Files to create/modify:**
-- `docs/` (REWRITE all documentation)
+### C.1 Subagent Delegation
 
-**Verification:** New contributor can set up and run the project in <10 minutes.
+**What:** Allow the main agent to spawn child agents that work on bounded subtasks in parallel, each with their own isolated context.
 
-**Complexity:** Medium (6-8 hours)
-**Impact:** Medium (maintainability)
+**Why:** A single agent working on a large refactor fills its context with exploration before getting to the actual task. Subagents isolate exploration, preserve the main agent's context for synthesis, and enable true parallelism.
+
+**How it should work:**
+
+1. Create `src/coding_agent/agent/subagent.py`:
+   - `SubAgent` class that wraps an `AgentLoop` instance.
+   - Each subagent gets:
+     - A fresh `ContextManager` (or forked from parent up to a point).
+     - Filtered tool set (no `git_commit`, no `create_plan` — read-only tools only by default).
+     - A unique agent ID.
+     - A separate undo stack.
+     - A bounded iteration limit (default: 20).
+
+2. Create `src/coding_agent/tools/subagent.py`:
+   - `delegate_task` tool: the LLM calls this to spawn a subagent.
+   - Parameters: `prompt` (what to do), `tools` (optional tool filter), `max_iterations` (optional).
+   - Returns the subagent's final text response.
+
+3. Execution model:
+   - Subagents run as `asyncio.Task`s.
+   - Maximum 3 concurrent subagents (configurable).
+   - Depth limit: 1 (subagents cannot spawn sub-subagents).
+   - Each subagent has its own LLM client (can share API keys).
+
+4. Result integration:
+   - When a subagent completes, its final response is injected into the parent's context as a tool result.
+   - The parent can then synthesize the subagent's findings.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/subagent.py`
+- Create: `src/coding_agent/tools/subagent.py`
+- Modify: `src/coding_agent/agent/loop.py` (track subagent tasks)
+- Modify: `src/coding_agent/config.py` (add subagent limits)
+
+**Acceptance criteria:**
+- The LLM can spawn a subagent via `delegate_task`.
+- Subagents run in parallel (up to 3 concurrent).
+- Subagents have isolated context (don't pollute parent).
+- Subagent results are returned to the parent as tool results.
+- Depth limit of 1 is enforced.
+- Subagent iterations are capped at 20 by default.
+
+**Effort:** 3-7 days
+
+---
+
+### C.2 Session Resumption
+
+**What:** Allow users to resume a previous session from where they left off, with full conversation history and context.
+
+**Why:** Without this, every new session starts from scratch. The user has to re-explain the task and re-explore the codebase. Claude Code's `--resume` flag loads the previous session's conversation history and continues.
+
+**How it should work:**
+
+1. Add `--resume` flag to the CLI:
+   ```
+   coding-agent repl --resume
+   coding-agent repl --resume <session-id>
+   ```
+
+2. When `--resume` is used:
+   - Load the session's messages from SQLite via `SessionManager.load_session()`.
+   - Reconstruct the `ContextManager` message list from the loaded messages.
+   - Reload the system prompt (including memory, plan state).
+   - Display a summary: "Resumed session <id> from <date>. <N> messages loaded."
+
+3. `--continue` (`-c`) flag: resume the most recent session automatically.
+   - Find the most recent session for the current workspace.
+   - If no session exists, start a new one.
+
+4. Session listing:
+   - `coding-agent history` already lists sessions.
+   - Add `coding-agent resume` that shows a numbered list and lets the user pick.
+
+**Components to modify:**
+- Modify: `src/coding_agent/main.py` (add `--resume` and `--continue` flags)
+- Modify: `src/coding_agent/agent/loop.py` (add `load_session()` method)
+- Modify: `src/coding_agent/session/manager.py` (add `load_session_messages()` that returns full message list)
+
+**Acceptance criteria:**
+- `coding-agent repl --resume` loads the most recent session.
+- `coding-agent repl --resume <id>` loads a specific session.
+- The conversation history is fully restored.
+- The system prompt is rebuilt with current environment info.
+- Plan state and memory are restored from the database.
+
+**Effort:** 1 day
+
+---
+
+### C.3 CLAUDE.md Hierarchy (AGENTS.md Hierarchy)
+
+**What:** Support a multi-scope hierarchy of project configuration files that are loaded at session start and injected into the system prompt.
+
+**Why:** Claude Code's 5-scope CLAUDE.md hierarchy (enterprise → user → project → local → rules) lets teams encode project conventions, user preferences, and local overrides in structured files. CoreCode only reads `AGENTS.md` and `README.md` from the workspace root.
+
+**How it should work:**
+
+1. Define the hierarchy (broadest to narrowest):
+   ```
+   ~/.coding-agent/AGENTS.md           (user global preferences)
+   ./AGENTS.md                          (project root, versioned with git)
+   ./.coding-agent/AGENTS.md            (project alternative location)
+   ./.coding-agent/rules/*.md           (project rules, modular)
+   ./AGENTS.local.md                    (local, gitignored, personal)
+   ```
+
+2. Load order: broadest first, narrowest last. Narrower files can override broader ones.
+
+3. Support `@path/to/file` import syntax:
+   - `@./path/to/file.md` — resolves relative to the importing file.
+   - Maximum nesting depth: 4 hops.
+   - Prevent circular imports.
+
+4. In `system_prompt.py`, replace the current `_project_context_section()` with a new `_agents_md_section()` that:
+   - Walks the hierarchy and loads all matching files.
+   - Concatenates them in order (broadest first).
+   - Respects `@path` imports.
+   - Truncates the total to 2000 tokens (configurable).
+
+5. File format: plain markdown with optional frontmatter:
+   ```markdown
+   ---
+   scope: project
+   description: Project coding conventions
+   ---
+   
+   ## Code Style
+   - Use snake_case for Python
+   - Use double quotes for strings
+   ```
+
+**Components to modify:**
+- Modify: `src/coding_agent/agent/system_prompt.py` (replace `_project_context_section` with hierarchy loader)
+- Create: `src/coding_agent/agent/agents_md.py` (hierarchy loader with import resolution)
+
+**Acceptance criteria:**
+- `~/.coding-agent/AGENTS.md` is loaded for all projects.
+- `./AGENTS.md` is loaded for the current project.
+- `.coding-agent/rules/*.md` files are loaded as modular rules.
+- `@path/to/file.md` imports resolve correctly (max 4 hops).
+- Circular imports are detected and prevented.
+- The total loaded content is truncated at 2000 tokens.
+
+**Effort:** 1-2 days
+
+---
+
+### C.4 Slash Commands
+
+**What:** In-session `/` commands for controlling the agent's behavior, checking status, and performing common operations.
+
+**Why:** Slash commands are the primary control surface for Claude Code. They let users switch models, compact context, check costs, and manage sessions without leaving the conversation flow.
+
+**How it should work:**
+
+1. Create `src/coding_agent/commands/` package:
+   - `registry.py` — `CommandRegistry` class that maps command names to handlers.
+   - `types.py` — `Command` dataclass with name, description, handler function, parameters.
+
+2. Built-in commands (start with the most useful):
+
+   | Command | Description |
+   |---------|-------------|
+   | `/help` | List available commands |
+   | `/clear` | Reset conversation (keep session) |
+   | `/compact` | Force summarization of context |
+   | `/cost` | Show current session cost |
+   | `/tokens` | Show token usage breakdown |
+   | `/model` | Switch model mid-session |
+   | `/permissions` | Show/change permission mode |
+   | `/plan` | Show current plan state |
+   | `/memory` | Show/manage memories |
+   | `/rewind` | Restore a checkpoint |
+   | `/history` | Show session history |
+
+3. Command parsing:
+   - Detect input starting with `/` at the REPL level (before sending to agent).
+   - Parse command name and arguments.
+   - Execute the command handler.
+   - Display the result in the TUI.
+   - If the command is not recognized, send it to the agent as a regular message.
+
+4. Custom commands:
+   - Load from `~/.coding-agent/commands/*.md` and `.coding-agent/commands/*.md`.
+   - Each markdown file defines a command: filename = command name, content = prompt template.
+   - Support `$ARGUMENTS` placeholder.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/commands/__init__.py`
+- Create: `src/coding_agent/commands/registry.py`
+- Create: `src/coding_agent/commands/types.py`
+- Create: `src/coding_agent/commands/builtin.py` (implementations)
+- Modify: `src/coding_agent/tui/repl.py` (parse `/` commands before sending to agent)
+
+**Acceptance criteria:**
+- `/help` lists all available commands.
+- `/cost` shows the current session cost.
+- `/compact` forces context summarization.
+- `/model` switches the active model.
+- `/rewind` shows checkpoints and lets the user restore one.
+- Unrecognized `/` commands are sent to the agent as messages.
+- Custom commands are loaded from `.coding-agent/commands/`.
+
+**Effort:** 2-3 days
+
+---
+
+### C.5 Context Window Sliding
+
+**What:** Drop the oldest message groups when the context window is approaching its limit, rather than waiting for full summarization.
+
+**Why:** Summarization is expensive (requires an LLM call). Sometimes a cheaper approach is to simply drop the oldest messages. Claude Code uses this as a fallback before reactive compact.
+
+**How it should work:**
+
+1. In `agent/context.py`, add a `drop_oldest_messages(count: int)` method:
+   - Remove the oldest `count` messages from `self.messages`.
+   - Preserve the system prompt and summary.
+   - Log the dropped messages for debugging.
+
+2. Trigger in `agent/loop.py`:
+   - At 90% context usage, drop the oldest 20% of messages.
+   - At 95%, drop the oldest 40% (if summarization hasn't helped).
+   - This is a cheaper alternative to summarization.
+
+3. The dropped messages are not lost — they were already summarized (if summarization ran earlier) or they are old enough that the model has moved past them.
+
+**Components to modify:**
+- Modify: `src/coding_agent/agent/context.py` (add `drop_oldest_messages()`)
+- Modify: `src/coding_agent/agent/loop.py` (trigger sliding at thresholds)
+
+**Acceptance criteria:**
+- At 90% context, oldest 20% of messages are dropped.
+- System prompt and summary are never dropped.
+- The drop is logged with the number of messages removed and tokens reclaimed.
+- The agent continues functioning normally after the drop.
+
+**Effort:** 1 day
+
+---
+
+### C.6 Intent Re-injection After Failures
+
+**What:** When tool calls fail repeatedly, re-inject the original task description into the context to prevent the agent from losing sight of its goal.
+
+**Why:** Repeated tool failures dilute the original intent with error noise. The agent may start chasing error messages instead of the original task. Claude Code uses PostToolUse hooks to re-inject intent.
+
+**How it should work:**
+
+1. In `agent/loop.py`, after each tool failure:
+   - Check the error tracker for consecutive failures (same tool, same error).
+   - If 2+ consecutive failures, inject a system message:
+     ```
+     [system] REMINDER: Your current task is: <original user prompt>.
+     You have failed <N> times. Try a different approach.
+     ```
+
+2. The reminder is injected as a user message (not a tool result) so the model sees it as context.
+
+3. Track `_last_reminder_iteration` to avoid injecting the reminder every iteration (max once per 3 iterations).
+
+**Components to modify:**
+- Modify: `src/coding_agent/agent/loop.py` (add reminder injection after consecutive failures)
+
+**Acceptance criteria:**
+- After 2+ consecutive failures, the original task is re-injected.
+- The reminder is injected at most once per 3 iterations.
+- The reminder includes the failure count and a suggestion to try a different approach.
+- The agent visibly changes its approach after the reminder.
+
+**Effort:** 3-5 hours
+
+---
+
+## Phase D — UX (2-3 weeks)
+
+These features improve the user experience — making the agent feel polished, professional, and pleasant to use.
+
+---
+
+### D.1 MCP Integration
+
+**What:** Connect to external MCP (Model Context Protocol) servers that provide additional tools — database access, GitHub operations, Slack integration, browser automation, etc.
+
+**Why:** CoreCode cannot build every possible integration into its core. MCP provides infinite extensibility. Any team can create an MCP server to expose their internal tools.
+
+**How it should work:**
+
+1. Create `src/coding_agent/mcp/` package:
+   - `client.py` — `MCPClient` class that connects to MCP servers via stdio transport.
+   - `transport.py` — StdioTransport for communicating with MCP server processes.
+   - `types.py` — MCP message types (JSON-RPC based).
+
+2. MCP configuration:
+   - Stored in `~/.coding-agent/mcp.json` or `.coding-agent/mcp.json` (project-level).
+   - Format:
+     ```json
+     {
+       "servers": {
+         "github": {
+           "command": "npx",
+           "args": ["-y", "@modelcontextprotocol/server-github"],
+           "env": { "GITHUB_TOKEN": "..." }
+         }
+       }
+     }
+     ```
+
+3. Tool discovery:
+   - At session start, connect to all configured MCP servers.
+   - Call `tools/list` on each server to discover available tools.
+   - Wrap each MCP tool as a `FunctionTool` with name `mcp__{server}__{tool}`.
+   - Register in the tool registry.
+
+4. Tool execution:
+   - When the LLM calls an MCP tool, route the call to the appropriate MCP server.
+   - Pass arguments via `tools/call`.
+   - Return the result as a `ToolResult`.
+
+5. Security boundary:
+   - MCP tools are marked with `permission_level = "execute"` (require confirmation).
+   - MCP tools cannot execute shell commands (blocked by design).
+   - MCP tools cannot access files outside the workspace.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/mcp/__init__.py`
+- Create: `src/coding_agent/mcp/client.py`
+- Create: `src/coding_agent/mcp/transport.py`
+- Create: `src/coding_agent/mcp/types.py`
+- Modify: `src/coding_agent/main.py` (load MCP servers at startup)
+- Modify: `src/coding_agent/config.py` (add MCP config path)
+
+**Acceptance criteria:**
+- MCP servers are loaded from config at session start.
+- MCP tools appear in the tool registry with `mcp__` prefix.
+- MCP tools can be called by the LLM and results returned.
+- MCP tools require permission confirmation.
+- MCP servers that fail to connect are logged and skipped.
+
+**Effort:** 5-7 days
+
+---
+
+### D.2 Model Switching
+
+**What:** Allow the user to switch between models mid-session via a `/model` command.
+
+**Why:** Different tasks benefit from different models. Opus for architecture decisions, Sonnet for routine edits, Haiku for quick lookups. Without mid-session switching, the user must restart the agent.
+
+**How it should work:**
+
+1. `/model` command (no args) shows available models:
+   ```
+   Current: gemini-2.5-flash
+   Available: gemini-2.5-flash, openai/gpt-4o, anthropic/claude-3.5-sonnet
+   ```
+
+2. `/model <name>` switches to the specified model:
+   - Validate the model name against available providers.
+   - Create a new `LLMClient` with the new model.
+   - Replace `self.llm_client` in the agent loop.
+   - Log the switch.
+
+3. Model aliases:
+   - `/fast` → cheapest/fastest available model.
+   - `/smart` → most capable available model.
+
+**Components to modify:**
+- Modify: `src/coding_agent/commands/builtin.py` (add `/model` command)
+- Modify: `src/coding_agent/agent/loop.py` (add `switch_model()` method)
+- Modify: `src/coding_agent/llm/client.py` (make model swappable)
+
+**Acceptance criteria:**
+- `/model` shows the current model and available options.
+- `/model <name>` switches the model for subsequent calls.
+- The switch is logged and visible in the status bar.
+- Token counting and cost tracking continue correctly after the switch.
+
+**Effort:** 3-5 hours
+
+---
+
+### D.3 Prompt Caching (API-Level)
+
+**What:** Structure the system prompt so that stable content (behavioral instructions, tool definitions) is cached by the API provider, reducing costs for long sessions.
+
+**Why:** The system prompt is rebuilt every request but 80% of it is identical across requests. Anthropic's prompt caching API can cache this content, reducing costs by 50-80%.
+
+**How it should work:**
+
+1. The current `system_prompt.py` already has a static/dynamic split with `DYNAMIC_BOUNDARY`.
+   - Static: behavioral rules, tool usage policy, safety guardrails.
+   - Dynamic: environment info, project context, memory, plan state.
+
+2. For Anthropic models: use the `cache_control` parameter in the API request:
+   ```python
+   {
+     "role": "system",
+     "content": [
+       {"type": "text", "text": static_prompt, "cache_control": {"type": "ephemeral"}},
+       {"type": "text", "text": dynamic_prompt}
+     ]
+   }
+   ```
+
+3. For other providers: structure the prompt so the static part is first and longest, maximizing the chance of implicit caching.
+
+4. Track cache hit/miss in the usage data and display in the status bar.
+
+**Components to modify:**
+- Modify: `src/coding_agent/llm/client.py` (add cache_control for Anthropic provider)
+- Modify: `src/coding_agent/agent/system_prompt.py` (ensure static/dynamic boundary is clean)
+
+**Acceptance criteria:**
+- Static prompt content is marked as cacheable for Anthropic models.
+- Cache hits are tracked and displayed.
+- Cost savings from caching are visible in the `/cost` output.
+- Non-Anthropic providers are unaffected.
+
+**Effort:** 1 day
+
+---
+
+### D.4 Diff Viewer
+
+**What:** Display file changes as colored diffs in the TUI, with additions in green and deletions in red.
+
+**Why:** Without a diff viewer, users can't see what the agent changed. They have to manually run `git diff`. A built-in diff viewer makes the agent transparent and trustworthy.
+
+**How it should work:**
+
+1. Create `src/coding_agent/tui/diff_viewer.py`:
+   - Takes `old_content` and `new_content` (or a unified diff string).
+   - Renders with colored output: green for additions, red for deletions, white for context.
+   - Supports scrolling for large diffs.
+   - Shows file path and change summary (N additions, N deletions).
+
+2. Integration:
+   - After `edit_file` or `write_file`, show the diff inline.
+   - For `write_file` (new file), show the full content in green.
+   - For `edit_file`, show only the changed lines.
+
+3. The diff viewer should be a Textual widget that can be embedded in the message area.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/tui/diff_viewer.py`
+- Modify: `src/coding_agent/tui/repl.py` (show diffs after file edits)
+
+**Acceptance criteria:**
+- After file edits, a colored diff is shown.
+- Additions are green, deletions are red.
+- Large diffs are scrollable.
+- The diff shows file path and change count.
+
+**Effort:** 1-2 days
+
+---
+
+### D.5 Status Bar
+
+**What:** A persistent bar at the bottom of the TUI showing current model, token usage, cost, context usage percentage, and iteration count.
+
+**Why:** Users need to see at a glance how much of their budget they've used, what model is active, and how full the context window is. Without this, they have no visibility into the agent's state.
+
+**How it should work:**
+
+1. Create `src/coding_agent/tui/status_bar.py`:
+   - Fixed at the bottom of the screen.
+   - Shows:
+     - Model name and provider (left).
+     - Token count: `12.5K / 100K` (context usage).
+     - Cost: `$0.23` (accumulated).
+     - Iteration: `iter 5`.
+     - Permission mode: `>` (default) or `>>` (acceptEdits).
+
+2. Updates in real time as the agent processes.
+
+3. Color coding:
+   - Context < 70%: green.
+   - Context 70-85%: yellow.
+   - Context > 85%: red.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/tui/status_bar.py`
+- Modify: `src/coding_agent/tui/repl.py` (add status bar to layout)
+
+**Acceptance criteria:**
+- Status bar is always visible at the bottom.
+- Model, tokens, cost, and iteration are displayed.
+- Context usage is color-coded.
+- Updates happen in real time.
+
+**Effort:** 3-5 hours
+
+---
+
+### D.6 Progress Indicators
+
+**What:** Show spinners, progress bars, or other visual feedback during long operations.
+
+**Why:** Without progress indicators, users don't know if the agent is working or stuck. This is especially important for tool calls that take several seconds.
+
+**How it should work:**
+
+1. Tool execution indicators:
+   - When a tool starts, show a spinner next to the tool name.
+   - When the tool completes, replace the spinner with a checkmark or X.
+   - For known-duration operations (e.g., running tests), show a progress bar.
+
+2. LLM streaming indicator:
+   - Show a pulsing dot while tokens are being generated.
+   - Stop when the response is complete.
+
+3. Implementation:
+   - Use Textual's `LoadingIndicator` or custom widget.
+   - The REPL manages spinner state based on agent events.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/tui/widgets.py` (spinner, progress bar widgets)
+- Modify: `src/coding_agent/tui/repl.py` (manage indicator state)
+
+**Acceptance criteria:**
+- Spinners appear when tools are executing.
+- Spinners are replaced by results when done.
+- The LLM streaming indicator pulses during generation.
+- No visual flicker or layout jumps.
+
+**Effort:** 3-5 hours
+
+---
+
+## Phase E — Advanced (3-4 weeks)
+
+These features add sophisticated capabilities that differentiate CoreCode from basic coding agents.
+
+---
+
+### E.1 Plan Mode (Read-Only)
+
+**What:** Enter a read-only mode where the agent can read files, search code, and analyze the codebase without making any changes. Once a plan is formed, the user approves and the agent switches to execution mode.
+
+**Why:** Without plan mode, the agent may start making changes before fully understanding the codebase. Plan mode forces the agent to think before acting. Claude Code's `/plan` command is one of its most important features.
+
+**How it should work:**
+
+1. `/plan` command enters plan mode:
+   - Set a `plan_mode` flag on the agent loop.
+   - In plan mode, all write/exec tools are blocked (return error: "In plan mode. Use /plan to exit and start execution.").
+   - Read-only tools (read_file, search_content, search_files, list_files, git_*) are allowed.
+
+2. The agent creates a plan using the existing `create_plan` tool.
+
+3. `/plan` again (or `/execute`) exits plan mode:
+   - Clear the `plan_mode` flag.
+   - The agent begins executing the plan.
+
+4. The plan is displayed in the TUI as a numbered checklist with status indicators.
+
+**Components to modify:**
+- Modify: `src/coding_agent/agent/loop.py` (add `plan_mode` flag, block write tools)
+- Modify: `src/coding_agent/commands/builtin.py` (add `/plan` command)
+
+**Acceptance criteria:**
+- `/plan` enters read-only mode.
+- Write tools are blocked in plan mode.
+- Read tools work normally in plan mode.
+- `/plan` again exits to execution mode.
+- The plan is displayed as a checklist in the TUI.
+
+**Effort:** 1 day
+
+---
+
+### E.2 Semantic Memory Search
+
+**What:** Use embeddings to search memories by meaning, not just keyword matching.
+
+**Why:** The current LIKE-based search (`content LIKE %query%`) only finds exact keyword matches. If a user says "the auth bug" but the memory says "login issue in authentication module", LIKE search won't find it. Semantic search understands that "auth bug" and "login issue" are related.
+
+**How it should work:**
+
+1. Create `src/coding_agent/memory/embeddings.py`:
+   - Use a lightweight local embedding model (e.g., `sentence-transformers` with `all-MiniLM-L6-v2` — 80MB, runs on CPU).
+   - `embed(text: str) -> list[float]` — generate embedding for a text.
+   - `similarity(a: list[float], b: list[float]) -> float` — cosine similarity.
+
+2. Modify `session/manager.py`:
+   - Add an `embedding BLOB` column to the `memory` table.
+   - When saving a memory, generate its embedding and store it.
+   - When searching, compute query embedding and rank by cosine similarity.
+
+3. Modify `agent/memory.py`:
+   - `recall()` method uses embedding similarity when available.
+   - Falls back to LIKE search if embeddings are not available (graceful degradation).
+
+4. The embedding model is loaded lazily (only when memory search is first used) to avoid startup latency.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/memory/embeddings.py`
+- Modify: `src/coding_agent/session/manager.py` (add embedding column, similarity search)
+- Modify: `src/coding_agent/agent/memory.py` (use embeddings for recall)
+- Modify: `src/coding_agent/config.py` (add embedding model config)
+
+**Acceptance criteria:**
+- Memories are stored with embeddings.
+- Recall ranks by semantic similarity, not just keyword match.
+- "auth bug" finds "login issue in authentication module".
+- The embedding model loads in < 5 seconds.
+- Graceful fallback to LIKE search if embeddings are unavailable.
+
+**Effort:** 3-5 days
+
+---
+
+### E.3 Session Forking
+
+**What:** Create an independent branch of the current conversation, allowing the user to explore alternative approaches without losing the original conversation.
+
+**Why:** Sometimes the user wants to try a different approach but doesn't want to lose the current conversation. Session forking is like `git branch` but for agent sessions.
+
+**How it should work:**
+
+1. `/fork` command:
+   - Clone the current message history into a new session.
+   - Both the original and fork continue independently.
+   - The fork shares the same message history up to the fork point.
+
+2. Implementation:
+   - Create a new session in SQLite with a `parent_session_id` field.
+   - Copy all messages from the parent session up to the current point.
+   - The fork gets a new session ID.
+   - Both sessions can be resumed independently.
+
+3. The REPL shows which session is active (e.g., "Session: abc123 (forked from def456)").
+
+**Components to modify:**
+- Modify: `src/coding_agent/session/manager.py` (add `parent_session_id` column, `fork_session()` method)
+- Modify: `src/coding_agent/commands/builtin.py` (add `/fork` command)
+- Modify: `src/coding_agent/tui/repl.py` (show session info)
+
+**Acceptance criteria:**
+- `/fork` creates a new session with the same history.
+- The fork is independent (changes don't affect the parent).
+- Both sessions can be resumed.
+- The session ID shows the fork relationship.
+
+**Effort:** 1-2 days
+
+---
+
+### E.4 Team Mode (Multi-Agent Collaboration)
+
+**What:** Create named teams of agents that collaborate on a task, sharing a scratchpad and communicating via messages.
+
+**Why:** Some tasks are naturally collaborative — one agent researches while another implements. Team mode enables this without a single agent filling its context with both research and implementation.
+
+**How it should work:**
+
+1. `TeamCreate` tool:
+   - Creates a named team with a shared scratchpad directory.
+   - Spawns 2-3 agents with different roles (e.g., "researcher", "implementer", "reviewer").
+
+2. `SendMessage` tool:
+   - Route messages between team members.
+   - Each agent sees messages from other team members in its context.
+
+3. Shared scratchpad:
+   - A temporary directory where agents can write findings for other agents to read.
+   - Files are cleaned up when the team is disbanded.
+
+4. Shutdown protocol:
+   - When the task is complete, the coordinator agent sends a shutdown request.
+   - Team members complete their current work and exit.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/team.py`
+- Create: `src/coding_agent/tools/team.py`
+- Modify: `src/coding_agent/agent/loop.py` (team management)
+
+**Acceptance criteria:**
+- A team can be created with 2-3 agents.
+- Agents can send messages to each other.
+- The shared scratchpad is accessible to all agents.
+- The team shuts down cleanly when the task is complete.
+
+**Effort:** 3-5 days
+
+---
+
+### E.5 Circuit Breaker
+
+**What:** Automatically disable features that are failing repeatedly, preventing the agent from getting stuck in error loops.
+
+**Why:** Without circuit breakers, a failing feature (e.g., compaction, auto-mode) can cause the agent to retry indefinitely, wasting time and tokens. Claude Code uses circuit breakers for compaction and auto-mode.
+
+**How it should work:**
+
+1. Create `src/coding_agent/agent/circuit_breaker.py`:
+   - `CircuitBreaker` class with states: CLOSED (normal), OPEN (failing), HALF_OPEN (testing).
+   - `record_failure()` — increment failure count.
+   - `record_success()` — reset failure count, move to CLOSED.
+   - `is_open()` — return True if too many failures (threshold: 3 consecutive).
+   - `reset()` — manually reset to CLOSED.
+
+2. Apply circuit breakers to:
+   - Context summarization (already has a lock, add circuit breaker).
+   - Reactive compact (prevent retry loops).
+   - Subagent spawning (prevent infinite subagent creation).
+
+3. When a circuit breaker opens:
+   - Log a warning.
+   - Skip the failing operation.
+   - Surface an error to the user.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/circuit_breaker.py`
+- Modify: `src/coding_agent/agent/loop.py` (apply circuit breakers)
+
+**Acceptance criteria:**
+- Circuit breaker opens after 3 consecutive failures.
+- When open, the failing operation is skipped.
+- Circuit breaker resets after a successful operation.
+- All circuit breaker state changes are logged.
+
+**Effort:** 1 day
+
+---
+
+## Phase F — Claude Code Parity (4-6 weeks)
+
+These features bring CoreCode to feature parity with Claude Code.
+
+---
+
+### F.1 Vim Mode
+
+**What:** Full vim keybinding support for the input area — motions (w, b, e, $, 0), operators (d, c, y), and text objects (iw, aw, i", a").
+
+**Why:** Power users expect vim keybindings. Claude Code has a full vim implementation. This is a differentiator for developer-focused tools.
+
+**How it should work:**
+
+1. Create `src/coding_agent/tui/vim.py`:
+   - State machine: Normal, Insert, Visual, Command modes.
+   - Motions: w (word forward), b (word backward), e (end of word), $ (end of line), 0 (start of line).
+   - Operators: d (delete), c (change), y (yank).
+   - Text objects: iw (inner word), aw (a word), i" (inner quotes), a" (a quotes).
+   - Number prefixes: 3dw = delete 3 words.
+
+2. Integration:
+   - `/vim` command toggles vim mode.
+   - When enabled, the input area processes keystrokes through the vim state machine.
+   - Mode indicator in the status bar: `-- NORMAL --`, `-- INSERT --`, `-- VISUAL --`.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/tui/vim.py`
+- Modify: `src/coding_agent/tui/repl.py` (integrate vim input handling)
+- Modify: `src/coding_agent/tui/status_bar.py` (show vim mode)
+
+**Acceptance criteria:**
+- `/vim` toggles vim mode on/off.
+- Normal mode motions work (w, b, e, $, 0).
+- Delete and change operators work (dw, ciw, etc.).
+- Mode indicator is shown in the status bar.
+- Vim mode persists across REPL sessions.
+
+**Effort:** 3-5 days
+
+---
+
+### F.2 DreamTask (Background Memory Consolidation)
+
+**What:** A background process that reviews recent session transcripts, identifies patterns and preferences, and updates memory files automatically — running when the user is idle.
+
+**Why:** Memory consolidation currently only happens at session end. DreamTask runs during idle time, keeping memories fresh and relevant without user intervention.
+
+**How it should work:**
+
+1. Create `src/coding_agent/agent/dream.py`:
+   - `DreamTask` class that runs as a background `asyncio.Task`.
+   - Triggered when the user has been idle for > 2 minutes.
+   - Reviews the last 10 messages of the current session.
+   - Identifies patterns: repeated file paths, common errors, user preferences.
+   - Updates memory via `MemoryManager.store()`.
+   - Max 30 "turns" of activity per dream cycle.
+
+2. Dream task types:
+   - Extract user preferences (e.g., "user prefers snake_case").
+   - Extract project conventions (e.g., "project uses pytest, not unittest").
+   - Extract ongoing work context (e.g., "working on auth refactor").
+
+3. The dream task is cancellable (if the user sends a new message, the dream stops).
+
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/dream.py`
+- Modify: `src/coding_agent/agent/loop.py` (trigger dream on idle)
+- Modify: `src/coding_agent/tui/repl.py` (detect idle, cancel dream on input)
+
+**Acceptance criteria:**
+- DreamTask triggers after 2 minutes of idle time.
+- It reviews recent messages and extracts patterns.
+- Extracted memories are stored via MemoryManager.
+- The dream stops immediately when the user sends a message.
+- Max 30 turns per dream cycle.
+- Dream activity is logged but not shown in the TUI.
+
+**Effort:** 1-2 days
+
+---
+
+### F.3 HTML Stats Report
+
+**What:** Generate an HTML report showing session statistics — token usage, cost breakdown, tool usage distribution, and context utilization over time.
+
+**Why:** Users need visibility into how they're using the agent. A visual report helps optimize usage and understand cost patterns.
+
+**How it should work:**
+
+1. `/stats` command generates an HTML file and opens it in the browser.
+
+2. Report sections:
+   - **Session summary**: model, provider, duration, total tokens, total cost.
+   - **Token usage over time**: line chart showing prompt vs completion tokens per iteration.
+   - **Tool usage distribution**: pie chart showing which tools were called most.
+   - **Cost breakdown**: bar chart showing cost per tool call.
+   - **Context utilization**: line chart showing context window usage over time.
+
+3. Implementation:
+   - Create `src/coding_agent/stats/report.py`.
+   - Use a templated HTML string (no external dependencies — just inline SVG/JS).
+   - Write to a temp file and open with `webbrowser.open()`.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/stats/__init__.py`
+- Create: `src/coding_agent/stats/report.py`
+- Modify: `src/coding_agent/commands/builtin.py` (add `/stats` command)
+
+**Acceptance criteria:**
+- `/stats` generates an HTML report and opens it.
+- The report shows session summary, token usage, tool distribution, and cost.
+- Charts are rendered as inline SVG (no external dependencies).
+- The report is saved to `~/.coding-agent/stats/` for later viewing.
+
+**Effort:** 3-5 hours
+
+---
+
+### F.4 Git Worktree Isolation
+
+**What:** When running parallel agents or subagents, each agent works in its own git worktree, preventing file conflicts.
+
+**Why:** Without worktree isolation, two agents editing the same file simultaneously will cause conflicts. Git worktrees provide lightweight isolation.
+
+**How it should work:**
+
+1. Create `src/coding_agent/git/worktree.py`:
+   - `create_worktree(branch_name: str) -> Path` — creates a git worktree for the given branch.
+   - `remove_worktree(worktree_path: Path)` — removes the worktree.
+   - `list_worktrees() -> list[Path]` — lists active worktrees.
+
+2. When a subagent is spawned:
+   - Create a new worktree with a unique branch name (e.g., `agent/<agent-id>`).
+   - The subagent's workspace is set to the worktree path.
+   - When the subagent completes, merge or cherry-pick its changes back.
+
+3. Worktree cleanup:
+   - On session end, remove all agent worktrees.
+   - Option to keep worktrees for manual review.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/git/worktree.py`
+- Modify: `src/coding_agent/agent/subagent.py` (use worktrees for isolation)
+
+**Acceptance criteria:**
+- Each subagent gets its own worktree.
+- File changes in one worktree don't affect others.
+- Worktrees are cleaned up on session end.
+- The main agent can merge subagent changes.
+
+**Effort:** 3-5 days
+
+---
+
+### F.5 Conflict Resolution
+
+**What:** When git merge conflicts are detected, the agent reads the conflict markers, understands both sides, and helps resolve them.
+
+**Why:** Developers frequently encounter merge conflicts. An agent that can read and resolve conflicts saves significant time.
+
+**How it should work:**
+
+1. Add a `resolve_conflicts` tool:
+   - Reads a file with conflict markers.
+   - Parses both sides (ours/theirs).
+   - For simple conflicts (formatting, imports), resolves automatically.
+   - For complex conflicts, presents both sides and asks the user.
+
+2. Integration:
+   - After `git_merge` or `git_rebase`, check for conflict markers.
+   - If found, invoke the conflict resolution tool.
+   - Show the resolution to the user for approval.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/tools/conflict.py`
+- Modify: `src/coding_agent/tools/git.py` (add merge/rebase tools)
+
+**Acceptance criteria:**
+- The agent can read conflict markers.
+- Simple conflicts are resolved automatically.
+- Complex conflicts are presented to the user.
+- The resolution is verified (no conflict markers remain).
+
+**Effort:** 3-5 days
+
+---
+
+### F.6 Transcript Viewer
+
+**What:** A separate view that shows the full conversation transcript with search and navigation.
+
+**Why:** In long sessions, the user needs to scroll back through the conversation. A dedicated transcript view with search is more efficient than scrolling the main TUI.
+
+**How it should work:**
+
+1. `/transcript` command (or Ctrl+O) toggles the transcript view.
+2. The transcript shows all messages in chronological order.
+3. Search: `/` to enter search mode, type a query, navigate with `n`/`N`.
+4. Navigation: `j`/`k` to scroll, `gg`/`G` to go to top/bottom.
+5. Exit with `Esc` or `q`.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/tui/transcript.py`
+- Modify: `src/coding_agent/tui/repl.py` (toggle transcript view)
+
+**Acceptance criteria:**
+- `/transcript` opens the transcript view.
+- Full conversation history is displayed.
+- Search works across all messages.
+- Navigation is smooth (no lag with large transcripts).
+- `q` or `Esc` returns to the main view.
+
+**Effort:** 3-5 days
+
+---
+
+## Phase G — Beyond Claude Code (6-8 weeks)
+
+These features go beyond what Claude Code currently offers, positioning CoreCode as a next-generation coding agent.
+
+---
+
+### G.1 Autonomous Background Tasks
+
+**What:** Queue tasks that run in the background while the user works on other things, with notification on completion.
+
+**Why:** Some tasks are long-running (e.g., "run the full test suite and fix all failures"). The user shouldn't have to wait for these to complete.
+
+**How it should work:**
+
+1. `/background <prompt>` command queues a task.
+2. The task runs in a background agent with its own session.
+3. The user can check status with `/tasks`.
+4. When the task completes, a notification is shown in the TUI.
+5. The user can view the results with `/tasks show <id>`.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/background.py`
+- Modify: `src/coding_agent/commands/builtin.py` (add `/background` and `/tasks`)
+
+**Effort:** 3-5 days
+
+---
+
+### G.2 Predictive Context Prefetching
+
+**What:** Analyze the current task and pre-load files the agent is likely to need next, reducing latency.
+
+**Why:** Every `read_file` call takes time. If the agent knows it will need certain files, it can load them proactively.
+
+**How it should work:**
+
+1. After each tool call, analyze the result to predict likely next files:
+   - If the agent read `auth/login.py` and saw `from auth.logout import logout`, prefetch `auth/logout.py`.
+   - If the agent is editing `main.py`, prefetch test files.
+
+2. Prefetch into the file state cache (if implemented) or a prefetch buffer.
+
+3. When the agent requests a prefetched file, return the cached version immediately.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/prefetch.py`
+- Modify: `src/coding_agent/agent/loop.py` (trigger prefetch after tool calls)
+
+**Effort:** 3-5 days
+
+---
+
+### G.3 Knowledge Graph of Codebase
+
+**What:** Build and maintain a graph of file→function→class→import relationships for faster navigation and understanding.
+
+**Why:** The current workspace index only tracks file names and languages. A knowledge graph understands the relationships between code elements, enabling smarter search and navigation.
+
+**How it should work:**
+
+1. Create `src/coding_agent/agent/knowledge_graph.py`:
+   - Parse Python files with `ast` to extract functions, classes, imports.
+   - Build a graph: `File → [Function, Class] → [Import, Call, Inheritance]`.
+   - Store in-memory (or SQLite for persistence).
+
+2. Query the graph:
+   - "Find all callers of function X" → follow call edges.
+   - "Find all files that import module Y" → follow import edges.
+   - "Find all subclasses of class Z" → follow inheritance edges.
+
+3. Integrate with search tools to provide structurally-aware search.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/agent/knowledge_graph.py`
+- Modify: `src/coding_agent/tools/search.py` (add graph-aware search)
+
+**Effort:** 5-7 days
+
+---
+
+### G.4 Multi-Model Orchestration
+
+**What:** Automatically route subtasks to the optimal model without user intervention.
+
+**Why:** Not all tasks need the most expensive model. Simple reads can use Haiku, complex architecture decisions need Opus. Manual switching is tedious.
+
+**How it should work:**
+
+1. Classify each tool call by complexity:
+   - Low: read_file, list_files, search_files, git_status → use fast/cheap model.
+   - Medium: edit_file, write_file, search_content → use balanced model.
+   - High: create_plan, complex shell commands → use advanced model.
+
+2. The classification is based on the tool name and arguments.
+
+3. For each tool call, select the appropriate model and create a temporary LLM client.
+
+4. The main response (where the model decides what to do) always uses the user's selected model.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/llm/router.py`
+- Modify: `src/coding_agent/agent/loop.py` (use router for tool execution)
+
+**Effort:** 3-5 days
+
+---
+
+### G.5 Workflow Automation
+
+**What:** Save and replay common task sequences (e.g., "create feature → write tests → lint → commit").
+
+**Why:** Developers repeat the same sequences frequently. Workflow automation lets them define these once and replay them.
+
+**How it should work:**
+
+1. `/workflow save <name>` — saves the current task sequence as a named workflow.
+2. `/workflow run <name>` — replays the workflow with current context.
+3. Workflows are stored as JSON files in `~/.coding-agent/workflows/`.
+4. Support parameterized workflows with `$ARGUMENTS` placeholders.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/workflows/__init__.py`
+- Create: `src/coding_agent/workflows/manager.py`
+- Modify: `src/coding_agent/commands/builtin.py` (add `/workflow` command)
+
+**Effort:** 3-5 days
+
+---
+
+### G.6 Rich Observability Dashboards
+
+**What:** Token flow visualization, cost breakdowns, latency histograms, and context utilization graphs — accessible from the TUI.
+
+**Why:** Power users need deep visibility into agent performance to optimize their workflows.
+
+**How it should work:**
+
+1. `/dashboard` command opens a full-screen dashboard view.
+2. Panels:
+   - Token flow: real-time chart of tokens per iteration.
+   - Cost tracker: cumulative cost with per-tool breakdown.
+   - Latency: histogram of tool execution times.
+   - Context: gauge showing context window utilization.
+   - Memory: count and importance distribution of stored memories.
+
+3. The dashboard updates in real time as the agent works.
+
+**Components to create/modify:**
+- Create: `src/coding_agent/tui/dashboard.py`
+- Modify: `src/coding_agent/commands/builtin.py` (add `/dashboard` command)
+
+**Effort:** 5-7 days
 
 ---
 
 ## Dependency Graph
 
 ```
-Phase 1 (Foundation)
-  ├── 1.1 Fix Gemini bug
-  ├── 1.2 tiktoken counting
-  ├── 1.3 Tool result truncation
-  ├── 1.4 Parallel execution
-  ├── 1.5 Streaming tool calls
-  ├── 1.6 Session persistence ←── blocks Phase 3
-  └── 1.7 Cost/time budgets
-
-Phase 2 (Intelligence)  ←── depends on Phase 1
-  ├── 2.1 Workspace index
-  ├── 2.2 Planning system ←── blocks 2.3, 2.6
-  ├── 2.3 Verification ←── depends on 2.2
-  ├── 2.4 Error recovery ←── depends on 2.2
-  ├── 2.5 Context engine
-  ├── 2.6 Stuck detection ←── depends on 2.2
-  ├── 2.7 Apply-patch tool
-
-Phase 3 (Memory)  ←── depends on Phase 1.6
-  ├── 3.1 Cross-session memory
-  ├── 3.2 Undo/redo ←── depends on 1.6
-  ├── 3.3 History viewer ←── depends on 1.6, 3.1
-  └── 3.4 Adaptive prompt
-
-Phase 4 (Production)  ←── depends on Phase 2
-  ├── 4.1 Prompt caching
-  ├── 4.2 Anthropic SDK
-  ├── 4.3 MCP integration
-  ├── 4.4 Sub-agents
-  ├── 4.5 Network isolation
-  ├── 4.6 Telemetry
-  ├── 4.7 TUI polish
-  ├── 4.8 Integration tests
-  └── 4.9 Documentation
+Phase A (Critical Fixes)
+├── A.1 Dangerous Command Detection (independent)
+├── A.2 Protected Files/Dirs (independent)
+├── A.3 Max Output Recovery (independent)
+├── A.4 Prompt Too Long Recovery (depends on context.py changes)
+├── A.5 Interactive REPL (independent, but largest effort)
+├── A.6 Checkpointing & Rewind (depends on A.5 REPL)
+│
+Phase B (Foundation)
+├── B.1 Micro-Compact (depends on A.4 context changes)
+├── B.2 Sibling Abort (independent)
+├── B.3 Tool Timeouts (independent)
+├── B.4 Fuzzy Edit (independent)
+├── B.5 Hooks System (independent)
+├── B.6 Streaming Display (depends on A.5 REPL)
+├── B.7 Permission Modes (independent)
+│
+Phase C (Intelligence)
+├── C.1 Subagents (depends on B.3 tool timeouts)
+├── C.2 Session Resumption (depends on A.5 REPL)
+├── C.3 AGENTS.md Hierarchy (independent)
+├── C.4 Slash Commands (depends on A.5 REPL)
+├── C.5 Context Window Sliding (depends on B.1 micro-compact)
+├── C.6 Intent Re-injection (independent)
+│
+Phase D (UX)
+├── D.1 MCP Integration (depends on B.5 hooks for security)
+├── D.2 Model Switching (independent)
+├── D.3 Prompt Caching (independent)
+├── D.4 Diff Viewer (depends on A.5 REPL)
+├── D.5 Status Bar (depends on A.5 REPL)
+├── D.6 Progress Indicators (depends on A.5 REPL)
+│
+Phase E (Advanced)
+├── E.1 Plan Mode (depends on C.4 slash commands)
+├── E.2 Semantic Memory (independent)
+├── E.3 Session Forking (depends on C.2 session resumption)
+├── E.4 Team Mode (depends on C.1 subagents)
+├── E.5 Circuit Breaker (independent)
+│
+Phase F (Claude Code Parity)
+├── F.1 Vim Mode (depends on A.5 REPL)
+├── F.2 DreamTask (depends on E.2 semantic memory)
+├── F.3 HTML Stats (independent)
+├── F.4 Git Worktree (depends on C.1 subagents)
+├── F.5 Conflict Resolution (independent)
+├── F.6 Transcript Viewer (depends on A.5 REPL)
+│
+Phase G (Beyond Claude Code)
+├── G.1 Background Tasks (depends on C.1 subagents, A.5 REPL)
+├── G.2 Predictive Prefetch (depends on F.4 worktree or file cache)
+├── G.3 Knowledge Graph (independent)
+├── G.4 Multi-Model Orchestration (depends on D.2 model switching)
+├── G.5 Workflow Automation (depends on C.4 slash commands, A.5 REPL)
+├── G.6 Observability Dashboard (depends on A.5 REPL)
 ```
 
 ---
 
-## Effort Summary
+## Estimated Total Effort
 
-| Phase | Duration | Complexity | Score Impact |
-|---|---|---|---|
-| Phase 1: Foundation | 10-15 days | Low-Medium | 3.5 → 5.0 |
-| Phase 2: Intelligence | 20-25 days | Medium-High | 5.0 → 7.0 |
-| Phase 3: Memory | 15-18 days | Medium-High | 7.0 → 8.5 |
-| Phase 4: Production | 25-30 days | Medium-High | 8.5 → 9.5 |
-| **Total** | **70-88 days** | | **3.5 → 9.5** |
+| Phase | Duration | Cumulative |
+|-------|----------|------------|
+| Phase A | 1-2 weeks | 1-2 weeks |
+| Phase B | 2-3 weeks | 3-5 weeks |
+| Phase C | 2-3 weeks | 5-8 weeks |
+| Phase D | 2-3 weeks | 7-11 weeks |
+| Phase E | 3-4 weeks | 10-15 weeks |
+| Phase F | 4-6 weeks | 14-21 weeks |
+| Phase G | 6-8 weeks | 20-29 weeks |
 
----
-
-## Priority Matrix (Quick Reference)
-
-| Priority | Task | Effort | Impact |
-|---|---|---|---|
-| P0 | Fix Gemini system prompt bug | 2h | Critical |
-| P0 | Tool result truncation | 4h | High |
-| P0 | tiktoken token counting | 3h | High |
-| P1 | Parallel tool execution | 6h | High |
-| P1 | Session persistence | 8h | High |
-| P1 | Planning system | 12h | Critical |
-| P1 | Verification system | 10h | Critical |
-| P2 | Workspace index | 8h | High |
-| P2 | Error recovery | 8h | High |
-| P2 | Context engine | 8h | High |
-| P2 | Cross-session memory | 15h | Critical |
-| P2 | Undo/redo | 8h | High |
-| P3 | Stuck detection | 6h | High |
-| P3 | Apply-patch tool | 8h | High |
-| P3 | Prompt caching | 8h | High |
-| P3 | Anthropic SDK | 12h | High |
-| P3 | MCP integration | 15h | High |
-| P3 | Sub-agents | 20h | Medium |
-| P4 | Network isolation | 3h | Medium |
-| P4 | Telemetry | 8h | Medium |
-| P4 | TUI polish | 10h | Medium |
-| P4 | Integration tests | 12h | High |
-| P4 | Documentation | 8h | Medium |
+**Total estimated time: 5-7 months** (assuming single developer, part-time).
 
 ---
 
-## Phase 5: Advanced Agent Capabilities (Week 15-20)
-
-**Goal:** Transform from a coding tool into an autonomous development partner. Full Git workflow, multi-modal understanding, custom agents, plugin ecosystem, team collaboration.
-
-**Expected score after:** 9.5 → 9.8/10
-
-**Status: ⬜ PLANNED (0/8)**
-
-- [ ] 5.1 Full Git Integration
-- [ ] 5.2 Multi-Modal Understanding
-- [ ] 5.3 Custom Agent Definitions
-- [ ] 5.4 Plugin System
-- [ ] 5.5 Team Collaboration
-- [ ] 5.6 Autonomous Background Workflows
-- [ ] 5.7 Code Intelligence & Impact Analysis
-- [ ] 5.8 Interactive Code Review
-
----
-
-### 5.1 Full Git Integration
-
-**Why:** Currently the agent can only do `git_commit`. Real development requires full Git workflow — branching, diffing, merging, rebasing, conflict resolution, PR creation.
-
-**What to build:**
-- New module `tools/git.py` — comprehensive Git tools:
-  - `git_status` — current branch, staged/unstaged changes
-  - `git_diff` — diff of staged or specific files
-  - `git_log` — recent commits with messages
-  - `git_branch` — list/create/switch branches
-  - `git_commit` — commit with message (already exists, enhance)
-  - `git_push` / `git_pull` — remote sync
-  - `git_merge` / `git_rebase` — branch integration
-  - `git_stash` / `git_stash_pop` — temporary save
-  - `git_resolve_conflict` — structured conflict resolution
-- Smart commit messages: auto-generate from changes
-- Branch awareness: agent knows what branch it's on, suggests branching strategy
-- Conflict resolution: when merge conflicts occur, agent reads both sides, proposes resolution
-
-**Files to create/modify:**
-- `src/coding_agent/tools/git.py` (NEW — ~400 lines)
-- `src/coding_agent/tools/__init__.py` — register git tools
-- `src/coding_agent/agent/loop.py` — git context in system prompt
-- `tests/test_tools/test_git.py` (NEW)
-
-**Verification:** Agent can create a branch, make changes, commit, and create a merge commit — all through tools.
-
-**Complexity:** High (12-15 hours)
-**Impact:** Critical (real development workflow)
-
----
-
-### 5.2 Multi-Modal Understanding
-
-**Why:** Developers share screenshots of bugs, UI mockups, architecture diagrams. The agent can't process images.
-
-**What to build:**
-- Extend LLM clients to support image inputs:
-  - Gemini: native multimodal (already supports images)
-  - OpenRouter: pass image as base64 in content blocks
-  - Anthropic: native image support
-- New tool `describe_image` — agent can ask about a screenshot/diagram
-- TUI support: paste image from clipboard (Ctrl+V), drag-drop file
-- Image context: when image is provided, agent can:
-  - Describe what it sees
-  - Compare with code (e.g., "this UI doesn't match the mockup")
-  - Generate code from mockup
-  - Identify bugs from screenshots
-
-**Files to create/modify:**
-- `src/coding_agent/llm/client.py` — image content blocks
-- `src/coding_agent/llm/gemini_client.py` — multimodal support
-- `src/coding_agent/tui/app.py` — clipboard paste handling
-- `src/coding_agent/tui/widgets/chat.py` — image display
-- `tests/test_llm/test_multimodal.py` (NEW)
-
-**Verification:** User pastes a screenshot, agent describes what it sees and suggests code changes.
-
-**Complexity:** High (10-12 hours)
-**Impact:** High (visual context)
-
----
-
-### 5.3 Custom Agent Definitions
-
-**Why:** Different tasks need different agent personalities. A security reviewer thinks differently than a performance optimizer.
-
-**What to build:**
-- Agent definition files (YAML/TOML):
-  ```yaml
-  # ~/.coding-agent/agents/security-reviewer.yaml
-  name: "Security Reviewer"
-  description: "Reviews code for security vulnerabilities"
-  system_prompt: |
-    You are a security expert. Focus on:
-    - SQL injection, XSS, CSRF
-    - Authentication/authorization flaws
-    - Secrets in code
-    - Dependency vulnerabilities
-  model: "gemini-2.5-pro"
-  tools: ["read_file", "grep", "list_files"]
-  temperature: 0.3
-  ```
-- New CLI command: `coding-agent --agent security-reviewer`
-- TUI: agent selector in status bar
-- Built-in agent profiles:
-  - `default` — general coding (current)
-  - `security-reviewer` — security focus
-  - `performance-optimizer` — perf focus
-  - `test-writer` — test generation
-  - `documenter` — documentation
-  - `refactorer` — code quality
-- Agent memory: each agent has its own memory namespace
-
-**Files to create/modify:**
-- `src/coding_agent/agent/definitions.py` (NEW — ~200 lines)
-- `src/coding_agent/agent/system_prompt.py` — load from agent definition
-- `src/coding_agent/main.py` — `--agent` flag
-- `src/coding_agent/tui/app.py` — agent selector
-- `~/.coding-agent/agents/` — built-in profiles
-- `tests/test_agent/test_definitions.py` (NEW)
-
-**Verification:** `coding-agent --agent security-reviewer` loads a security-focused system prompt.
-
-**Complexity:** Medium (8-10 hours)
-**Impact:** High (task-specific expertise)
-
----
-
-### 5.4 Plugin System
-
-**Why:** Users want to extend the agent with custom tools, prompts, and workflows without modifying core code.
-
-**What to build:**
-- Plugin architecture:
-  ```
-  ~/.coding-agent/plugins/
-    my-plugin/
-      plugin.yaml          # metadata
-      tools/               # custom tools
-      prompts/             # custom prompt sections
-      hooks/               # event handlers
-  ```
-- Plugin manifest:
-  ```yaml
-  name: "my-plugin"
-  version: "1.0.0"
-  description: "Adds custom linting tools"
-  tools:
-    - name: "custom_lint"
-      description: "Run custom linting rules"
-      module: "tools.custom_lint"
-  hooks:
-    - event: "after_edit"
-      module: "hooks.auto_format"
-  ```
-- Dynamic tool registration: plugin tools added to `tool_registry`
-- Event hooks: plugins can listen to agent events (after_edit, before_llm_call, etc.)
-- Plugin discovery: scan `~/.coding-agent/plugins/` on startup
-- Plugin marketplace: future — community-shared plugins
-
-**Files to create/modify:**
-- `src/coding_agent/plugins/loader.py` (NEW — ~200 lines)
-- `src/coding_agent/plugins/manifest.py` (NEW — ~100 lines)
-- `src/coding_agent/tools/__init__.py` — plugin tool registration
-- `src/coding_agent/agent/loop.py` — plugin hooks
-- `tests/test_plugins/` (NEW directory)
-
-**Verification:** User creates a plugin with a custom tool, agent can use it.
-
-**Complexity:** High (12-15 hours)
-**Impact:** High (extensibility)
-
----
-
-### 5.5 Team Collaboration
-
-**Why:** Teams need shared context, conventions, and memory. Not just per-user, per-project.
-
-**What to build:**
-- Shared memory: `.coding-agent/team-memory.json` in project root:
-  - Team conventions ("we use 4-space indent, not 2")
-  - Project decisions ("auth uses JWT, not sessions")
-  - Coding standards ("all functions must have docstrings")
-- Session handoff: export session state, another team member can import
-- Team agents: shared agent definitions in `.coding-agent/agents/`
-- Conflict prevention: when multiple agents work on same branch, detect and warn
-- Convention enforcement: agent follows team conventions automatically
-
-**Files to create/modify:**
-- `src/coding_agent/agent/memory.py` — team memory support
-- `src/coding_agent/session/manager.py` — export/import sessions
-- `src/coding_agent/agent/system_prompt.py` — inject team conventions
-- `src/coding_agent/config.py` — team settings
-- `tests/test_agent/test_team.py` (NEW)
-
-**Verification:** Two sessions on same project share conventions and learned facts.
-
-**Complexity:** Medium (8-10 hours)
-**Impact:** High (team productivity)
-
----
-
-### 5.6 Autonomous Background Workflows
-
-**Why:** Some tasks should run without user interaction — CI checks, scheduled refactoring, monitoring.
-
-**What to build:**
-- Background task runner:
-  - `coding-agent run-task "run all tests and fix failures"`
-  - Agent runs autonomously, writes results to file
-- Workflow definitions (YAML):
-  ```yaml
-  name: "pre-commit-check"
-  triggers: ["pre-commit"]
-  steps:
-    - run: "ruff check ."
-    - run: "pytest tests/"
-    - on_failure: "fix and retry"
-  ```
-- Integration points:
-  - Git hooks (pre-commit, pre-push)
-  - CI/CD (GitHub Actions, GitLab CI)
-  - Scheduled (cron-like)
-- Progress reporting: background tasks write to `~/.coding-agent/tasks/`
-- Notification: when background task completes, notify via system notification
-
-**Files to create/modify:**
-- `src/coding_agent/agent/background.py` (NEW — ~200 lines)
-- `src/coding_agent/workflows/` (NEW directory)
-- `src/coding_agent/main.py` — `run-task` command
-- `tests/test_agent/test_background.py` (NEW)
-
-**Verification:** `coding-agent run-task "fix lint errors"` runs autonomously and reports results.
-
-**Complexity:** High (10-12 hours)
-**Impact:** High (automation)
-
----
-
-### 5.7 Code Intelligence & Impact Analysis
-
-**Why:** Agent edits files without understanding the full impact. Breaking changes propagate silently.
-
-**What to build:**
-- Dependency graph: map which files import/depend on which
-  - Python: AST-based import analysis
-  - JS/TS: require/import resolution
-  - Generic: grep-based fallback
-- Impact analysis: before editing a file, show:
-  - "This file is imported by 5 other files"
-  - "Changing this function will break X, Y, Z"
-- Call graph: which functions call which
-- Dead code detection: unused imports, unreachable code
-- Code metrics: complexity, duplication, coverage gaps
-- New tool `impact_analysis` — agent can query impact before editing
-
-**Files to create/modify:**
-- `src/coding_agent/agent/code_intel.py` (NEW — ~300 lines)
-- `src/coding_agent/tools/code_intel.py` (NEW — ~150 lines)
-- `src/coding_agent/agent/loop.py` — impact warnings before edits
-- `tests/test_agent/test_code_intel.py` (NEW)
-
-**Verification:** Before editing a widely-imported function, agent is warned about downstream impact.
-
-**Complexity:** High (15-20 hours)
-**Impact:** High (prevents breaking changes)
-
----
-
-### 5.8 Interactive Code Review
-
-**Why:** Agent can write code but can't review it. Code review is a critical development workflow.
-
-**What to build:**
-- New tool `review_code` — agent reviews a file or diff:
-  - Checks for bugs, security issues, performance problems
-  - Suggests improvements
-  - Rates code quality (1-10)
-  - Compares against team conventions
-- PR review workflow:
-  - `coding-agent review-pr <number>` — reviews a GitHub PR
-  - Posts comments on specific lines
-  - Suggests changes
-  - Approves or requests changes
-- Review memory: agent remembers past reviews, learns team preferences
-- Review standards: configurable review criteria per project
-
-**Files to create/modify:**
-- `src/coding_agent/tools/review.py` (NEW — ~250 lines)
-- `src/coding_agent/agent/reviewer.py` (NEW — ~200 lines)
-- `src/coding_agent/main.py` — `review-pr` command
-- `tests/test_agent/test_reviewer.py` (NEW)
-
-**Verification:** `coding-agent review-pr 42` posts review comments on a GitHub PR.
-
-**Complexity:** High (12-15 hours)
-**Impact:** High (code quality)
-
----
-
-## Dependency Graph (Updated)
-
-```
-Phase 1 (Foundation)
-  ├── 1.1 Fix Gemini bug
-  ├── 1.2 tiktoken counting
-  ├── 1.3 Tool result truncation
-  ├── 1.4 Parallel execution
-  ├── 1.5 Streaming tool calls
-  ├── 1.6 Session persistence ←── blocks Phase 3
-  └── 1.7 Cost/time budgets
-
-Phase 2 (Intelligence)  ←── depends on Phase 1
-  ├── 2.1 Workspace index
-  ├── 2.2 Planning system ←── blocks 2.3, 2.6
-  ├── 2.3 Verification ←── depends on 2.2
-  ├── 2.4 Error recovery ←── depends on 2.2
-  ├── 2.5 Context engine
-  ├── 2.6 Stuck detection ←── depends on 2.2
-  ├── 2.7 Apply-patch tool
-
-Phase 3 (Memory)  ←── depends on Phase 1.6
-  ├── 3.1 Cross-session memory
-  ├── 3.2 Undo/redo ←── depends on 1.6
-  ├── 3.3 History viewer ←── depends on 1.6, 3.1
-  └── 3.4 Adaptive prompt
-
-Phase 4 (Production)  ←── depends on Phase 2
-  ├── 4.1 Prompt caching
-  ├── 4.2 Anthropic SDK
-  ├── 4.3 MCP integration
-  ├── 4.4 Sub-agents
-  ├── 4.5 Network isolation
-  ├── 4.6 Telemetry
-  ├── 4.7 TUI polish
-  ├── 4.8 Integration tests
-  └── 4.9 Documentation
-
-Phase 5 (Advanced)  ←── depends on Phase 3, Phase 4
-  ├── 5.1 Full Git integration ←── depends on 4.8 (tests)
-  ├── 5.2 Multi-modal ←── depends on 4.2 (Anthropic)
-  ├── 5.3 Custom agents ←── depends on 3.4 (adaptive prompt)
-  ├── 5.4 Plugin system ←── depends on 4.3 (MCP)
-  ├── 5.5 Team collaboration ←── depends on 3.1 (memory)
-  ├── 5.6 Background workflows ←── depends on 4.4 (sub-agents)
-  ├── 5.7 Code intelligence ←── depends on 2.1 (workspace index)
-  └── 5.8 Code review ←── depends on 5.7 (code intelligence)
-```
-
----
-
-## Effort Summary
-
-| Phase | Duration | Complexity | Score Impact |
-|---|---|---|---|
-| Phase 1: Foundation | 10-15 days | Low-Medium | 3.5 → 5.0 |
-| Phase 2: Intelligence | 20-25 days | Medium-High | 5.0 → 7.0 |
-| Phase 3: Memory | 15-18 days | Medium-High | 7.0 → 8.5 |
-| Phase 4: Production | 25-30 days | Medium-High | 8.5 → 9.5 |
-| Phase 5: Advanced | 30-40 days | High | 9.5 → 9.8 |
-| **Total** | **100-128 days** | | **3.5 → 9.8** |
-
----
-
-## Priority Matrix (Quick Reference)
-
-| Priority | Task | Effort | Impact |
-|---|---|---|---|
-| P0 | Fix Gemini system prompt bug | 2h | Critical |
-| P0 | Tool result truncation | 4h | High |
-| P0 | tiktoken token counting | 3h | High |
-| P1 | Parallel tool execution | 6h | High |
-| P1 | Session persistence | 8h | High |
-| P1 | Planning system | 12h | Critical |
-| P1 | Verification system | 10h | Critical |
-| P2 | Workspace index | 8h | High |
-| P2 | Error recovery | 8h | High |
-| P2 | Context engine | 8h | High |
-| P2 | Cross-session memory | 15h | Critical |
-| P2 | Undo/redo | 8h | High |
-| P3 | Stuck detection | 6h | High |
-| P3 | Apply-patch tool | 8h | High |
-| P3 | Prompt caching | 8h | High |
-| P3 | Anthropic SDK | 12h | High |
-| P3 | MCP integration | 15h | High |
-| P3 | Sub-agents | 20h | Medium |
-| P4 | Network isolation | 3h | Medium |
-| P4 | Telemetry | 8h | Medium |
-| P4 | TUI polish | 10h | Medium |
-| P4 | Integration tests | 12h | High |
-| P4 | Documentation | 8h | Medium |
-| P5 | Full Git integration | 15h | Critical |
-| P5 | Multi-modal | 12h | High |
-| P5 | Custom agents | 10h | High |
-| P5 | Plugin system | 15h | High |
-| P5 | Team collaboration | 10h | High |
-| P5 | Background workflows | 12h | High |
-| P5 | Code intelligence | 20h | High |
-| P5 | Code review | 15h | High |
-
----
-
-## What Success Looks Like
-
-After all 5 phases, CoreCode will:
-
-1. **Plan before executing** — creates explicit step-by-step plans
-2. **Execute in parallel** — reads multiple files concurrently
-3. **Verify every change** — runs linter/tests after edits
-4. **Recover from errors** — detects stuck states, switches strategies
-5. **Remember across sessions** — learns project conventions
-6. **Support undo** — safe experimentation
-7. **Manage context intelligently** — truncates results, prioritizes relevant files
-8. **Cost-conscious** — prompt caching, budget limits, model routing
-9. **Extensible** — MCP tools, custom plugins
-10. **Production-ready** — monitoring, logging, testing, documentation
-11. **Full Git workflow** — branch, commit, merge, PR, conflict resolution
-12. **Multi-modal** — understands screenshots, mockups, diagrams
-13. **Customizable** — task-specific agent personas
-14. **Team-aware** — shared conventions, collaborative memory
-15. **Autonomous** — background tasks, CI integration, scheduled workflows
-16. **Intelligent** — dependency graphs, impact analysis, dead code detection
-17. **Reviewable** — code review, PR review, quality scoring
-
-This will be a system that doesn't just write code — it understands code, reviews code, and works as a full development partner.
+## Priority Summary
+
+| Priority | Features | Count |
+|----------|----------|-------|
+| **Critical** | A.1-A.6 (dangerous commands, protected files, max output, prompt overflow, REPL, checkpoints) | 6 |
+| **High** | B.1-B.7 (micro-compact, sibling abort, timeouts, fuzzy edit, hooks, streaming, permissions) + C.1, C.2, C.3, C.4 | 11 |
+| **Medium** | D.1-D.6 (MCP, model switching, prompt caching, diff viewer, status bar, progress) + E.1-E.3 | 9 |
+| **Low** | E.4-E.5, F.1-F.6, G.1-G.6 (team mode, circuit breaker, vim, dream, stats, worktrees, conflicts, transcript, background tasks, prefetch, knowledge graph, orchestration, workflows, dashboard) | 14 |
+
+**Total features: 40**

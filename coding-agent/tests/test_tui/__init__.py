@@ -1,1 +1,0 @@
-"""TUI tests package."""

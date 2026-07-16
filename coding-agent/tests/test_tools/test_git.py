@@ -72,32 +72,29 @@ async def _git_init(path: Path) -> None:
 
 
 class TestGitStatus:
-    async def test_clean_repo(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        result = await tool_registry.execute("git_status", {"path": str(p)})
+    async def test_clean_repo(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        result = await tool_registry.execute("git_status", {"path": str(tmp_path)})
         assert result.success is True
 
-    async def test_shows_modified_files(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "README.md").write_text("# Modified\n")  # type: ignore[union-attr]
-        result = await tool_registry.execute("git_status", {"path": str(p)})
+    async def test_shows_modified_files(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "README.md").write_text("# Modified\n")
+        result = await tool_registry.execute("git_status", {"path": str(tmp_path)})
         assert result.success is True
         assert "README.md" in result.output
 
-    async def test_shows_untracked_files(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "new_file.txt").write_text("new\n")  # type: ignore[union-attr]
-        result = await tool_registry.execute("git_status", {"path": str(p)})
+    async def test_shows_untracked_files(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "new_file.txt").write_text("new\n")
+        result = await tool_registry.execute("git_status", {"path": str(tmp_path)})
         assert result.success is True
         assert "new_file.txt" in result.output
 
-    async def test_not_git_repo(self, tmp_path: object) -> None:
+    async def test_not_git_repo(self, tmp_path: Path) -> None:
         result = await tool_registry.execute(
             "git_status",
-            {"path": str(tmp_path)},  # type: ignore[arg-type]
+            {"path": str(tmp_path)},
         )
         assert result.success is False
         assert "failed" in (result.error or "").lower()
@@ -109,31 +106,28 @@ class TestGitStatus:
 
 
 class TestGitDiff:
-    async def test_unstaged_changes(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "README.md").write_text("# Changed\n")  # type: ignore[union-attr]
-        result = await tool_registry.execute("git_diff", {"path": str(p)})
+    async def test_unstaged_changes(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "README.md").write_text("# Changed\n")
+        result = await tool_registry.execute("git_diff", {"path": str(tmp_path)})
         assert result.success is True
         assert "Changed" in result.output
         assert result.metadata["has_changes"] is True
 
-    async def test_no_changes(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        result = await tool_registry.execute("git_diff", {"path": str(p)})
+    async def test_no_changes(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        result = await tool_registry.execute("git_diff", {"path": str(tmp_path)})
         assert result.success is True
         assert result.metadata["has_changes"] is False
 
-    async def test_staged_changes(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "README.md").write_text("# Staged\n")  # type: ignore[union-attr]
+    async def test_staged_changes(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "README.md").write_text("# Staged\n")
         # Stage the file
         proc = await __import__("asyncio").create_subprocess_exec(
             "git",
             "-C",
-            str(p),
+            str(tmp_path),
             "add",
             "README.md",
             stdout=__import__("asyncio").subprocess.PIPE,
@@ -141,18 +135,17 @@ class TestGitDiff:
         )
         await proc.wait()
         result = await tool_registry.execute(
-            "git_diff", {"path": str(p), "staged": True}
+            "git_diff", {"path": str(tmp_path), "staged": True}
         )
         assert result.success is True
         assert result.metadata["staged"] is True
 
-    async def test_diff_specific_file(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "a.txt").write_text("aaa\n")  # type: ignore[union-attr]
-        (p / "b.txt").write_text("bbb\n")  # type: ignore[union-attr]
+    async def test_diff_specific_file(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "a.txt").write_text("aaa\n")
+        (tmp_path / "b.txt").write_text("bbb\n")
         result = await tool_registry.execute(
-            "git_diff", {"path": str(p), "file": "a.txt"}
+            "git_diff", {"path": str(tmp_path), "file": "a.txt"}
         )
         assert result.success is True
 
@@ -163,25 +156,22 @@ class TestGitDiff:
 
 
 class TestGitLog:
-    async def test_shows_commits(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        result = await tool_registry.execute("git_log", {"path": str(p), "n": 5})
+    async def test_shows_commits(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        result = await tool_registry.execute("git_log", {"path": str(tmp_path), "n": 5})
         assert result.success is True
         assert "initial commit" in result.output
 
-    async def test_limit_count(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        result = await tool_registry.execute("git_log", {"path": str(p), "n": 1})
+    async def test_limit_count(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        result = await tool_registry.execute("git_log", {"path": str(tmp_path), "n": 1})
         assert result.success is True
         lines = [line for line in result.output.splitlines() if line.strip()]
         assert len(lines) <= 1
 
-    async def test_metadata_count(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        result = await tool_registry.execute("git_log", {"path": str(p), "n": 10})
+    async def test_metadata_count(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        result = await tool_registry.execute("git_log", {"path": str(tmp_path), "n": 10})
         assert result.metadata["count"] == 10
 
 
@@ -191,53 +181,49 @@ class TestGitLog:
 
 
 class TestGitCommit:
-    async def test_commit_all_changes(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "new.txt").write_text("new file\n")  # type: ignore[union-attr]
+    async def test_commit_all_changes(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "new.txt").write_text("new file\n")
         result = await tool_registry.execute(
             "git_commit",
-            {"message": "add new file", "path": str(p)},
+            {"message": "add new file", "path": str(tmp_path)},
         )
         assert result.success is True
         assert result.metadata["commit_hash"]
         assert result.metadata["message"] == "add new file"
 
-    async def test_commit_specific_files(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "a.txt").write_text("aaa\n")  # type: ignore[union-attr]
-        (p / "b.txt").write_text("bbb\n")  # type: ignore[union-attr]
+    async def test_commit_specific_files(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "a.txt").write_text("aaa\n")
+        (tmp_path / "b.txt").write_text("bbb\n")
         result = await tool_registry.execute(
             "git_commit",
             {
                 "message": "add a.txt only",
                 "files": ["a.txt"],
-                "path": str(p),
+                "path": str(tmp_path),
             },
         )
         assert result.success is True
         # b.txt should still be untracked
-        status_result = await tool_registry.execute("git_status", {"path": str(p)})
+        status_result = await tool_registry.execute("git_status", {"path": str(tmp_path)})
         assert "b.txt" in status_result.output
 
-    async def test_empty_commit_fails(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
+    async def test_empty_commit_fails(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
         result = await tool_registry.execute(
             "git_commit",
-            {"message": "nothing to commit", "path": str(p)},
+            {"message": "nothing to commit", "path": str(tmp_path)},
         )
         assert result.success is False
         assert "commit failed" in (result.error or "").lower()
 
-    async def test_commit_hash_is_hex(self, tmp_path: object) -> None:
-        p = tmp_path  # type: ignore[assignment]
-        await _git_init(p)
-        (p / "file.txt").write_text("data\n")  # type: ignore[union-attr]
+    async def test_commit_hash_is_hex(self, tmp_path: Path) -> None:
+        await _git_init(tmp_path)
+        (tmp_path / "file.txt").write_text("data\n")
         result = await tool_registry.execute(
             "git_commit",
-            {"message": "test commit", "path": str(p)},
+            {"message": "test commit", "path": str(tmp_path)},
         )
         assert result.success is True
         h = result.metadata["commit_hash"]

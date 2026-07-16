@@ -85,7 +85,7 @@ async def create_plan(goal: str, steps: list[str]) -> ToolResult:
     description=(
         "Update the status of a plan step. Use this as you work through "
         "your plan to track progress. Set status to 'in_progress' when "
-        "starting a step, 'done' when completed, or 'failed' if it didn't work."
+        "starting a step, 'completed' when done, or 'failed' if it didn't work."
     ),
     permission="read",
 )
@@ -101,7 +101,7 @@ async def update_plan(
     step_index:
         Zero-based index of the step to update.
     status:
-        New status: "in_progress", "done", or "failed".
+        New status: "in_progress", "completed", or "failed".
     result:
         Optional result description (e.g. what was found or why it failed).
     """
@@ -129,14 +129,14 @@ async def update_plan(
 
     if status == "in_progress":
         step = manager.start_step(step_index)
-    elif status == "done":
+    elif status in ("completed", "done"):
         step = manager.complete_step(step_index, result)
     elif status == "failed":
         step = manager.fail_step(step_index, result)
     else:
         return ToolResult(
             success=False,
-            error=f"Invalid status '{status}'. Use: in_progress, done, or failed.",
+            error=f"Invalid status '{status}'. Use: in_progress, completed, or failed.",
         )
 
     output = f"Step {step_index + 1} ({step.description}): {status}"

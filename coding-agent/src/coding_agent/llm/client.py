@@ -967,7 +967,9 @@ class LLMClient:
                         )
                     if event.type == StreamEventType.TEXT and isinstance(event.data, str):
                         response_text_parts.append(event.data)
-                    yield event
+                    # Suppress DONE — we yield it at the very end after fallback
+                    if event.type != StreamEventType.DONE:
+                        yield event
             logger.debug(
                 "stream_finished_gemini",
                 chunk_count=chunk_count,
@@ -1006,7 +1008,9 @@ class LLMClient:
                             )
                         if event.type == StreamEventType.TEXT and isinstance(event.data, str):
                             response_text_parts.append(event.data)
-                        yield event
+                        # Suppress DONE — we yield it at the very end after fallback
+                        if event.type != StreamEventType.DONE:
+                            yield event
             logger.debug(
                 "stream_finished",
                 chunk_count=chunk_count,
@@ -1058,5 +1062,5 @@ class LLMClient:
                     error=str(exc),
                 )
 
-        if not parser.is_finished:
-            yield StreamEvent(type=StreamEventType.DONE)
+        # Always yield DONE at the very end (after fallback usage estimation)
+        yield StreamEvent(type=StreamEventType.DONE)

@@ -68,9 +68,18 @@ class PromptCallback:
         self, tool_name: str, args: dict[str, Any], permission_level: str
     ) -> bool:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._prompt_user, tool_name, args, permission_level
-        )
+        try:
+            return await loop.run_in_executor(
+                None, self._prompt_user, tool_name, args, permission_level
+            )
+        except (EOFError, OSError):
+            # Non-interactive terminal — deny by default
+            logger.warning(
+                "permission_callback_noninteractive",
+                tool=tool_name,
+                level=permission_level,
+            )
+            return False
 
     def _prompt_user(
         self, tool_name: str, args: dict[str, Any], permission_level: str

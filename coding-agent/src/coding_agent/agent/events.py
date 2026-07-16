@@ -27,6 +27,7 @@ class EventType(Enum):
     STUCK_DETECTED = "stuck_detected"
     ASK_USER = "ask_user"
     CONTEXT_HEALTH = "context_health"
+    REFLECTION = "reflection"
 
 
 @dataclass

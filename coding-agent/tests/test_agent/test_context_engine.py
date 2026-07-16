@@ -131,12 +131,12 @@ class TestSmartContextEngineSelect:
         sources = [s.source for s in slices]
         assert "verification" in sources
 
-    def test_verification_excluded_when_all_pass(self, engine, context):
+    def test_verification_included_when_all_pass(self, engine, context):
         context.add_user_message("hello")
         engine.record_verification("syntax", passed=True, message="ok")
         slices = engine.select_context(include_verification=True)
         sources = [s.source for s in slices]
-        assert "verification" not in sources
+        assert "verification" in sources
 
     def test_plan_included_when_enabled(self, engine, context):
         context.add_user_message("hello")

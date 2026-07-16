@@ -130,7 +130,7 @@ class SmartContextEngine:
         # 3. Error context (if errors exist)
         if include_error_context and self._error_tracker:
             history = self._error_tracker.get_history()
-            if history and any(not r.success for r in history[-5:]):
+            if history and any(not r.success for r in history[-10:]):
                 content = self._format_error_context()
                 est = self._estimate_tokens(content)
                 if est < token_budget:
@@ -144,22 +144,23 @@ class SmartContextEngine:
                 else:
                     excluded.append("error")
 
-        # 4. Verification feedback (if failures)
+        # 4. Verification feedback
         if include_verification and self._verification_results:
-            failures = [v for v in self._verification_results if not v["passed"]]
-            if failures:
-                content = self._format_verification(failures)
-                est = self._estimate_tokens(content)
-                if est < token_budget:
-                    slices.append(ContextSlice(
-                        content=content,
-                        priority=80,
-                        source="verification",
-                        token_estimate=est,
-                    ))
-                    token_budget -= est
-                else:
-                    excluded.append("verification")
+            # Show recent verification results (failures prioritized)
+            recent = self._verification_results[-5:]
+            failures = [v for v in recent if not v["passed"]]
+            content = self._format_verification(failures if failures else recent)
+            est = self._estimate_tokens(content)
+            if est < token_budget:
+                slices.append(ContextSlice(
+                    content=content,
+                    priority=80,
+                    source="verification",
+                    token_estimate=est,
+                ))
+                token_budget -= est
+            else:
+                excluded.append("verification")
 
         # 5. Plan context (if enabled)
         if include_plan and plan_text:
