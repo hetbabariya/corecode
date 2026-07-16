@@ -126,4 +126,13 @@ ThinkingIndicator {
     padding: 0 1;
     margin: 0 0 0 2;
 }
+
+#toolbar {
+    dock: bottom;
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+    border-top: tall $panel;
+}
 """

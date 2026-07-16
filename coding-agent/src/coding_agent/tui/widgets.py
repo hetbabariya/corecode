@@ -221,3 +221,49 @@ class StatusBar(Static):
         text.append("  \u2502 Ctrl+D exit", style="dim")
 
         return text
+
+
+class Toolbar(Static):
+    """Toolbar with undo/redo buttons and checkpoint info."""
+
+    _last_checkpoint: reactive[str] = reactive("")
+    _can_undo: reactive[bool] = reactive(False)
+    _can_redo: reactive[bool] = reactive(False)
+
+    def set_checkpoint(self, checkpoint_id: str, can_undo: bool = True) -> None:
+        """Update checkpoint info."""
+        self._last_checkpoint = checkpoint_id
+        self._can_undo = can_undo
+        self._can_redo = False
+
+    def render(self) -> Text:
+        text = Text()
+
+        # Undo button
+        if self._can_undo:
+            text.append(" [", style="dim")
+            text.append("Ctrl+Z Undo", style=f"bold {_NORD['primary']}")
+            text.append("]", style="dim")
+        else:
+            text.append(" [", style="dim")
+            text.append("Ctrl+Z Undo", style=f"dim {_NORD['dim']}")
+            text.append("]", style="dim")
+
+        text.append(" ", style="dim")
+
+        # Redo button
+        if self._can_redo:
+            text.append("[", style="dim")
+            text.append("Ctrl+Y Redo", style=f"bold {_NORD['primary']}")
+            text.append("]", style="dim")
+        else:
+            text.append("[", style="dim")
+            text.append("Ctrl+Y Redo", style=f"dim {_NORD['dim']}")
+            text.append("]", style="dim")
+
+        # Checkpoint info
+        if self._last_checkpoint:
+            text.append("  \u2502 ", style="dim")
+            text.append(f"cp: {self._last_checkpoint}", style=f"bold {_NORD['accent']}")
+
+        return text

@@ -17,6 +17,7 @@ from coding_agent.tui.widgets import (
     StatusBar,
     SystemMessage,
     ThinkingIndicator,
+    Toolbar,
     ToolCallBlock,
     UserMessage,
 )
@@ -33,6 +34,8 @@ class CodingAgentREPL(App[None]):
         Binding("ctrl+d", "quit", "Exit", show=True),
         Binding("ctrl+c", "interrupt", "Interrupt", show=True),
         Binding("ctrl+l", "clear", "Clear", show=True),
+        Binding("ctrl+z", "undo", "Undo", show=True),
+        Binding("ctrl+y", "redo", "Redo", show=True),
     ]
 
     def __init__(
@@ -63,6 +66,7 @@ class CodingAgentREPL(App[None]):
                 "Welcome! Type a message to start. Ctrl+D to exit, Ctrl+C to interrupt.",
                 level="info",
             )
+        yield Toolbar(id="toolbar")
         yield Input(placeholder="Ask anything...", id="input", password=False)
         yield StatusBar(id="status-bar")
         yield Footer()
@@ -260,6 +264,10 @@ class CodingAgentREPL(App[None]):
                         f"Checkpoint: {checkpoint_id} ({label}) before {tool}",
                         "warning",
                     )
+                    # Update toolbar with checkpoint info
+                    self.call_from_thread(
+                        self._update_toolbar_checkpoint, checkpoint_id
+                    )
 
                 elif event.type == EventType.CONTEXT_HEALTH:
                     data = event.data if isinstance(event.data, dict) else {}
@@ -345,6 +353,11 @@ class CodingAgentREPL(App[None]):
         chat_view.mount(SystemMessage(message, level=level))
         chat_view.scroll_end(animate=False)
 
+    def _update_toolbar_checkpoint(self, checkpoint_id: str) -> None:
+        """Update the toolbar with checkpoint info."""
+        toolbar = self.query_one("#toolbar", Toolbar)
+        toolbar.set_checkpoint(checkpoint_id, can_undo=True)
+
     def _update_status(self) -> None:
         """Update the status bar."""
         status_bar = self.query_one("#status-bar", StatusBar)
@@ -412,6 +425,33 @@ class CodingAgentREPL(App[None]):
                 level="info",
             )
         )
+
+    def action_undo(self) -> None:
+        """Undo the last change by restoring to previous checkpoint."""
+        if self._processing:
+            return
+
+        try:
+            from coding_agent.sandbox.checkpoint import CheckpointManager
+
+            manager = CheckpointManager(self.workspace)
+            checkpoint = manager.undo()
+            if checkpoint:
+                self._show_system(
+                    f"Undone to checkpoint: {checkpoint.id} - {checkpoint.label}",
+                    "warning",
+                )
+                # Update toolbar
+                toolbar = self.query_one("#toolbar", Toolbar)
+                toolbar.set_checkpoint(checkpoint.id, can_undo=True)
+            else:
+                self._show_system("Nothing to undo.", "info")
+        except Exception as e:
+            self._show_system(f"Undo failed: {e}", "error")
+
+    def action_redo(self) -> None:
+        """Redo is not fully supported yet."""
+        self._show_system("Redo is not fully supported yet.", "info")
 
 
 def run_repl(
