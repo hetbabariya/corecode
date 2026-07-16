@@ -24,6 +24,7 @@ from coding_agent.agent.context_limits import (
 from coding_agent.agent.error_recovery import ErrorTracker
 from coding_agent.agent.events import AgentEvent, EventType
 from coding_agent.agent.memory import MemoryManager
+from coding_agent.agent.reflector import Assessment, Reflector
 from coding_agent.agent.permissions import PermissionManager
 from coding_agent.agent.planner import PlanManager
 from coding_agent.agent.system_prompt import build_system_prompt
@@ -147,6 +148,12 @@ class AgentLoop:
 
         # Error recovery and stuck detection
         self.error_tracker = ErrorTracker()
+
+        # Post-action reflection
+        self.reflector = Reflector()
+
+        # Phase B.4: Progress evaluation interval
+        self._progress_eval_interval: int = 5
 
         # Phase A metrics
         self.metrics: dict[str, int | float] = {
@@ -321,15 +328,29 @@ class AgentLoop:
                     plan_prompt=plan_prompt,
                 )
 
-                # Check if replanning is needed
+                # Phase B.2: Auto-replanning when a step fails
                 if self.plan_manager.needs_replan():
-                    yield AgentEvent(
-                        type=EventType.PLAN_UPDATE,
-                        data={
-                            "action": "replan_needed",
-                            "plan": self.plan_manager.plan.to_dict() if self.plan_manager.plan else None,
-                        },
-                    )
+                    new_plan = await self._generate_replan()
+                    if new_plan is not None:
+                        self.plan_manager.replace_plan(new_plan)
+                        self.context.system_prompt = self._build_system_prompt_cached(
+                            plan_prompt=self.plan_manager.to_prompt(),
+                        )
+                        yield AgentEvent(
+                            type=EventType.PLAN_UPDATE,
+                            data={
+                                "action": "replanned",
+                                "plan": new_plan.to_dict(),
+                            },
+                        )
+                    else:
+                        yield AgentEvent(
+                            type=EventType.PLAN_UPDATE,
+                            data={
+                                "action": "replan_failed",
+                                "plan": self.plan_manager.plan.to_dict() if self.plan_manager.plan else None,
+                            },
+                        )
 
             # --- Check for stuck state ---
             if self.error_tracker.is_stuck():
@@ -407,6 +428,29 @@ class AgentLoop:
 
             # --- No tool calls → done ---
             if not tool_calls:
+                # Run progress evaluation one last time before exiting
+                if _iteration > 0 and _iteration % self._progress_eval_interval == 0:
+                    progress = self._evaluate_progress()
+                    logger.info(
+                        "progress_evaluation",
+                        completed=progress["completed"],
+                        total=progress["total"],
+                        ratio=progress["progress_ratio"],
+                        stalled=progress["is_stalled"],
+                        tool_count=progress["tool_count"],
+                    )
+                    if progress["is_stalled"]:
+                        yield AgentEvent(
+                            type=EventType.STUCK_DETECTED,
+                            data={
+                                "message": (
+                                    f"Progress stalled after {progress['tool_count']} tools, "
+                                    f"{progress['completed']}/{progress['total']} plan steps done."
+                                ),
+                                "progress": progress,
+                            },
+                        )
+
                 duration = time.monotonic() - self._start_time
                 logger.info(
                     "agent_session_end",
@@ -575,7 +619,9 @@ class AgentLoop:
                             pc["name"], pc["args"], perm_level
                         )
                     else:
-                        approved = True
+                        # No callback registered — respect the permission check.
+                        # Denied tools must NOT execute silently.
+                        approved = False
 
                     if not approved:
                         logger.warning(
@@ -636,6 +682,29 @@ class AgentLoop:
                         "sources": [s.source for s in slices],
                     },
                 )
+
+            # --- Phase B.4: Progress evaluation every N iterations ---
+            if _iteration > 0 and _iteration % self._progress_eval_interval == 0:
+                progress = self._evaluate_progress()
+                logger.info(
+                    "progress_evaluation",
+                    completed=progress["completed"],
+                    total=progress["total"],
+                    ratio=progress["progress_ratio"],
+                    stalled=progress["is_stalled"],
+                    tool_count=progress["tool_count"],
+                )
+                if progress["is_stalled"]:
+                    yield AgentEvent(
+                        type=EventType.STUCK_DETECTED,
+                        data={
+                            "message": (
+                                f"Progress stalled after {progress['tool_count']} tools, "
+                                f"{progress['completed']}/{progress['total']} plan steps done."
+                            ),
+                            "progress": progress,
+                        },
+                    )
 
     # ------------------------------------------------------------------
     # Tool result processing
@@ -760,6 +829,49 @@ class AgentLoop:
             error=result.error or "",
         )
 
+        # Post-action reflection (signal-only: assessment + reason + confidence)
+        reflection = self.reflector.reflect_on_tool(pc["name"], pc["args"], result)
+        logger.debug(
+            "tool_reflection",
+            tool=pc["name"],
+            assessment=reflection.assessment.value,
+            confidence=reflection.confidence,
+            reason=reflection.reason,
+        )
+        yield AgentEvent(
+            type=EventType.REFLECTION,
+            data={
+                "tool_name": pc["name"],
+                "assessment": reflection.assessment.value,
+                "reason": reflection.reason,
+                "confidence": reflection.confidence,
+            },
+        )
+
+        # Phase B.3: Outcome assessment when plan is active
+        # Skip for plan management and non-substantive tools
+        _SKIP_ASSESSMENT_TOOLS = {"create_plan", "update_plan", "remember", "recall", "refresh_index"}
+        if (
+            self.plan_manager.has_plan
+            and self.plan_manager.plan
+            and pc["name"] not in _SKIP_ASSESSMENT_TOOLS
+        ):
+            active = self.plan_manager.plan.active_step
+            if active is not None:
+                outcome_reflection = await self.reflector.assess_outcome(
+                    pc["name"], pc["args"], result,
+                    expected_outcome=active.description,
+                    llm_client=self.llm_client,
+                )
+                if outcome_reflection.assessment.value != reflection.assessment.value:
+                    logger.info(
+                        "outcome_assessment",
+                        tool=pc["name"],
+                        assessment=outcome_reflection.assessment.value,
+                        reason=outcome_reflection.reason,
+                        confidence=outcome_reflection.confidence,
+                    )
+
         # Record in context engine
         self.context_engine.record_tool_result(
             pc["name"], output, success=result.success,
@@ -801,6 +913,125 @@ class AgentLoop:
                     Path(path), "modified", workspace=self.workspace
                 )
 
+    # ------------------------------------------------------------------
+    # Phase B.4: Progress evaluation
+    # ------------------------------------------------------------------
+
+    def _evaluate_progress(self) -> dict[str, Any]:
+        """Evaluate progress toward the goal.
+
+        Returns a dict with completed/failed/total counts, progress_ratio,
+        is_stalled flag, cost_per_step, and elapsed time.
+        """
+        completed = 0
+        failed = 0
+        total = 0
+
+        if self.plan_manager.has_plan and self.plan_manager.plan:
+            plan = self.plan_manager.plan
+            completed = len(plan.completed_steps)
+            failed = len(plan.failed_steps)
+            total = len(plan.steps)
+
+        progress_ratio = completed / total if total > 0 else 0.0
+
+        is_stalled = (
+            self._tool_count > 0
+            and self.error_tracker.is_stuck()
+        )
+
+        elapsed = time.monotonic() - self._start_time
+        cost_per_step = self._accumulated_cost / max(completed, 1)
+
+        return {
+            "completed": completed,
+            "failed": failed,
+            "total": total,
+            "progress_ratio": progress_ratio,
+            "is_stalled": is_stalled,
+            "cost_per_step": round(cost_per_step, 4),
+            "elapsed": round(elapsed, 1),
+            "tool_count": self._tool_count,
+        }
+
+    # ------------------------------------------------------------------
+    # Phase B.2: Auto-replanning
+    # ------------------------------------------------------------------
+
+    async def _generate_replan(self) -> "Plan | None":
+        """Generate a new plan using the LLM when a step fails.
+
+        Returns a new Plan or None if replanning fails.
+        """
+        from coding_agent.agent.planner import Plan, PlanStep, PlanStatus
+
+        current_state = self.plan_manager.to_prompt()
+        failed_step = ""
+        if self.plan_manager.plan and self.plan_manager.plan.active_step:
+            failed_step = self.plan_manager.plan.active_step.description
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a planning assistant. The previous plan had a step that failed. "
+                    "Generate a NEW plan that accounts for what was already accomplished. "
+                    "Return ONLY a JSON object with this exact format:\n"
+                    '{"goal": "...", "steps": ["step 1", "step 2", ...]}\n'
+                    "3-10 steps. Be specific and actionable."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Previous plan state:\n{current_state}\n\n"
+                    f"Failed step: {failed_step}\n\n"
+                    "Generate a new plan."
+                ),
+            },
+        ]
+
+        try:
+            response = await self.llm_client.complete(messages)
+            return self._parse_plan_response(response.content)
+        except Exception as e:
+            logger.error("replan_failed", error=str(e))
+            return None
+
+    def _parse_plan_response(self, content: str) -> "Plan | None":
+        """Parse an LLM response into a Plan object.
+
+        Expects JSON with {"goal": "...", "steps": [...]}.
+        """
+        import json
+
+        from coding_agent.agent.planner import Plan, PlanStep, PlanStatus
+
+        try:
+            # Try to extract JSON from the response (may be wrapped in markdown)
+            text = content.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+
+            data = json.loads(text)
+            goal = data.get("goal", "Replanned task")
+            steps = data.get("steps", [])
+
+            if not steps:
+                return None
+
+            plan_steps = [PlanStep(description=desc) for desc in steps]
+            return Plan(
+                goal=goal,
+                steps=plan_steps,
+                status=PlanStatus.EXECUTING,
+            )
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error("replan_parse_failed", error=str(e), content=content[:200])
+            return None
+
     async def _verify_after_edit(
         self, tool_name: str, args: dict[str, Any], result: ToolResult
     ) -> AgentEvent | None:
@@ -827,14 +1058,15 @@ class AgentLoop:
             failed=len(verification.failed_checks),
         )
 
+        # Always record verification in context engine (even when passed)
+        # so the context engine has data to report
+        for check in verification.checks:
+            self.context_engine.record_verification(
+                check.tool, passed=check.passed, message=check.output[:200],
+            )
+
         if verification.all_passed:
             return None
-
-        # Record verification failure in context engine
-        for check in verification.failed_checks:
-            self.context_engine.record_verification(
-                check.tool, passed=False, message=check.output[:200],
-            )
 
         # Feed verification failure back to context as user message
         # (not as tool result — there's no matching tool_call_id)

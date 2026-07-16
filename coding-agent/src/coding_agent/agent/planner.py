@@ -17,6 +17,7 @@ class StepStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     DONE = "done"
+    COMPLETED = "completed"
     FAILED = "failed"
 
 
@@ -49,14 +50,16 @@ class Plan:
     @property
     def active_step(self) -> PlanStep | None:
         """Return the first non-done step, or None if all steps are done."""
+        _done_statuses = (StepStatus.DONE, StepStatus.COMPLETED)
         for i, step in enumerate(self.steps):
-            if step.status not in (StepStatus.DONE,):
+            if step.status not in _done_statuses:
                 return step
         return None
 
     @property
     def completed_steps(self) -> list[PlanStep]:
-        return [s for s in self.steps if s.status == StepStatus.DONE]
+        _done_statuses = (StepStatus.DONE, StepStatus.COMPLETED)
+        return [s for s in self.steps if s.status in _done_statuses]
 
     @property
     def failed_steps(self) -> list[PlanStep]:
@@ -129,6 +132,18 @@ class PlanManager:
         logger.info("plan_created", goal=goal, steps=len(steps))
         return self._plan
 
+    def replace_plan(self, plan: Plan) -> None:
+        """Replace the current plan with a new one (for auto-replanning)."""
+        old_goal = self._plan.goal if self._plan else None
+        self._plan = plan
+        logger.info(
+            "plan_replaced",
+            old_goal=old_goal,
+            new_goal=plan.goal,
+            steps=len(plan.steps),
+        )
+        return self._plan
+
     def start_step(self, index: int) -> PlanStep:
         """Mark a step as in-progress. Returns the step."""
         if self._plan is None:
@@ -153,12 +168,13 @@ class PlanManager:
         if self._plan is None:
             raise ValueError("No active plan")
         step = self._plan.steps[index]
-        step.status = StepStatus.DONE
+        step.status = StepStatus.COMPLETED
         step.result = result
 
         # Check if plan is complete
-        if all(s.status in (StepStatus.DONE, StepStatus.IN_PROGRESS) for s in self._plan.steps):
-            if all(s.status == StepStatus.DONE for s in self._plan.steps):
+        _done_statuses = (StepStatus.DONE, StepStatus.COMPLETED)
+        if all(s.status in (*_done_statuses, StepStatus.IN_PROGRESS) for s in self._plan.steps):
+            if all(s.status in _done_statuses for s in self._plan.steps):
                 self._plan.status = PlanStatus.COMPLETED
                 logger.info("plan_completed", goal=self._plan.goal, steps=len(self._plan.steps))
             else:
@@ -202,7 +218,8 @@ class PlanManager:
         """Return True if all steps are done."""
         if self._plan is None:
             return False
-        return all(s.status == StepStatus.DONE for s in self._plan.steps)
+        _done_statuses = (StepStatus.DONE, StepStatus.COMPLETED)
+        return all(s.status in _done_statuses for s in self._plan.steps)
 
     def to_prompt(self) -> str:
         """Serialize the current plan for injection into the system prompt."""
@@ -216,6 +233,7 @@ class PlanManager:
                 StepStatus.PENDING: "[ ]",
                 StepStatus.IN_PROGRESS: "[>]",
                 StepStatus.DONE: "[x]",
+                StepStatus.COMPLETED: "[x]",
                 StepStatus.FAILED: "[!]",
             }[step.status]
 

@@ -129,7 +129,7 @@ class TestPlanManager:
         m.create_plan("Test", ["A", "B"])
         m.complete_step(0, "Done manually")
         m.start_step(1)
-        assert m.plan.steps[0].status == StepStatus.DONE
+        assert m.plan.steps[0].status == StepStatus.COMPLETED
         assert m.plan.steps[0].result == "Done manually"
 
     def test_start_step_out_of_range(self):
@@ -148,7 +148,7 @@ class TestPlanManager:
         m.create_plan("Test", ["A", "B"])
         m.start_step(0)
         step = m.complete_step(0, "Found it")
-        assert step.status == StepStatus.DONE
+        assert step.status == StepStatus.COMPLETED
         assert step.result == "Found it"
 
     def test_complete_step_marks_plan_completed(self):
