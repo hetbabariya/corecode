@@ -121,12 +121,15 @@ class ErrorTracker:
 
         Stuck patterns:
         - Same tool + same args hash called N+ times (stuck_threshold)
-        - Same tool + same error N+ times
+        - Same tool + same error N+ times (consecutive)
+        - Same tool failing N+ times in the last window (interleaved with
+          other tools — catches the "edit → lint fail → edit → lint fail"
+          loop where different tools alternate)
         """
         if len(self._history) < self._stuck_threshold:
             return False
 
-        # Check for repeated identical calls
+        # Check for repeated identical calls (consecutive)
         recent = list(self._history)[-self._stuck_threshold:]
         if len(recent) >= self._stuck_threshold:
             # All same tool + same args
@@ -139,6 +142,19 @@ class ErrorTracker:
                 and len(set(r.error for r in recent)) == 1
                 and recent[0].error
             ):
+                return True
+
+        # Same tool + same error failing N+ times across the full window
+        # (interleaved with other tools/successes — catches the
+        # "edit → lint fail → edit → lint fail" loop)
+        window = list(self._history)
+        error_groups: dict[tuple[str, str], int] = {}
+        for r in window:
+            if not r.success and r.error:
+                key = (r.name, r.error)
+                error_groups[key] = error_groups.get(key, 0) + 1
+        for count in error_groups.values():
+            if count >= self._stuck_threshold:
                 return True
 
         return False

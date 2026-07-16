@@ -849,12 +849,15 @@ class AgentLoop:
         )
 
         # Phase B.3: Outcome assessment when plan is active
-        # Skip for plan management and non-substantive tools
-        _SKIP_ASSESSMENT_TOOLS = {"create_plan", "update_plan", "remember", "recall", "refresh_index"}
+        # Only assess file-modifying tools — read-only and query tools
+        # generate false negatives (e.g., read_file "failed" because it
+        # didn't create a file).  Shell commands are also excluded because
+        # lint-check failures are not meaningful against a creation step.
+        _ASSESSMENT_ALLOWLIST = {"write_file", "edit_file", "apply_patch", "multi_edit"}
         if (
             self.plan_manager.has_plan
             and self.plan_manager.plan
-            and pc["name"] not in _SKIP_ASSESSMENT_TOOLS
+            and pc["name"] in _ASSESSMENT_ALLOWLIST
         ):
             active = self.plan_manager.plan.active_step
             if active is not None:
