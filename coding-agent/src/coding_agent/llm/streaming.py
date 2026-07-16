@@ -20,6 +20,7 @@ class StreamEventType(Enum):
     TOOL_CALL = "tool_call"
     USAGE = "usage"
     DONE = "done"
+    STOP_REASON = "stop_reason"
 
 
 @dataclass
@@ -121,6 +122,11 @@ class StreamParser:
         # Check for stream end
         if finish_reason is not None:
             self._finished = True
+            # Emit stop_reason event for max tokens recovery
+            events.append(StreamEvent(
+                type=StreamEventType.STOP_REASON,
+                data={"finish_reason": finish_reason}
+            ))
             # Emit any remaining tool calls not yet emitted
             for acc in self._tool_calls.values():
                 if acc.name:  # Only emit if not already emitted

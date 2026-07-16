@@ -46,6 +46,24 @@ def _is_key_specific_error(exc: Exception) -> bool:
     return "404" in msg or "not found" in msg
 
 
+def _normalize_stop_reason(finish_reason: str) -> str:
+    """Normalize finish_reason across providers to a standard stop_reason.
+
+    - "length" (OpenAI) → "max_tokens"
+    - "MAX_TOKENS" (Gemini) → "max_tokens"
+    - "stop" → "stop"
+    - "" → ""
+    """
+    if not finish_reason:
+        return ""
+    reason = finish_reason.lower()
+    if reason in ("length", "max_tokens"):
+        return "max_tokens"
+    if reason == "stop":
+        return "stop"
+    return reason
+
+
 # ---------------------------------------------------------------------------
 # Response type
 # ---------------------------------------------------------------------------
@@ -60,6 +78,7 @@ class LLMResponse:
     usage: TokenUsage
     model: str
     finish_reason: str = ""
+    stop_reason: str = ""  # Normalized stop reason ("max_tokens", "stop", etc.)
     raw: dict[str, Any] = field(default_factory=dict)  # pyright: ignore[reportUnknownVariableType]
 
 
@@ -916,12 +935,17 @@ class LLMClient:
             content_preview=content[:200] if content else "",
         )
 
+        # Normalize finish_reason to stop_reason
+        raw_finish_reason = choice.get("finish_reason", "")
+        stop_reason = _normalize_stop_reason(raw_finish_reason)
+
         return LLMResponse(
             content=content,
             tool_calls=tool_calls,
             usage=usage,
             model=self.model,
-            finish_reason=choice.get("finish_reason", ""),
+            finish_reason=raw_finish_reason,
+            stop_reason=stop_reason,
             raw=response_dict,
         )
 

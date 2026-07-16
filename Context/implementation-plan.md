@@ -7,7 +7,7 @@
 ### Phase A — Critical Fixes
 - [x] A.1 Dangerous Command Detection
 - [x] A.2 Protected Files and Directories
-- [ ] A.3 Max Output Tokens Recovery
+- [x] A.3 Max Output Tokens Recovery
 - [ ] A.4 Prompt Too Long Recovery (Reactive Compact)
 - [ ] A.5 Interactive REPL
 

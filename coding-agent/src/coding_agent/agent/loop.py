@@ -155,6 +155,11 @@ class AgentLoop:
         # Phase B.4: Progress evaluation interval
         self._progress_eval_interval: int = 5
 
+        # Phase A.3: Max tokens recovery
+        self._max_tokens_recovery_count: int = 0
+        self._max_tokens_recovery_max: int = 3
+        self._stop_reason: str = ""
+
         # Phase A metrics
         self.metrics: dict[str, int | float] = {
             "permission_check_count": 0,
@@ -466,6 +471,7 @@ class AgentLoop:
             # --- Stream LLM response ---
             tool_calls: list[dict[str, Any]] = []
             text_parts: list[str] = []
+            self._stop_reason = ""
 
             async for event in self.llm_client.stream(messages, tools=tools):
                 if event.type == StreamEventType.TEXT:
@@ -488,6 +494,11 @@ class AgentLoop:
                             model=self.llm_client.model,
                         )
                         self._accumulated_cost += usage.estimated_cost
+
+                elif event.type == StreamEventType.STOP_REASON:
+                    # Capture stop_reason for max tokens recovery
+                    if isinstance(event.data, dict):
+                        self._stop_reason = event.data.get("finish_reason", "")
 
                 elif event.type == StreamEventType.DONE:
                     break
@@ -513,7 +524,54 @@ class AgentLoop:
                 text_length=len(full_text),
                 text_preview=full_text[:300] if full_text else "",
                 tool_call_count=len(tool_calls),
+                stop_reason=self._stop_reason,
             )
+
+            # --- Phase A.3: Max tokens recovery ---
+            # Check if response was truncated due to max tokens
+            from coding_agent.llm.client import _normalize_stop_reason
+            normalized_stop_reason = _normalize_stop_reason(self._stop_reason)
+            if normalized_stop_reason == "max_tokens":
+                self._max_tokens_recovery_count += 1
+                if self._max_tokens_recovery_count <= self._max_tokens_recovery_max:
+                    logger.warning(
+                        "max_tokens_recovery",
+                        attempt=self._max_tokens_recovery_count,
+                        max_attempts=self._max_tokens_recovery_max,
+                        text_length=len(full_text),
+                    )
+                    yield AgentEvent(
+                        type=EventType.MAX_TOKENS_RECOVERY,
+                        data={
+                            "attempt": self._max_tokens_recovery_count,
+                            "max_attempts": self._max_tokens_recovery_max,
+                            "text_length": len(full_text),
+                        },
+                    )
+                    # Add continuation prompt to context
+                    self.context.add_user_message(
+                        "Your response was cut off due to token limit. "
+                        "Please continue from where you left off."
+                    )
+                    # Persist continuation prompt
+                    if self.session_manager is not None and self.session_id is not None:
+                        await self.session_manager.save_message(
+                            self.session_id, "user",
+                            "Your response was cut off due to token limit. "
+                            "Please continue from where you left off.",
+                        )
+                    # Continue the loop to get the rest of the response
+                    continue
+                else:
+                    logger.error(
+                        "max_tokens_recovery_failed",
+                        max_attempts=self._max_tokens_recovery_max,
+                    )
+                    # Reset counter and fall through to normal completion
+                    self._max_tokens_recovery_count = 0
+
+            # Reset recovery count on successful completion
+            self._max_tokens_recovery_count = 0
 
             # --- No tool calls → done ---
             if not tool_calls:

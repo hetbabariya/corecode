@@ -28,6 +28,7 @@ class EventType(Enum):
     ASK_USER = "ask_user"
     CONTEXT_HEALTH = "context_health"
     REFLECTION = "reflection"
+    MAX_TOKENS_RECOVERY = "max_tokens_recovery"
 
 
 @dataclass
