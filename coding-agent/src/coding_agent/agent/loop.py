@@ -899,22 +899,27 @@ class AgentLoop:
                 _EDIT_TOOLS = {"write_file", "edit_file", "apply_patch", "multi_edit"}
                 if pc["name"] in _EDIT_TOOLS:
                     try:
+                        import asyncio
                         from coding_agent.sandbox.checkpoint import CheckpointManager
 
-                        checkpoint_mgr = CheckpointManager(".")
-                        checkpoint = checkpoint_mgr.create_checkpoint(
-                            f"before {pc['name']}"
+                        def _create_checkpoint() -> tuple[str, str]:
+                            mgr = CheckpointManager(".")
+                            cp = mgr.create_checkpoint(f"before {pc['name']}")
+                            return cp.id, cp.label
+
+                        checkpoint_id, checkpoint_label = await asyncio.to_thread(
+                            _create_checkpoint
                         )
                         logger.info(
                             "auto_checkpoint",
-                            checkpoint_id=checkpoint.id,
+                            checkpoint_id=checkpoint_id,
                             tool=pc["name"],
                         )
                         yield AgentEvent(
                             type=EventType.CHECKPOINT,
                             data={
-                                "checkpoint_id": checkpoint.id,
-                                "label": checkpoint.label,
+                                "checkpoint_id": checkpoint_id,
+                                "label": checkpoint_label,
                                 "tool": pc["name"],
                             },
                         )

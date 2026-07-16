@@ -426,24 +426,33 @@ class CodingAgentREPL(App[None]):
             )
         )
 
-    def action_undo(self) -> None:
+    async def action_undo(self) -> None:
         """Undo the last change by restoring to previous checkpoint."""
         if self._processing:
             return
 
+        import asyncio
+
         try:
             from coding_agent.sandbox.checkpoint import CheckpointManager
 
-            manager = CheckpointManager(self.workspace)
-            checkpoint = manager.undo()
-            if checkpoint:
+            def _do_undo() -> tuple[bool, str]:
+                manager = CheckpointManager(self.workspace)
+                checkpoint = manager.undo()
+                if checkpoint:
+                    return True, f"{checkpoint.id} - {checkpoint.label}"
+                return False, ""
+
+            success, info = await asyncio.to_thread(_do_undo)
+            if success:
                 self._show_system(
-                    f"Undone to checkpoint: {checkpoint.id} - {checkpoint.label}",
+                    f"Undone to checkpoint: {info}",
                     "warning",
                 )
                 # Update toolbar
+                checkpoint_id = info.split(" - ")[0]
                 toolbar = self.query_one("#toolbar", Toolbar)
-                toolbar.set_checkpoint(checkpoint.id, can_undo=True)
+                toolbar.set_checkpoint(checkpoint_id, can_undo=True)
             else:
                 self._show_system("Nothing to undo.", "info")
         except Exception as e:
