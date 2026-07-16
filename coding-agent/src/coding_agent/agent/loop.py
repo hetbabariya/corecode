@@ -853,6 +853,10 @@ class AgentLoop:
         # generate false negatives (e.g., read_file "failed" because it
         # didn't create a file).  Shell commands are also excluded because
         # lint-check failures are not meaningful against a creation step.
+        #
+        # Use fast rule-based assessment instead of LLM — the LLM cannot
+        # see file contents so it always returns "partial" with low
+        # confidence, which is pure noise and costs 15-24s per call.
         _ASSESSMENT_ALLOWLIST = {"write_file", "edit_file", "apply_patch", "multi_edit"}
         if (
             self.plan_manager.has_plan
@@ -861,19 +865,26 @@ class AgentLoop:
         ):
             active = self.plan_manager.plan.active_step
             if active is not None:
-                outcome_reflection = await self.reflector.assess_outcome(
-                    pc["name"], pc["args"], result,
-                    expected_outcome=active.description,
-                    llm_client=self.llm_client,
+                from coding_agent.agent.reflector import Assessment, ReflectionResult
+
+                if result.success:
+                    assessment = Assessment.SUCCESS
+                    reason = f"{pc['name']} succeeded — file was created/modified"
+                else:
+                    assessment = Assessment.FAILURE
+                    reason = f"{pc['name']} failed: {result.error or 'unknown error'}"
+                outcome_reflection = ReflectionResult(
+                    assessment=assessment,
+                    reason=reason,
+                    confidence=0.95,
                 )
-                if outcome_reflection.assessment.value != reflection.assessment.value:
-                    logger.info(
-                        "outcome_assessment",
-                        tool=pc["name"],
-                        assessment=outcome_reflection.assessment.value,
-                        reason=outcome_reflection.reason,
-                        confidence=outcome_reflection.confidence,
-                    )
+                logger.info(
+                    "outcome_assessment",
+                    tool=pc["name"],
+                    assessment=outcome_reflection.assessment,
+                    reason=outcome_reflection.reason,
+                    confidence=outcome_reflection.confidence,
+                )
 
         # Record in context engine
         self.context_engine.record_tool_result(
