@@ -240,6 +240,16 @@ class CodingAgentREPL(App[None]):
                         "warning",
                     )
 
+                elif event.type == EventType.MICRO_COMPACT:
+                    data = event.data if isinstance(event.data, dict) else {}
+                    compacted = data.get("compacted", 0)
+                    remaining = data.get("remaining_messages", 0)
+                    self.call_from_thread(
+                        self._show_system,
+                        f"Micro-compact: {compacted} old results cleared ({remaining} messages remain)",
+                        "warning",
+                    )
+
                 elif event.type == EventType.CONTEXT_HEALTH:
                     data = event.data if isinstance(event.data, dict) else {}
                     ratio = data.get("usage_ratio", 0)

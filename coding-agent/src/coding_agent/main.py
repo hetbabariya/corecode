@@ -322,6 +322,17 @@ async def _run_agent_clean(
             slices = d.get("slice_count", 0)
             print(f"    \u2503   \u26a0 context at {ratio:.0%} ({slices} slices)")
 
+        elif event.type == EventType.MICRO_COMPACT:
+            compacted = d.get("compacted", 0)
+            remaining = d.get("remaining_messages", 0)
+            print(f"    \u2503   \u26a0 micro-compact: {compacted} old results cleared ({remaining} messages remain)")
+
+        elif event.type == EventType.REACTIVE_COMPACT:
+            print(f"    \u2503   \u26a0 context overflow recovery triggered")
+
+        elif event.type == EventType.MAX_TOKENS_RECOVERY:
+            print(f"    \u2503   \u26a0 max tokens recovery triggered")
+
         elif event.type == EventType.VERIFICATION:
             file_path = d.get("file_path", "")
             checks = d.get("checks", [])
