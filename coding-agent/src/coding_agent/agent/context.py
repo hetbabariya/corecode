@@ -145,6 +145,36 @@ class ContextManager:
             )
         )
 
+    def drop_oldest_tool_results(self, count: int = 2) -> int:
+        """Drop the oldest tool result messages.
+
+        This is the "overflow flush" — a cheap way to reduce context size
+        by removing old tool results while preserving the conversation flow.
+
+        Parameters
+        ----------
+        count:
+            Maximum number of tool result messages to drop.
+
+        Returns
+        -------
+        int
+            Number of messages actually dropped.
+        """
+        # Find indices of tool result messages (oldest first)
+        tool_indices: list[int] = []
+        for i, msg in enumerate(self.messages):
+            if msg.role == "tool":
+                tool_indices.append(i)
+
+        # Drop oldest ones (up to count)
+        dropped = 0
+        for idx in reversed(tool_indices[:count]):  # Reverse to preserve indices
+            self.messages.pop(idx)
+            dropped += 1
+
+        return dropped
+
     def set_context_summary(self, summary: str) -> None:
         """Set prioritized context summary from SmartContextEngine.
 

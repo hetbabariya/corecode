@@ -61,6 +61,24 @@ _PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset({
 })
 
 
+def _is_context_overflow_error(exc: Exception) -> bool:
+    """Detect context overflow errors across providers.
+
+    Returns True if the error indicates the prompt/context is too long.
+    """
+    msg = str(exc).lower()
+    patterns = [
+        "prompt_too_long",
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "token limit",
+        "request too large",
+        "400",  # HTTP 400 often indicates context overflow
+    ]
+    return any(p in msg for p in patterns)
+
+
 class AgentLoop:
     """Core agentic loop — observe, think, act, repeat.
 
@@ -160,6 +178,10 @@ class AgentLoop:
         self._max_tokens_recovery_max: int = 3
         self._stop_reason: str = ""
 
+        # Phase A.4: Reactive compact (context overflow recovery)
+        self._reactive_compact_count: int = 0
+        self._reactive_compact_max: int = 3
+
         # Phase A metrics
         self.metrics: dict[str, int | float] = {
             "permission_check_count": 0,
@@ -191,6 +213,60 @@ class AgentLoop:
         # Build and inject the system prompt
         self._cached_system_prompt: str | None = None
         self.context.system_prompt = self._build_system_prompt_cached()
+
+    async def _reactive_compact(self) -> None:
+        """Reactive compact — summarize older messages to reduce context size.
+
+        This is called when the context window is full and we need to
+        compress the conversation to continue. Keeps the last 3 messages
+        and summarizes everything else.
+        """
+        if len(self.context.messages) <= 3:
+            return
+
+        # Get the old messages to summarize
+        old_messages = self.context.messages[:-3]
+        recent_messages = self.context.messages[-3:]
+
+        # Build a summary prompt
+        summary_parts: list[str] = []
+        for msg in old_messages:
+            if msg.role in ("user", "assistant"):
+                content = msg.content[:500] if msg.content else ""
+                summary_parts.append(f"{msg.role}: {content}")
+            elif msg.role == "tool":
+                name = msg.name or "tool"
+                content = msg.content[:200] if msg.content else ""
+                summary_parts.append(f"  [tool_result: {name}] {content}")
+
+        old_content = "\n".join(summary_parts)
+
+        # Use the summary LLM client if available, otherwise use main client
+        summary_client = self.summary_llm_client or self.llm_client
+
+        # Generate summary
+        try:
+            messages = [
+                {"role": "system", "content": "Summarize the following conversation concisely, keeping key facts and decisions:"},
+                {"role": "user", "content": old_content},
+            ]
+            response = await summary_client.complete(messages)
+            summary = response.content
+        except Exception as exc:
+            logger.warning("reactive_compact_summary_failed", error=str(exc)[:200])
+            # Fallback: just keep a simple summary
+            summary = f"[Previous conversation with {len(old_messages)} messages]"
+
+        # Replace old messages with summary
+        self.context._summary = summary
+        self.context.messages = recent_messages
+
+        logger.info(
+            "reactive_compact_completed",
+            old_count=len(old_messages),
+            new_count=len(recent_messages),
+            summary_length=len(summary),
+        )
 
     async def _run_session_cleanup(
         self, last_text: str = "", iteration: int = 0,
@@ -468,40 +544,100 @@ class AgentLoop:
             messages = self.context.build_messages()
             tools = tool_registry.get_schemas()
 
-            # --- Stream LLM response ---
+            # --- Stream LLM response (with context overflow recovery) ---
             tool_calls: list[dict[str, Any]] = []
             text_parts: list[str] = []
             self._stop_reason = ""
+            _stream_success = False
 
-            async for event in self.llm_client.stream(messages, tools=tools):
-                if event.type == StreamEventType.TEXT:
-                    text_parts.append(str(event.data))
-                    yield AgentEvent(type=EventType.TEXT, data=event.data)
+            try:
+                async for event in self.llm_client.stream(messages, tools=tools):
+                    if event.type == StreamEventType.TEXT:
+                        text_parts.append(str(event.data))
+                        yield AgentEvent(type=EventType.TEXT, data=event.data)
 
-                elif event.type == StreamEventType.TOOL_CALL:
-                    tool_calls.append(event.data)  # type: ignore[arg-type]
+                    elif event.type == StreamEventType.TOOL_CALL:
+                        tool_calls.append(event.data)  # type: ignore[arg-type]
 
-                elif event.type == StreamEventType.USAGE:
-                    yield AgentEvent(type=EventType.USAGE, data=event.data)
-                    # Track accumulated cost
-                    usage_data: dict[str, Any] = event.data  # type: ignore[assignment]
-                    if isinstance(usage_data, dict):
-                        from coding_agent.llm.tokens import TokenUsage
+                    elif event.type == StreamEventType.USAGE:
+                        yield AgentEvent(type=EventType.USAGE, data=event.data)
+                        # Track accumulated cost
+                        usage_data: dict[str, Any] = event.data  # type: ignore[assignment]
+                        if isinstance(usage_data, dict):
+                            from coding_agent.llm.tokens import TokenUsage
 
-                        usage = TokenUsage(
-                            prompt_tokens=int(usage_data.get("prompt_tokens", 0)),
-                            completion_tokens=int(usage_data.get("completion_tokens", 0)),
-                            model=self.llm_client.model,
+                            usage = TokenUsage(
+                                prompt_tokens=int(usage_data.get("prompt_tokens", 0)),
+                                completion_tokens=int(usage_data.get("completion_tokens", 0)),
+                                model=self.llm_client.model,
+                            )
+                            self._accumulated_cost += usage.estimated_cost
+
+                    elif event.type == StreamEventType.STOP_REASON:
+                        # Capture stop_reason for max tokens recovery
+                        if isinstance(event.data, dict):
+                            self._stop_reason = event.data.get("finish_reason", "")
+
+                    elif event.type == StreamEventType.DONE:
+                        break
+
+                _stream_success = True
+
+            except Exception as exc:
+                # Phase A.4: Context overflow recovery
+                if _is_context_overflow_error(exc):
+                    self._reactive_compact_count += 1
+                    if self._reactive_compact_count <= self._reactive_compact_max:
+                        logger.warning(
+                            "context_overflow_detected",
+                            attempt=self._reactive_compact_count,
+                            max_attempts=self._reactive_compact_max,
+                            error=str(exc)[:200],
                         )
-                        self._accumulated_cost += usage.estimated_cost
 
-                elif event.type == StreamEventType.STOP_REASON:
-                    # Capture stop_reason for max tokens recovery
-                    if isinstance(event.data, dict):
-                        self._stop_reason = event.data.get("finish_reason", "")
+                        # Step 1: Overflow flush — drop oldest tool results
+                        dropped = self.context.drop_oldest_tool_results(count=2)
+                        logger.info(
+                            "overflow_flush",
+                            dropped=dropped,
+                            remaining_messages=len(self.context.messages),
+                        )
 
-                elif event.type == StreamEventType.DONE:
-                    break
+                        # Step 2: If no tool results to drop, summarize older messages
+                        if dropped == 0 and len(self.context.messages) > 6:
+                            logger.info("reactive_compact_summarize")
+                            await self._reactive_compact()
+
+                        # Emit event for TUI visibility
+                        yield AgentEvent(
+                            type=EventType.REACTIVE_COMPACT,
+                            data={
+                                "attempt": self._reactive_compact_count,
+                                "max_attempts": self._reactive_compact_max,
+                                "dropped": dropped,
+                            },
+                        )
+
+                        # Continue the loop to retry with compressed context
+                        continue
+                    else:
+                        # Max attempts reached
+                        logger.error(
+                            "reactive_compact_failed",
+                            max_attempts=self._reactive_compact_max,
+                            error=str(exc)[:200],
+                        )
+                        yield AgentEvent(
+                            type=EventType.ERROR,
+                            data={
+                                "error": f"Context overflow - max recovery attempts reached: {str(exc)[:200]}",
+                            },
+                        )
+                        await self._run_session_cleanup("", _iteration)
+                        return
+                else:
+                    # Not a context overflow error — re-raise
+                    raise
 
             # --- Store assistant turn in context ---
             full_text = "".join(text_parts)

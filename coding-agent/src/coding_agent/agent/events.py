@@ -29,6 +29,7 @@ class EventType(Enum):
     CONTEXT_HEALTH = "context_health"
     REFLECTION = "reflection"
     MAX_TOKENS_RECOVERY = "max_tokens_recovery"
+    REACTIVE_COMPACT = "reactive_compact"
 
 
 @dataclass

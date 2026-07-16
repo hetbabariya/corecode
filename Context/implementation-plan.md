@@ -8,8 +8,8 @@
 - [x] A.1 Dangerous Command Detection
 - [x] A.2 Protected Files and Directories
 - [x] A.3 Max Output Tokens Recovery
-- [ ] A.4 Prompt Too Long Recovery (Reactive Compact)
-- [ ] A.5 Interactive REPL
+- [x] A.4 Prompt Too Long Recovery (Reactive Compact)
+- [x] A.5 Interactive REPL
 
 ### Phase B — Foundation
 - [ ] B.1 Checkpoint System

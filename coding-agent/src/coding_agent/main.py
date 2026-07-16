@@ -612,6 +612,29 @@ async def _run_agent_raw(
 
 
 @app.command()
+def repl(
+    workspace: Path = Path("."),
+    permission: str = typer.Option("auto", help="Permission mode: auto, confirm, deny"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug-level logging"),
+) -> None:
+    """Start an interactive REPL session.
+
+    Use Ctrl+D to exit, Ctrl+C to interrupt, Ctrl+L to clear.
+    """
+    from coding_agent.config import Settings
+    from coding_agent.logging import setup_logging
+
+    effective_level = "DEBUG" if verbose else log_level
+    log_file = Settings().log_file
+    setup_logging(level=effective_level, log_file=log_file)
+
+    from coding_agent.tui.repl import run_repl
+
+    run_repl(workspace=workspace, permission=permission)
+
+
+@app.command()
 def config() -> None:
     """Show current configuration."""
     from coding_agent.config import Settings
