@@ -706,5 +706,54 @@ def history(
     asyncio.run(_list())
 
 
+@app.command()
+def checkpoints(
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of checkpoints to show"),
+) -> None:
+    """List available checkpoints."""
+    from coding_agent.sandbox.checkpoint import CheckpointManager
+
+    try:
+        manager = CheckpointManager(".")
+        checkpoints = manager.list_checkpoints(limit)
+        if not checkpoints:
+            typer.echo("No checkpoints found.")
+            return
+
+        typer.echo(f"{'ID':<10} {'Label':<40} {'Date':<22}")
+        typer.echo("-" * 72)
+        for cp in checkpoints:
+            from datetime import datetime
+
+            date = datetime.fromtimestamp(cp.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            typer.echo(f"{cp.id:<10} {cp.label:<40} {date:<22}")
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command()
+def undo() -> None:
+    """Undo the last change by restoring to previous checkpoint."""
+    from coding_agent.sandbox.checkpoint import CheckpointManager
+
+    try:
+        manager = CheckpointManager(".")
+        checkpoint = manager.undo()
+        if checkpoint:
+            typer.echo(f"Undone to checkpoint: {checkpoint.id} - {checkpoint.label}")
+        else:
+            typer.echo("Nothing to undo.")
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command()
+def redo() -> None:
+    """Redo by moving forward one checkpoint (limited support)."""
+    typer.echo("Redo is not fully supported yet. Use 'undo' to go back.")
+
+
 if __name__ == "__main__":
     app()

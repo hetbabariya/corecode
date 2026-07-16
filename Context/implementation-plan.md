@@ -13,7 +13,7 @@
 
 ### Phase B — Foundation
 - [x] B.1 Micro-Compact (Old Tool Results)
-- [ ] B.2 Undo/Redo Persistence
+- [x] B.2 Undo/Redo Persistence
 - [ ] B.3 Permission Presets
 - [ ] B.4 Cost Tracking Dashboard
 

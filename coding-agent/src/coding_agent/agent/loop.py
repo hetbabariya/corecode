@@ -895,6 +895,24 @@ class AgentLoop:
                         data={"tool_name": pc["name"], "approved": True},
                     )
 
+                # Auto-checkpoint before file modifications
+                _EDIT_TOOLS = {"write_file", "edit_file", "apply_patch", "multi_edit"}
+                if pc["name"] in _EDIT_TOOLS:
+                    try:
+                        from coding_agent.sandbox.checkpoint import CheckpointManager
+
+                        checkpoint_mgr = CheckpointManager(".")
+                        checkpoint = checkpoint_mgr.create_checkpoint(
+                            f"before {pc['name']}"
+                        )
+                        logger.info(
+                            "auto_checkpoint",
+                            checkpoint_id=checkpoint.id,
+                            tool=pc["name"],
+                        )
+                    except Exception as e:
+                        logger.warning("auto_checkpoint_failed", error=str(e))
+
                 result = await tool_registry.execute_from_llm(pc["tc"])
                 tool_duration_ms = (time.monotonic() - tool_start) * 1000
                 self._tool_count += 1
