@@ -333,6 +333,12 @@ async def _run_agent_clean(
         elif event.type == EventType.MAX_TOKENS_RECOVERY:
             print(f"    \u2503   \u26a0 max tokens recovery triggered")
 
+        elif event.type == EventType.CHECKPOINT:
+            checkpoint_id = d.get("checkpoint_id", "")
+            label = d.get("label", "")
+            tool = d.get("tool", "")
+            print(f"    \u2503   \u26a0 checkpoint: {checkpoint_id} ({label}) before {tool}")
+
         elif event.type == EventType.VERIFICATION:
             file_path = d.get("file_path", "")
             checks = d.get("checks", [])

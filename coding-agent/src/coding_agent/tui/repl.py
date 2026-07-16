@@ -250,6 +250,17 @@ class CodingAgentREPL(App[None]):
                         "warning",
                     )
 
+                elif event.type == EventType.CHECKPOINT:
+                    data = event.data if isinstance(event.data, dict) else {}
+                    checkpoint_id = data.get("checkpoint_id", "")
+                    label = data.get("label", "")
+                    tool = data.get("tool", "")
+                    self.call_from_thread(
+                        self._show_system,
+                        f"Checkpoint: {checkpoint_id} ({label}) before {tool}",
+                        "warning",
+                    )
+
                 elif event.type == EventType.CONTEXT_HEALTH:
                     data = event.data if isinstance(event.data, dict) else {}
                     ratio = data.get("usage_ratio", 0)

@@ -910,6 +910,14 @@ class AgentLoop:
                             checkpoint_id=checkpoint.id,
                             tool=pc["name"],
                         )
+                        yield AgentEvent(
+                            type=EventType.CHECKPOINT,
+                            data={
+                                "checkpoint_id": checkpoint.id,
+                                "label": checkpoint.label,
+                                "tool": pc["name"],
+                            },
+                        )
                     except Exception as e:
                         logger.warning("auto_checkpoint_failed", error=str(e))
 

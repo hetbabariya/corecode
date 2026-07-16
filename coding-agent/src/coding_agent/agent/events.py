@@ -31,6 +31,7 @@ class EventType(Enum):
     MAX_TOKENS_RECOVERY = "max_tokens_recovery"
     REACTIVE_COMPACT = "reactive_compact"
     MICRO_COMPACT = "micro_compact"
+    CHECKPOINT = "checkpoint"
 
 
 @dataclass
