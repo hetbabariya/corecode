@@ -13,6 +13,7 @@ import pathspec.patterns.gitignore  # noqa: F401  # type: ignore[reportUnusedImp
 
 from coding_agent.agent.ast_check import validate_syntax
 from coding_agent.logging import logger
+from coding_agent.sandbox.protected_paths import is_protected_path
 from coding_agent.tools.base import ToolResult
 from coding_agent.tools.registry import tool
 from coding_agent.tools.undo import get_undo_stack
@@ -28,6 +29,22 @@ _DEFAULT_EXCLUDES = {
     ".ruff_cache",
     ".pyright",
 }
+
+
+def _check_protected_path(path: Path) -> ToolResult | None:
+    """Check if a path is protected. Returns ToolResult if blocked, None if allowed."""
+    from coding_agent.config import Settings
+
+    settings = Settings()
+    if not settings.protect_critical_paths:
+        return None
+
+    is_protected, reason = is_protected_path(str(path))
+    if is_protected:
+        logger.warning("protected_path_blocked", path=str(path), reason=reason)
+        return ToolResult(success=False, error=f"Protected path: {reason}")
+
+    return None
 
 
 def _push_undo(tool_name: str, file_path: str, before: str, after: str, desc: str = "") -> None:
@@ -194,6 +211,11 @@ async def write_file(path: str, content: str) -> ToolResult:
     """Create or overwrite a file with the given content."""
     p = Path(path).resolve()
 
+    # Protected path check
+    blocked = _check_protected_path(p)
+    if blocked:
+        return blocked
+
     # Capture before-state for undo
     before = ""
     if p.exists() and p.is_file():
@@ -244,6 +266,11 @@ async def edit_file(path: str, old_text: str, new_text: str) -> ToolResult:
         return ToolResult(success=False, error=f"File not found: {path}")
     if p.is_dir():
         return ToolResult(success=False, error=f"Path is a directory: {path}")
+
+    # Protected path check
+    blocked = _check_protected_path(p)
+    if blocked:
+        return blocked
 
     try:
         text = p.read_text(encoding="utf-8")
@@ -470,6 +497,11 @@ async def apply_patch(path: str, patch: str) -> ToolResult:
     if p.is_dir():
         return ToolResult(success=False, error=f"Path is a directory: {path}")
 
+    # Protected path check
+    blocked = _check_protected_path(p)
+    if blocked:
+        return blocked
+
     try:
         text = p.read_text(encoding="utf-8")
     except OSError as exc:
@@ -540,6 +572,11 @@ async def multi_edit(path: str, edits: list[dict[str, str]]) -> ToolResult:
         return ToolResult(success=False, error=f"File not found: {path}")
     if p.is_dir():
         return ToolResult(success=False, error=f"Path is a directory: {path}")
+
+    # Protected path check
+    blocked = _check_protected_path(p)
+    if blocked:
+        return blocked
 
     if not edits:
         return ToolResult(success=False, error="No edits provided.")

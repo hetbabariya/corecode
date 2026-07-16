@@ -140,6 +140,9 @@ class Settings(BaseSettings):
     block_dangerous_commands: bool = Field(
         default=True, description="Block dangerous shell commands (rm -rf, git push --force, etc.)"
     )
+    protect_critical_paths: bool = Field(
+        default=True, description="Protect critical files (.gitconfig, .ssh, .env, etc.)"
+    )
 
     # Workspace
     workspace: Any = Field(default=".", description="Workspace directory")

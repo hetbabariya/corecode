@@ -2,6 +2,51 @@
 
 > This document details every missing feature from the Claude Code audit, organized into phases. Each feature includes: what it is, why it matters, how it should work, what components to create/modify, dependencies, acceptance criteria, and estimated effort.
 
+## Implementation Checklist
+
+### Phase A — Critical Fixes
+- [x] A.1 Dangerous Command Detection
+- [x] A.2 Protected Files and Directories
+- [ ] A.3 Max Output Tokens Recovery
+- [ ] A.4 Prompt Too Long Recovery (Reactive Compact)
+- [ ] A.5 Interactive REPL
+
+### Phase B — Foundation
+- [ ] B.1 Checkpoint System
+- [ ] B.2 Undo/Redo Persistence
+- [ ] B.3 Permission Presets
+- [ ] B.4 Cost Tracking Dashboard
+
+### Phase C — Intelligence
+- [ ] C.1 Auto-Compact (Proactive)
+- [ ] C.2 Tool Result Summarization
+- [ ] C.3 Context Budget Manager
+- [ ] C.4 Memory Consolidation
+
+### Phase D — UX
+- [ ] D.1 Streaming Output
+- [ ] D.2 Progress Indicators
+- [ ] D.3 Diff Visualization
+- [ ] D.4 Keyboard Shortcuts
+
+### Phase E — Advanced
+- [ ] E.1 Subagent System
+- [ ] E.2 Tool Composition
+- [ ] E.3 Custom Slash Commands
+- [ ] E.4 Hook System
+
+### Phase F — Claude Code Parity
+- [ ] F.1 CLAUDE.md Support
+- [ ] F.2 Multi-Model Routing
+- [ ] F.3 Parallel Tool Execution
+- [ ] F.4 Headless Mode
+
+### Phase G — Beyond Claude Code
+- [ ] G.1 Plugin System
+- [ ] G.2 Remote Execution
+- [ ] G.3 Team Collaboration
+- [ ] G.4 Analytics Dashboard
+
 ---
 
 ## Table of Contents
