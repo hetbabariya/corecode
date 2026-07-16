@@ -30,6 +30,7 @@ class EventType(Enum):
     REFLECTION = "reflection"
     MAX_TOKENS_RECOVERY = "max_tokens_recovery"
     REACTIVE_COMPACT = "reactive_compact"
+    MICRO_COMPACT = "micro_compact"
 
 
 @dataclass

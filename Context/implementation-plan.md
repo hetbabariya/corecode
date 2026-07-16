@@ -12,7 +12,7 @@
 - [x] A.5 Interactive REPL
 
 ### Phase B — Foundation
-- [ ] B.1 Checkpoint System
+- [x] B.1 Micro-Compact (Old Tool Results)
 - [ ] B.2 Undo/Redo Persistence
 - [ ] B.3 Permission Presets
 - [ ] B.4 Cost Tracking Dashboard

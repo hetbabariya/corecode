@@ -195,6 +195,7 @@ class AgentLoop:
             "token_estimate_calls": 0,
             "prompt_cache_hits": 0,
             "prompt_cache_misses": 0,
+            "micro_compact_count": 0,
         }
 
         # Smart context engine
@@ -899,6 +900,25 @@ class AgentLoop:
                 self._tool_count += 1
                 async for event in self._finalize_tool_execution(pc, result, tool_duration_ms):
                     yield event
+
+            # --- Phase B.1: Micro-compact old tool results ---
+            compacted = self.context.compact_old_tool_results(keep_recent=10)
+            if compacted > 0:
+                logger.info(
+                    "micro_compact",
+                    compacted=compacted,
+                    remaining_messages=len(self.context.messages),
+                )
+                self.metrics["micro_compact_count"] = (
+                    self.metrics.get("micro_compact_count", 0) + compacted
+                )
+                yield AgentEvent(
+                    type=EventType.MICRO_COMPACT,
+                    data={
+                        "compacted": compacted,
+                        "remaining_messages": len(self.context.messages),
+                    },
+                )
 
             # --- Check context budget (progressive thresholds) ---
             usage_ratio = await self._check_context_usage()

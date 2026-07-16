@@ -214,3 +214,82 @@ class TestContextManager:
             ctx.add_user_message(f"msg {i}")
         result = ctx.format_old_messages()
         assert "System prompt" not in result
+
+
+class TestMicroCompact:
+    """Tests for compact_old_tool_results method."""
+
+    def test_no_compact_when_few_messages(self):
+        ctx = ContextManager()
+        ctx.add_user_message("hello")
+        ctx.add_tool_result("c1", "read_file", "x" * 600)
+        compacted = ctx.compact_old_tool_results(keep_recent=10)
+        assert compacted == 0
+        # Tool result should be preserved (not compacted)
+        tool_msg = [m for m in ctx.messages if m.role == "tool"][0]
+        assert len(tool_msg.content) > 500
+
+    def test_compact_old_tool_results(self):
+        ctx = ContextManager()
+        # Add 15 messages with tool results
+        for i in range(15):
+            ctx.add_user_message(f"msg {i}")
+            ctx.add_tool_result(f"c{i}", "read_file", "x" * 600)
+
+        compacted = ctx.compact_old_tool_results(keep_recent=10)
+        assert compacted > 0
+        # Old tool results should be compacted
+        tool_msgs = [m for m in ctx.messages if m.role == "tool"]
+        assert "[Old tool result:" in tool_msgs[0].content
+        # Recent tool results should be preserved
+        assert len(tool_msgs[-1].content) > 500
+
+    def test_compact_preserves_metadata(self):
+        ctx = ContextManager()
+        for i in range(15):
+            ctx.add_user_message(f"msg {i}")
+            ctx.add_tool_result(f"c{i}", "read_file", "line1\nline2\n" + "x" * 600)
+
+        ctx.compact_old_tool_results(keep_recent=10)
+        tool_msgs = [m for m in ctx.messages if m.role == "tool"]
+        compacted_msg = tool_msgs[0]
+        assert "read_file" in compacted_msg.content
+        assert "ok" in compacted_msg.content
+        assert "lines" in compacted_msg.content
+
+    def test_compact_failed_tool_result(self):
+        ctx = ContextManager()
+        for i in range(15):
+            ctx.add_user_message(f"msg {i}")
+            ctx.add_tool_result(f"c{i}", "read_file", "Error: file not found" + "x" * 600)
+
+        ctx.compact_old_tool_results(keep_recent=10)
+        tool_msgs = [m for m in ctx.messages if m.role == "tool"]
+        # Failed results should show "failed"
+        assert "failed" in tool_msgs[0].content
+
+    def test_compact_skips_small_results(self):
+        ctx = ContextManager()
+        for i in range(15):
+            ctx.add_user_message(f"msg {i}")
+            ctx.add_tool_result(f"c{i}", "read_file", "small content")
+
+        compacted = ctx.compact_old_tool_results(keep_recent=10)
+        assert compacted == 0
+
+    def test_compact_preserves_non_tool_messages(self):
+        ctx = ContextManager()
+        for i in range(15):
+            ctx.add_user_message(f"msg {i}")
+            if i % 2 == 0:
+                ctx.add_tool_result(f"c{i}", "read_file", "x" * 600)
+
+        ctx.compact_old_tool_results(keep_recent=10)
+        # User messages should be preserved
+        user_msgs = [m for m in ctx.messages if m.role == "user"]
+        assert user_msgs[0].content == "msg 0"
+
+    def test_micro_compact_event_type_exists(self):
+        from coding_agent.agent.events import EventType
+        assert hasattr(EventType, "MICRO_COMPACT")
+        assert EventType.MICRO_COMPACT.value == "micro_compact"

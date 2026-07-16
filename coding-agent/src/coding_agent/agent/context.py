@@ -175,6 +175,50 @@ class ContextManager:
 
         return dropped
 
+    def compact_old_tool_results(self, keep_recent: int = 10) -> int:
+        """Replace old tool results with compact markers.
+
+        This is a lightweight pass that reclaims context space by replacing
+        large tool results (file contents, search results) with short markers
+        that preserve metadata (tool name, success/failure, line count).
+
+        Parameters
+        ----------
+        keep_recent:
+            Number of recent messages to preserve intact.
+
+        Returns
+        -------
+        int
+            Number of messages compacted.
+        """
+        if len(self.messages) <= keep_recent:
+            return 0
+
+        compacted = 0
+        cutoff_index = len(self.messages) - keep_recent
+
+        for i in range(cutoff_index):
+            msg = self.messages[i]
+            if msg.role == "tool" and len(msg.content) > 500:
+                # Build compact marker
+                name = msg.name or "tool"
+                success = not msg.content.startswith("Error")
+                status = "ok" if success else "failed"
+                lines = msg.content.count("\n") + 1
+
+                # Extract first line as preview
+                first_line = msg.content.split("\n")[0][:80]
+
+                marker = f"[Old tool result: {name} \u2192 {status}, {lines} lines]"
+                if first_line:
+                    marker += f"\nPreview: {first_line}"
+
+                msg.content = marker
+                compacted += 1
+
+        return compacted
+
     def set_context_summary(self, summary: str) -> None:
         """Set prioritized context summary from SmartContextEngine.
 
