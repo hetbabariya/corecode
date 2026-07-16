@@ -215,6 +215,58 @@ class TestSchemaMigration:
         assert len(sessions) == 1
         await mgr2.close()
 
+    async def test_migration_v2_to_v3(self, tmp_path: Path) -> None:
+        """Simulate a v2 database and verify migration adds new columns."""
+        import aiosqlite
+
+        db_path = tmp_path / "old.db"
+        # Create a v2 schema manually (no importance/access_count/last_accessed, no plans)
+        async with aiosqlite.connect(str(db_path)) as db:
+            await db.executescript("""
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_version (version) VALUES (1);
+                CREATE TABLE memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace TEXT NOT NULL DEFAULT '',
+                    memory_type TEXT NOT NULL DEFAULT 'semantic',
+                    content TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    session_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    workspace TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_cost REAL NOT NULL DEFAULT 0.0
+                );
+                INSERT INTO memory (workspace, content, created_at, updated_at)
+                VALUES ('w', 'old memory', '2025-01-01', '2025-01-01');
+            """)
+
+        # Open with new SessionManager — should migrate and preserve data
+        mgr = SessionManager(db_path=db_path)
+        await mgr.initialize()
+
+        # Old memory should still exist
+        memories = await mgr.get_memories(workspace="w")
+        assert len(memories) == 1
+        assert memories[0].content == "old memory"
+        assert memories[0].importance == 0.5  # default from migration
+
+        # Plans table should exist
+        await mgr.save_plan(workspace="w", goal="Test", steps=[], current_step=0, status="planning")
+        loaded = await mgr.load_active_plan("w")
+        assert loaded is not None
+
+        await mgr.close()
+
 
 # ===================================================================
 # Memory CRUD tests

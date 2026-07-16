@@ -192,12 +192,52 @@ class SessionManager:
         self._db = await aiosqlite.connect(str(self._db_path))
         await self._db.executescript(_SCHEMA_SQL)
         await self._db.commit()
+        await self._migrate_db()
 
     async def close(self) -> None:
         """Close the database connection."""
         if self._db:
             await self._db.close()
             self._db = None
+
+    async def _migrate_db(self) -> None:
+        """Detect schema version and apply incremental migrations."""
+        assert self._db is not None
+        cursor = await self._db.execute("SELECT version FROM schema_version")
+        row = await cursor.fetchone()
+        current = row[0] if row else 1
+
+        if current < 2:
+            await self._add_column_if_missing("memory", "importance", "REAL NOT NULL DEFAULT 0.5")
+            await self._add_column_if_missing("memory", "access_count", "INTEGER NOT NULL DEFAULT 0")
+            await self._add_column_if_missing("memory", "last_accessed", "TEXT NOT NULL DEFAULT ''")
+
+        if current < 3:
+            await self._db.executescript("""
+                CREATE TABLE IF NOT EXISTS plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace TEXT NOT NULL DEFAULT '',
+                    goal TEXT NOT NULL DEFAULT '',
+                    steps TEXT NOT NULL DEFAULT '[]',
+                    current_step INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'planning',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_plans_workspace ON plans(workspace);
+            """)
+
+        await self._db.execute("DELETE FROM schema_version")
+        await self._db.execute("INSERT INTO schema_version (version) VALUES (?)", (_SCHEMA_VERSION,))
+        await self._db.commit()
+
+    async def _add_column_if_missing(self, table: str, column: str, col_def: str) -> None:
+        """Add a column to *table* only if it doesn't already exist."""
+        assert self._db is not None
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
+        cols = [row[1] for row in await cursor.fetchall()]
+        if column not in cols:
+            await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
 
     # ------------------------------------------------------------------
     # Session CRUD
