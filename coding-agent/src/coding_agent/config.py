@@ -136,6 +136,11 @@ class Settings(BaseSettings):
         default=True, description="Run syntax/lint checks after file edits"
     )
 
+    # Safety
+    block_dangerous_commands: bool = Field(
+        default=True, description="Block dangerous shell commands (rm -rf, git push --force, etc.)"
+    )
+
     # Workspace
     workspace: Any = Field(default=".", description="Workspace directory")
 

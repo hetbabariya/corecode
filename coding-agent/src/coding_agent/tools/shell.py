@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from coding_agent.logging import logger
+from coding_agent.sandbox.danger_patterns import check_dangerous_command
 from coding_agent.tools.base import ToolResult
 from coding_agent.tools.registry import tool
 
@@ -85,6 +86,20 @@ async def execute_command(
     """
     if not command.strip():
         return ToolResult(success=False, error="Command cannot be empty")
+
+    # Dangerous command check
+    from coding_agent.config import Settings
+
+    settings = Settings()
+    if settings.block_dangerous_commands:
+        result = check_dangerous_command(command)
+        if result.is_dangerous:
+            logger.warning(
+                "dangerous_command_blocked",
+                command=command,
+                reason=result.reason,
+            )
+            return ToolResult(success=False, error=f"Blocked: {result.reason}")
 
     executor = await _get_executor()
     result = await executor.execute(
