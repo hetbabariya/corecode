@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from coding_agent.logging import logger
+
+if TYPE_CHECKING:
+    from coding_agent.session.manager import SessionManager
 
 
 class StepStatus(str, Enum):
@@ -259,3 +262,65 @@ class PlanManager:
     def reset(self) -> None:
         """Clear the plan."""
         self._plan = None
+
+    # ------------------------------------------------------------------
+    # Persistence (D.3)
+    # ------------------------------------------------------------------
+
+    async def save(
+        self,
+        session_manager: SessionManager,
+        workspace: str,
+    ) -> int:
+        """Save the current plan to the database. Returns plan id."""
+        if self._plan is None:
+            return 0
+        steps_data = [
+            {
+                "description": s.description,
+                "status": s.status.value,
+                "result": s.result,
+            }
+            for s in self._plan.steps
+        ]
+        plan_id = await session_manager.save_plan(
+            workspace=workspace,
+            goal=self._plan.goal,
+            steps=steps_data,
+            current_step=self._plan.current_step,
+            status=self._plan.status.value,
+        )
+        logger.debug("plan_saved", plan_id=plan_id, goal=self._plan.goal)
+        return plan_id
+
+    def load_from_dict(self, data: dict[str, Any]) -> bool:
+        """Load a plan from a dictionary (from SessionManager).
+
+        Returns True if a plan was loaded.
+        """
+        if not data or not data.get("steps"):
+            return False
+
+        steps = []
+        for s in data["steps"]:
+            steps.append(
+                PlanStep(
+                    description=s.get("description", ""),
+                    status=StepStatus(s.get("status", "pending")),
+                    result=s.get("result", ""),
+                )
+            )
+
+        self._plan = Plan(
+            goal=data.get("goal", ""),
+            steps=steps,
+            current_step=data.get("current_step", 0),
+            status=PlanStatus(data.get("status", "executing")),
+        )
+        logger.info(
+            "plan_loaded",
+            goal=self._plan.goal,
+            steps=len(self._plan.steps),
+            current_step=self._plan.current_step,
+        )
+        return True

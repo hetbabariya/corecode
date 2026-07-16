@@ -16,7 +16,7 @@ from typing import Any
 import aiosqlite
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -64,16 +64,31 @@ CREATE TABLE IF NOT EXISTS memory (
     memory_type TEXT NOT NULL DEFAULT 'semantic',
     content TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
+    importance REAL NOT NULL DEFAULT 0.5,
+    access_count INTEGER NOT NULL DEFAULT 0,
+    last_accessed TEXT NOT NULL DEFAULT '',
     session_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL DEFAULT '',
+    steps TEXT NOT NULL DEFAULT '[]',
+    current_step INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'planning',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_operations_session ON operations(session_id);
 CREATE INDEX IF NOT EXISTS idx_memory_workspace ON memory(workspace);
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(memory_type);
+CREATE INDEX IF NOT EXISTS idx_plans_workspace ON plans(workspace);
 """
 
 
@@ -123,7 +138,7 @@ class OperationRecord:
     created_at: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass
 class MemoryRecord:
     """A single memory entry."""
 
@@ -135,6 +150,9 @@ class MemoryRecord:
     session_id: str | None
     created_at: str
     updated_at: str
+    importance: float = 0.5
+    access_count: int = 0
+    last_accessed: str = ""
 
 
 def _json_dumps(obj: object) -> str:
@@ -387,6 +405,7 @@ class SessionManager:
         memory_type: str = "semantic",
         workspace: str = "",
         tags: list[str] | None = None,
+        importance: float = 0.5,
         session_id: str | None = None,
     ) -> int:
         """Insert a memory record and return its id."""
@@ -394,13 +413,15 @@ class SessionManager:
         now = datetime.now(UTC).isoformat()
         cursor = await self._db.execute(
             "INSERT INTO memory "
-            "(workspace, memory_type, content, tags, session_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(workspace, memory_type, content, tags, importance, "
+            "session_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 workspace,
                 memory_type,
                 content,
                 _json_dumps(tags or []),
+                importance,
                 session_id,
                 now,
                 now,
@@ -421,7 +442,8 @@ class SessionManager:
         assert self._db is not None
         query = (
             "SELECT id, workspace, memory_type, content, tags, "
-            "session_id, created_at, updated_at "
+            "session_id, created_at, updated_at, "
+            "importance, access_count, last_accessed "
             "FROM memory WHERE 1=1"
         )
         params: list[str | int] = []
@@ -445,6 +467,9 @@ class SessionManager:
                 session_id=r[5],
                 created_at=r[6],
                 updated_at=r[7],
+                importance=r[8] if r[8] is not None else 0.5,
+                access_count=r[9] if r[9] is not None else 0,
+                last_accessed=r[10] or "",
             )
             for r in rows
         ]
@@ -461,7 +486,8 @@ class SessionManager:
         assert self._db is not None
         sql = (
             "SELECT id, workspace, memory_type, content, tags, "
-            "session_id, created_at, updated_at "
+            "session_id, created_at, updated_at, "
+            "importance, access_count, last_accessed "
             "FROM memory WHERE content LIKE ?"
         )
         params: list[str | int] = [f"%{query}%"]
@@ -485,6 +511,9 @@ class SessionManager:
                 session_id=r[5],
                 created_at=r[6],
                 updated_at=r[7],
+                importance=r[8] if r[8] is not None else 0.5,
+                access_count=r[9] if r[9] is not None else 0,
+                last_accessed=r[10] or "",
             )
             for r in rows
         ]
@@ -509,3 +538,113 @@ class SessionManager:
         )
         await self._db.commit()
         return cursor.rowcount > 0
+
+    async def touch_memory(self, memory_id: int) -> None:
+        """Increment access_count and update last_accessed."""
+        assert self._db is not None
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "UPDATE memory SET access_count = access_count + 1, "
+            "last_accessed = ? WHERE id = ?",
+            (now, memory_id),
+        )
+        await self._db.commit()
+
+    async def count_memories(
+        self, *, workspace: str = "", memory_type: str | None = None
+    ) -> int:
+        """Count memory records."""
+        assert self._db is not None
+        query = "SELECT COUNT(*) FROM memory WHERE 1=1"
+        params: list[str] = []
+        if workspace:
+            query += " AND workspace = ?"
+            params.append(workspace)
+        if memory_type:
+            query += " AND memory_type = ?"
+            params.append(memory_type)
+        cursor = await self._db.execute(query, params)
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+    async def delete_memories(self, ids: list[int]) -> int:
+        """Delete multiple memories by id. Returns count deleted."""
+        if not ids:
+            return 0
+        assert self._db is not None
+        placeholders = ",".join("?" for _ in ids)
+        cursor = await self._db.execute(
+            f"DELETE FROM memory WHERE id IN ({placeholders})",
+            ids,
+        )
+        await self._db.commit()
+        return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # Plan CRUD
+    # ------------------------------------------------------------------
+
+    async def save_plan(
+        self,
+        workspace: str,
+        goal: str,
+        steps: list[dict[str, Any]],
+        current_step: int,
+        status: str,
+    ) -> int:
+        """Upsert a plan for a workspace. Returns plan id."""
+        assert self._db is not None
+        now = datetime.now(UTC).isoformat()
+        cursor = await self._db.execute(
+            "SELECT id FROM plans WHERE workspace = ? AND status NOT IN ('completed', 'failed')",
+            (workspace,),
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            plan_id = existing[0]
+            await self._db.execute(
+                "UPDATE plans SET goal=?, steps=?, current_step=?, status=?, updated_at=? "
+                "WHERE id=?",
+                (goal, _json_dumps(steps), current_step, status, now, plan_id),
+            )
+        else:
+            cursor = await self._db.execute(
+                "INSERT INTO plans (workspace, goal, steps, current_step, status, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (workspace, goal, _json_dumps(steps), current_step, status, now, now),
+            )
+            plan_id = cursor.lastrowid or 0
+        await self._db.commit()
+        return plan_id
+
+    async def load_active_plan(
+        self, workspace: str
+    ) -> dict[str, Any] | None:
+        """Load the active (non-completed/failed) plan for a workspace."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT id, goal, steps, current_step, status "
+            "FROM plans WHERE workspace = ? AND status NOT IN ('completed', 'failed') "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (workspace,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "goal": row[1],
+            "steps": json.loads(row[2]) if row[2] else [],
+            "current_step": row[3],
+            "status": row[4],
+        }
+
+    async def complete_plan(self, plan_id: int) -> None:
+        """Mark a plan as completed."""
+        assert self._db is not None
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "UPDATE plans SET status = 'completed', updated_at = ? WHERE id = ?",
+            (now, plan_id),
+        )
+        await self._db.commit()

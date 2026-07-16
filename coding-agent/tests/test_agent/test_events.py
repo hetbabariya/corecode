@@ -23,6 +23,7 @@ class TestEventType:
             "stuck_detected",
             "ask_user",
             "context_health",
+            "reflection",
         }
         actual = {e.value for e in EventType}
         assert actual == expected

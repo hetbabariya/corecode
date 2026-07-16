@@ -209,6 +209,23 @@ class AgentLoop:
                     memory_content=memory_content,
                 )
 
+        # Resume active plan from previous session (D.3)
+        if (
+            self.plan_manager is not None
+            and self.session_manager is not None
+            and not self.plan_manager.has_plan
+        ):
+            plan_data = await self.session_manager.load_active_plan(
+                str(self.workspace)
+            )
+            if plan_data:
+                self.plan_manager.load_from_dict(plan_data)
+                logger.info(
+                    "plan_resumed",
+                    goal=plan_data.get("goal", ""),
+                    current_step=plan_data.get("current_step", 0),
+                )
+
         self.context.add_user_message(user_input)
         self._start_time = time.monotonic()
         self._accumulated_cost = 0.0
@@ -475,6 +492,25 @@ class AgentLoop:
                         summary,
                         workspace=str(self.workspace),
                         session_id=self.session_id,
+                    )
+                    # Consolidate similar memories (D.1)
+                    await self.memory_manager.consolidate_memories(
+                        workspace=str(self.workspace),
+                    )
+                    # Prune low-value memories (D.4)
+                    await self.memory_manager.prune_memories(
+                        workspace=str(self.workspace),
+                    )
+
+                # Save active plan state (D.3)
+                if (
+                    self.plan_manager is not None
+                    and self.session_manager is not None
+                    and self.plan_manager.has_plan
+                ):
+                    await self.plan_manager.save(
+                        self.session_manager,
+                        str(self.workspace),
                     )
 
                 # Update session stats
@@ -853,10 +889,6 @@ class AgentLoop:
         # generate false negatives (e.g., read_file "failed" because it
         # didn't create a file).  Shell commands are also excluded because
         # lint-check failures are not meaningful against a creation step.
-        #
-        # Use fast rule-based assessment instead of LLM — the LLM cannot
-        # see file contents so it always returns "partial" with low
-        # confidence, which is pure noise and costs 15-24s per call.
         _ASSESSMENT_ALLOWLIST = {"write_file", "edit_file", "apply_patch", "multi_edit"}
         if (
             self.plan_manager.has_plan
@@ -865,26 +897,19 @@ class AgentLoop:
         ):
             active = self.plan_manager.plan.active_step
             if active is not None:
-                from coding_agent.agent.reflector import Assessment, ReflectionResult
-
-                if result.success:
-                    assessment = Assessment.SUCCESS
-                    reason = f"{pc['name']} succeeded — file was created/modified"
-                else:
-                    assessment = Assessment.FAILURE
-                    reason = f"{pc['name']} failed: {result.error or 'unknown error'}"
-                outcome_reflection = ReflectionResult(
-                    assessment=assessment,
-                    reason=reason,
-                    confidence=0.95,
+                outcome_reflection = await self.reflector.assess_outcome(
+                    pc["name"], pc["args"], result,
+                    expected_outcome=active.description,
+                    llm_client=self.llm_client,
                 )
-                logger.info(
-                    "outcome_assessment",
-                    tool=pc["name"],
-                    assessment=outcome_reflection.assessment,
-                    reason=outcome_reflection.reason,
-                    confidence=outcome_reflection.confidence,
-                )
+                if outcome_reflection.assessment.value != reflection.assessment.value:
+                    logger.info(
+                        "outcome_assessment",
+                        tool=pc["name"],
+                        assessment=outcome_reflection.assessment.value,
+                        reason=outcome_reflection.reason,
+                        confidence=outcome_reflection.confidence,
+                    )
 
         # Record in context engine
         self.context_engine.record_tool_result(

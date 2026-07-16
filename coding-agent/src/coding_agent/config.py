@@ -123,6 +123,14 @@ class Settings(BaseSettings):
         default=300, description="Max time per task in seconds"
     )
 
+    # Memory
+    max_memories: int = Field(
+        default=200, description="Max semantic memories per workspace"
+    )
+    memory_prune_threshold: float = Field(
+        default=0.1, description="Min importance score to keep during pruning"
+    )
+
     # Verification
     verify_after_edit: bool = Field(
         default=True, description="Run syntax/lint checks after file edits"

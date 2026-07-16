@@ -214,3 +214,69 @@ class TestSchemaMigration:
         sessions = await mgr2.list_sessions()
         assert len(sessions) == 1
         await mgr2.close()
+
+
+# ===================================================================
+# Memory CRUD tests
+# ===================================================================
+
+
+class TestMemoryCRUD:
+    async def test_save_and_get_memory(self, manager: SessionManager) -> None:
+        row_id = await manager.save_memory(
+            "User prefers dark mode",
+            memory_type="semantic",
+            workspace="test",
+            tags=["preference"],
+            importance=0.8,
+        )
+        assert row_id > 0
+        memories = await manager.get_memories(workspace="test")
+        assert len(memories) == 1
+        assert memories[0].content == "User prefers dark mode"
+        assert memories[0].importance == 0.8
+        assert memories[0].tags == ["preference"]
+
+    async def test_search_memories(self, manager: SessionManager) -> None:
+        await manager.save_memory("Python style guide", workspace="w")
+        await manager.save_memory("JavaScript conventions", workspace="w")
+        results = await manager.search_memories("Python", workspace="w")
+        assert len(results) == 1
+        assert "Python" in results[0].content
+
+    async def test_delete_memory(self, manager: SessionManager) -> None:
+        row_id = await manager.save_memory("To delete", workspace="w")
+        deleted = await manager.delete_memory(row_id)
+        assert deleted is True
+        memories = await manager.get_memories(workspace="w")
+        assert len(memories) == 0
+
+    async def test_update_memory(self, manager: SessionManager) -> None:
+        row_id = await manager.save_memory("Old content", workspace="w")
+        updated = await manager.update_memory(row_id, "New content")
+        assert updated is True
+        memories = await manager.get_memories(workspace="w")
+        assert memories[0].content == "New content"
+
+    async def test_touch_memory(self, manager: SessionManager) -> None:
+        row_id = await manager.save_memory("Touch me", workspace="w")
+        await manager.touch_memory(row_id)
+        await manager.touch_memory(row_id)
+        memories = await manager.get_memories(workspace="w")
+        assert memories[0].access_count == 2
+
+    async def test_count_memories(self, manager: SessionManager) -> None:
+        for i in range(5):
+            await manager.save_memory(f"Memory {i}", workspace="w")
+        count = await manager.count_memories(workspace="w")
+        assert count == 5
+
+    async def test_delete_memories_batch(self, manager: SessionManager) -> None:
+        ids = []
+        for i in range(5):
+            row_id = await manager.save_memory(f"Mem {i}", workspace="w")
+            ids.append(row_id)
+        deleted = await manager.delete_memories(ids[:3])
+        assert deleted == 3
+        remaining = await manager.get_memories(workspace="w")
+        assert len(remaining) == 2

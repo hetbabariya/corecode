@@ -205,7 +205,11 @@ async def _run_agent_clean(
 
     session_mgr = SessionManager(settings.get_db_path())
     await session_mgr.initialize()
-    memory_mgr = MemoryManager(session_mgr)
+    memory_mgr = MemoryManager(
+        session_mgr,
+        max_memories=settings.max_memories,
+        prune_threshold=settings.memory_prune_threshold,
+    )
 
     agent = AgentLoop(
         llm_client=llm_client,
@@ -217,6 +221,8 @@ async def _run_agent_clean(
         summary_llm_client=summary_client,
         memory_manager=memory_mgr,
         session_manager=session_mgr,
+        max_cost=settings.max_cost_per_session,
+        max_time=settings.max_time_per_task,
     )
 
     W = 60  # box width
@@ -325,6 +331,17 @@ async def _run_agent_clean(
                 for c in failed[:3]:
                     print(f"    \u2503     - [{c.get('tool', '?')}] {c.get('output', '')[:100]}")
 
+        elif event.type == EventType.REFLECTION:
+            assessment = d.get("assessment", "")
+            reason = d.get("reason", "")
+            tool_name = d.get("tool_name", "")
+            if assessment == "failure":
+                print(f"    \u2503   \u2717 reflect: {tool_name} \u2014 {reason}")
+            elif assessment == "partial":
+                print(f"    \u2503   \u26a0 reflect: {tool_name} \u2014 {reason}")
+            elif assessment == "success":
+                print(f"    \u2503   \u2713 reflect: {tool_name} \u2014 {reason}")
+
         elif event.type == EventType.STUCK_DETECTED:
             msg = d.get("message", "")
             strategy = d.get("strategy", "")
@@ -338,6 +355,18 @@ async def _run_agent_clean(
             action = d.get("action", "")
             if action == "replan_needed":
                 print(f"    \u2503   \u26a0 replan needed")
+            elif action == "replanned":
+                plan = d.get("plan", {})
+                goal = plan.get("goal", "") if isinstance(plan, dict) else ""
+                steps = plan.get("steps", []) if isinstance(plan, dict) else []
+                print(f"    \u2503   \u21bb plan replanned: {goal}")
+                for i, s in enumerate(steps[:5], 1):
+                    desc = s.get("description", "") if isinstance(s, dict) else str(s)
+                    print(f"    \u2503     {i}. {desc}")
+                if len(steps) > 5:
+                    print(f"    \u2503     ... +{len(steps) - 5} more steps")
+            elif action == "replan_failed":
+                print(f"    \u2503   \u2717 replanning failed")
 
         elif event.type == EventType.BUDGET_EXCEEDED:
             reason = d.get("reason", "")
@@ -479,7 +508,11 @@ async def _run_agent_raw(
 
     session_mgr = SessionManager(settings.get_db_path())
     await session_mgr.initialize()
-    memory_mgr = MemoryManager(session_mgr)
+    memory_mgr = MemoryManager(
+        session_mgr,
+        max_memories=settings.max_memories,
+        prune_threshold=settings.memory_prune_threshold,
+    )
 
     agent = AgentLoop(
         llm_client=llm_client,
@@ -491,12 +524,16 @@ async def _run_agent_raw(
         summary_llm_client=summary_client,
         memory_manager=memory_mgr,
         session_manager=session_mgr,
+        max_cost=settings.max_cost_per_session,
+        max_time=settings.max_time_per_task,
     )
 
     async for event in agent.process_input(prompt):
         d = _event_dict(event.data)
         if event.type == EventType.TEXT:
             print(str(event.data), end="", flush=True)
+        elif event.type == EventType.LOOP_START:
+            print(f"\n  [Iteration]")
         elif event.type == EventType.TOOL_START:
             name = d.get("name", "?")
             args_str = d.get("args", "")
@@ -506,6 +543,52 @@ async def _run_agent_raw(
         elif event.type == EventType.PERMISSION_REQUEST:
             name = d.get("tool_name", "?")
             print(f"\n  [Permission: {name}]")
+        elif event.type == EventType.PERMISSION_CHECK:
+            pass  # silent in raw mode
+        elif event.type == EventType.USAGE:
+            if isinstance(d, dict):
+                pt = d.get("prompt_tokens", 0)
+                ct = d.get("completion_tokens", 0)
+                if pt or ct:
+                    print(f"\n  [Usage: {pt} prompt + {ct} completion]")
+        elif event.type == EventType.CONTEXT_HEALTH:
+            ratio = d.get("usage_ratio", 0)
+            print(f"\n  [Context: {ratio:.0%}]")
+        elif event.type == EventType.VERIFICATION:
+            file_path = d.get("file_path", "")
+            checks = d.get("checks", [])
+            failed = [c for c in checks if not c.get("passed", True)]
+            if failed:
+                print(f"\n  [Verify FAIL: {file_path}]")
+                for c in failed[:3]:
+                    print(f"    - [{c.get('tool', '?')}] {c.get('output', '')[:100]}")
+        elif event.type == EventType.REFLECTION:
+            assessment = d.get("assessment", "")
+            reason = d.get("reason", "")
+            tool_name = d.get("tool_name", "")
+            print(f"\n  [Reflect: {tool_name} -> {assessment}: {reason}]")
+        elif event.type == EventType.STUCK_DETECTED:
+            msg = d.get("message", "")
+            print(f"\n  [STUCK: {msg}]")
+        elif event.type == EventType.ASK_USER:
+            msg = d.get("message", "")
+            print(f"\n  [ASK: {msg}]")
+        elif event.type == EventType.PLAN_UPDATE:
+            action = d.get("action", "")
+            if action == "replan_needed":
+                print(f"\n  [PLAN: replan needed]")
+            elif action == "replanned":
+                print(f"\n  [PLAN: replanned]")
+        elif event.type == EventType.BUDGET_EXCEEDED:
+            reason = d.get("reason", "")
+            if reason == "cost":
+                cost = d.get("cost", 0)
+                limit = d.get("limit", 0)
+                print(f"\n  [BUDGET: cost ${cost:.4f} / ${limit:.4f}]")
+            elif reason == "time":
+                elapsed = d.get("elapsed", 0)
+                limit = d.get("limit", 0)
+                print(f"\n  [BUDGET: time {elapsed:.0f}s / {limit}s]")
         elif event.type == EventType.DONE:
             print("\n")
         elif event.type == EventType.ERROR:

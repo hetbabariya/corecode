@@ -1,5 +1,7 @@
 """Tests for agent.planner module."""
 
+from pathlib import Path
+
 import pytest
 
 from coding_agent.agent.planner import Plan, PlanManager, PlanStatus, PlanStep, StepStatus
@@ -248,3 +250,66 @@ class TestPlanManager:
         m.create_plan("Test", ["A"])
         with pytest.raises(IndexError):
             m.start_step(-1)
+
+
+# ---------------------------------------------------------------------------
+# Plan persistence (D.3)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanPersistence:
+    """Tests for PlanManager save/load via SessionManager."""
+
+    @pytest.mark.asyncio
+    async def test_save_and_load_plan(self):
+        from coding_agent.session.manager import SessionManager
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sm = SessionManager(Path(tmp) / "test.db")
+            await sm.initialize()
+            try:
+                m = PlanManager()
+                m.create_plan("Test goal", ["Step A", "Step B"])
+                m.start_step(0)
+                m.complete_step(0, "done")
+
+                plan_id = await m.save(sm, "workspace1")
+                assert plan_id > 0
+
+                # Load in a fresh PlanManager
+                m2 = PlanManager()
+                data = await sm.load_active_plan("workspace1")
+                assert data is not None
+                loaded = m2.load_from_dict(data)
+                assert loaded is True
+                assert m2.plan is not None
+                assert m2.plan.goal == "Test goal"
+                assert len(m2.plan.steps) == 2
+            finally:
+                await sm.close()
+
+    @pytest.mark.asyncio
+    async def test_load_from_dict_empty(self):
+        m = PlanManager()
+        assert m.load_from_dict({}) is False
+        assert m.load_from_dict({"steps": []}) is False
+
+    @pytest.mark.asyncio
+    async def test_load_from_dict_with_steps(self):
+        m = PlanManager()
+        data = {
+            "goal": "Loaded goal",
+            "steps": [
+                {"description": "S1", "status": "completed", "result": "ok"},
+                {"description": "S2", "status": "pending", "result": ""},
+            ],
+            "current_step": 1,
+            "status": "executing",
+        }
+        assert m.load_from_dict(data) is True
+        assert m.plan is not None
+        assert m.plan.goal == "Loaded goal"
+        assert m.plan.steps[0].status == StepStatus.COMPLETED
+        assert m.plan.steps[1].status == StepStatus.PENDING
+        assert m.plan.current_step == 1
