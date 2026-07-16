@@ -25,6 +25,7 @@ DYNAMIC_BOUNDARY = "__DYNAMIC_BOUNDARY__"
 # Module-level cache for the static prompt (rebuilt only when model changes).
 _STATIC_CACHE: str | None = None
 _STATIC_CACHE_MODEL: str | None = None
+_STATIC_CACHE_VERSION: int = 3  # bump when prompt content changes
 
 
 # ============================================================================
@@ -74,7 +75,9 @@ def _tool_rules_section() -> str:
   - Search different patterns simultaneously
   - Run independent checks in parallel
 
-- **Batch reads**: If you need 5 files, read all 5 at once, not one by one."""
+- **Batch reads**: If you need 5 files, read all 5 at once, not one by one.
+
+- **Remember important facts.** When the user mentions preferences, project conventions, API keys, or decisions, call `remember` to persist them. Set `importance` (0.0-1.0) and `tags` so they surface first when recalled."""
 
 
 def _code_editing_section() -> str:
@@ -254,18 +257,23 @@ def _planning_section() -> str:
     return """\
 ## Planning
 
-For multi-step tasks, use the planning tools:
+**Always create a plan first** unless the task is a single atomic action (one file read, one line edit).
 
 1. **Create a plan first.** Call `create_plan` with a goal and ordered steps.
-2. **Track progress.** Call `update_plan` to mark steps as in_progress, done, or failed.
+2. **Track progress.** Call `update_plan` with `step_index` and `status` to mark steps:
+   - `"in_progress"` when you start working on a step
+   - `"completed"` immediately after the step succeeds (edit applied, test passed, etc.)
+   - `"failed"` if the step cannot be completed
 3. **Replan on failure.** If a step fails, assess whether to retry or create a new plan.
+
+**IMPORTANT:** You MUST call `update_plan` with `status: "completed"` after each step finishes. Do not skip this — the system tracks progress and will detect stalls if steps are never marked done.
 
 A good plan has:
 - Clear, actionable steps (not vague)
 - 3-10 steps (fewer for simple tasks, more for complex ones)
 - Each step produces a verifiable result
 
-Don't over-plan. For simple tasks (read a file, make one edit), skip planning and just act."""
+**Rule of thumb:** If the task involves more than 2 tool calls, create a plan. Reading a directory, reading multiple files, making edits, running tests — these are all multi-step tasks that need a plan."""
 
 
 def build_static_prompt(model: str = "") -> str:
@@ -307,7 +315,7 @@ def get_static_prompt(model: str = "") -> str:
     if _STATIC_CACHE is None or _STATIC_CACHE_MODEL != model:
         _STATIC_CACHE = build_static_prompt(model=model)
         _STATIC_CACHE_MODEL = model
-        logger.debug("static_prompt_cache_miss", model=model)
+        logger.debug("static_prompt_cache_miss", model=model, version=_STATIC_CACHE_VERSION)
     else:
         logger.debug("static_prompt_cache_hit", model=model)
     return _STATIC_CACHE

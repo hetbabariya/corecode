@@ -180,9 +180,76 @@ class AgentLoop:
         self._bg_tasks: set[asyncio.Task[None]] = set()
         self._summarize_lock = asyncio.Lock()
 
+        # Session cleanup guard — ensures one-time cleanup on exit
+        self._cleanup_done = False
+
         # Build and inject the system prompt
         self._cached_system_prompt: str | None = None
         self.context.system_prompt = self._build_system_prompt_cached()
+
+    async def _run_session_cleanup(
+        self, last_text: str = "", iteration: int = 0,
+    ) -> None:
+        """Run one-time session cleanup: episodic memory, consolidation, pruning, plan save, stats.
+
+        Safe to call multiple times — guarded by ``_cleanup_done``.
+        """
+        if self._cleanup_done:
+            return
+        self._cleanup_done = True
+
+        duration = time.monotonic() - self._start_time if self._start_time else 0.0
+        logger.info(
+            "agent_session_end",
+            duration_s=round(duration, 1),
+            iterations=iteration,
+            tool_count=self._tool_count,
+            total_cost=round(self._accumulated_cost, 4),
+            status="completed",
+        )
+        self.metrics["tool_count"] = self._tool_count
+        logger.info(
+            "session_metrics",
+            **{k: v for k, v in self.metrics.items()},  # type: ignore[arg-type]
+        )
+        print(self.get_metrics_summary())
+
+        # Save episodic memory (session summary)
+        if self.memory_manager is not None:
+            summary = self._build_session_summary(last_text, iteration)
+            await self.memory_manager.save_episodic(
+                summary,
+                workspace=str(self.workspace),
+                session_id=self.session_id,
+            )
+            # Consolidate similar memories (D.1)
+            await self.memory_manager.consolidate_memories(
+                workspace=str(self.workspace),
+            )
+            # Prune low-value memories (D.4)
+            await self.memory_manager.prune_memories(
+                workspace=str(self.workspace),
+            )
+
+        # Save active plan state (D.3)
+        if (
+            self.plan_manager is not None
+            and self.session_manager is not None
+            and self.plan_manager.has_plan
+        ):
+            await self.plan_manager.save(
+                self.session_manager,
+                str(self.workspace),
+            )
+
+        # Update session stats
+        if self.session_manager is not None and self.session_id is not None:
+            usage = self.llm_client.total_usage
+            await self.session_manager.update_session_stats(
+                self.session_id,
+                tokens=usage.total_tokens,
+                cost=usage.estimated_cost,
+            )
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -281,6 +348,7 @@ class AgentLoop:
                     type=EventType.MAX_ITERATIONS,
                     data={"reason": "safety_net", "iteration": _iteration},
                 )
+                await self._run_session_cleanup("", _iteration)
                 return
 
             # --- Check user-configured limit (0 = unlimited) ---
@@ -297,6 +365,7 @@ class AgentLoop:
                     type=EventType.MAX_ITERATIONS,
                     data={"reason": "user_limit", "iteration": _iteration},
                 )
+                await self._run_session_cleanup("", _iteration)
                 return
 
             # --- Check budget ---
@@ -318,6 +387,7 @@ class AgentLoop:
                         "iteration": _iteration,
                     },
                 )
+                await self._run_session_cleanup("", _iteration)
                 return
             if self._accumulated_cost >= self.max_cost:
                 logger.warning(
@@ -336,6 +406,7 @@ class AgentLoop:
                         "iteration": _iteration,
                     },
                 )
+                await self._run_session_cleanup("", _iteration)
                 return
 
             # --- Inject plan state into system prompt ---
@@ -380,6 +451,7 @@ class AgentLoop:
                         type=EventType.ASK_USER,
                         data={"message": stuck_msg},
                     )
+                    await self._run_session_cleanup("", _iteration)
                     return
                 else:
                     yield AgentEvent(
@@ -468,60 +540,7 @@ class AgentLoop:
                             },
                         )
 
-                duration = time.monotonic() - self._start_time
-                logger.info(
-                    "agent_session_end",
-                    duration_s=round(duration, 1),
-                    iterations=_iteration,
-                    tool_count=self._tool_count,
-                    total_cost=round(self._accumulated_cost, 4),
-                    status="completed",
-                )
-                # Log Phase A metrics
-                self.metrics["tool_count"] = self._tool_count
-                logger.info(
-                    "session_metrics",
-                    **{k: v for k, v in self.metrics.items()},  # type: ignore[arg-type]
-                )
-                print(self.get_metrics_summary())
-
-                # Save episodic memory (session summary)
-                if self.memory_manager is not None:
-                    summary = self._build_session_summary(full_text, _iteration)
-                    await self.memory_manager.save_episodic(
-                        summary,
-                        workspace=str(self.workspace),
-                        session_id=self.session_id,
-                    )
-                    # Consolidate similar memories (D.1)
-                    await self.memory_manager.consolidate_memories(
-                        workspace=str(self.workspace),
-                    )
-                    # Prune low-value memories (D.4)
-                    await self.memory_manager.prune_memories(
-                        workspace=str(self.workspace),
-                    )
-
-                # Save active plan state (D.3)
-                if (
-                    self.plan_manager is not None
-                    and self.session_manager is not None
-                    and self.plan_manager.has_plan
-                ):
-                    await self.plan_manager.save(
-                        self.session_manager,
-                        str(self.workspace),
-                    )
-
-                # Update session stats
-                if self.session_manager is not None and self.session_id is not None:
-                    usage = self.llm_client.total_usage
-                    await self.session_manager.update_session_stats(
-                        self.session_id,
-                        tokens=usage.total_tokens,
-                        cost=usage.estimated_cost,
-                    )
-
+                await self._run_session_cleanup(full_text, _iteration)
                 yield AgentEvent(type=EventType.DONE)
                 return
 
@@ -897,19 +916,31 @@ class AgentLoop:
         ):
             active = self.plan_manager.plan.active_step
             if active is not None:
-                outcome_reflection = await self.reflector.assess_outcome(
-                    pc["name"], pc["args"], result,
-                    expected_outcome=active.description,
-                    llm_client=self.llm_client,
-                )
-                if outcome_reflection.assessment.value != reflection.assessment.value:
-                    logger.info(
-                        "outcome_assessment",
+                # Skip LLM call when rule-based heuristic already says success
+                # with high confidence — saves ~15-30s per file write
+                if (
+                    reflection.assessment == Assessment.SUCCESS
+                    and reflection.confidence >= 0.8
+                ):
+                    logger.debug(
+                        "outcome_assessment_skipped",
                         tool=pc["name"],
-                        assessment=outcome_reflection.assessment.value,
-                        reason=outcome_reflection.reason,
-                        confidence=outcome_reflection.confidence,
+                        reason="rule_based_success",
                     )
+                else:
+                    outcome_reflection = await self.reflector.assess_outcome(
+                        pc["name"], pc["args"], result,
+                        expected_outcome=active.description,
+                        llm_client=self.llm_client,
+                    )
+                    if outcome_reflection.assessment.value != reflection.assessment.value:
+                        logger.info(
+                            "outcome_assessment",
+                            tool=pc["name"],
+                            assessment=outcome_reflection.assessment.value,
+                            reason=outcome_reflection.reason,
+                            confidence=outcome_reflection.confidence,
+                        )
 
         # Record in context engine
         self.context_engine.record_tool_result(
