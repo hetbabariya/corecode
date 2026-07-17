@@ -352,12 +352,14 @@ def _environment_section(
 
 
 def _project_context_section(workspace: Path) -> str:
-    """Section 10: project-specific context (AGENTS.md, README.md)."""
+    """Section 10: project-specific context (AGENTS.md hierarchy + README.md)."""
+    from coding_agent.agent.agents_md import load_agents_hierarchy
+
     parts: list[str] = []
 
-    agents_md = _load_project_file(workspace, "AGENTS.md")
+    agents_md = load_agents_hierarchy(workspace)
     if agents_md:
-        parts.append(f"## Project Instructions (AGENTS.md)\n\n{agents_md}")
+        parts.append(f"## Project Instructions\n\n{agents_md}")
 
     readme = _load_project_file(workspace, "README.md")
     if readme:

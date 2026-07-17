@@ -23,9 +23,9 @@
 
 ### Phase C — Intelligence
 - [ ] C.1 Subagent Delegation
-- [ ] C.2 Session Resumption
-- [ ] C.3 CLAUDE.md Hierarchy (AGENTS.md Hierarchy)
-- [ ] C.4 Slash Commands
+- [x] C.2 Session Resumption
+- [x] C.3 CLAUDE.md Hierarchy (AGENTS.md Hierarchy)
+- [x] C.4 Slash Commands
 - [x] C.5 Context Window Sliding
 - [x] C.6 Intent Re-injection After Failures
 

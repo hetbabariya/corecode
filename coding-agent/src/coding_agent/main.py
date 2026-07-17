@@ -648,17 +648,56 @@ async def _run_agent_raw(
     await session_mgr.close()
 
 
+async def _resolve_session_id(workspace: Path, session_id: str | None) -> str | None:
+    """Resolve session ID from --resume or --continue flags.
+
+    If *session_id* is given, validate it exists. Otherwise find the most
+    recent session for the current workspace.
+    """
+    from coding_agent.config import Settings
+    from coding_agent.session.manager import SessionManager
+
+    settings = Settings()
+    mgr = SessionManager(settings.get_db_path())
+    await mgr.initialize()
+
+    if session_id:
+        info = await mgr.get_session(session_id)
+        await mgr.close()
+        if info is None:
+            typer.echo(f"Session {session_id} not found.", err=True)
+            return None
+        return session_id
+
+    # --continue: find most recent session for this workspace
+    sessions = await mgr.list_sessions(limit=50)
+    await mgr.close()
+
+    ws_str = str(workspace.resolve())
+    for s in sessions:
+        if s.workspace == ws_str:
+            return s.id
+    # Fallback: most recent session overall
+    return sessions[0].id if sessions else None
+
+
 @app.command()
 def repl(
     workspace: Path = Path("."),
     permission: str = typer.Option("auto", help="Permission mode: auto, confirm, deny"),
     log_level: str = typer.Option("INFO", help="Log level"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug-level logging"),
+    resume: str | None = typer.Option(None, "--resume", "-r", help="Resume session by ID (or most recent if no ID)"),
+    continue_last: bool = typer.Option(False, "--continue", "-c", help="Continue most recent session"),
 ) -> None:
     """Start an interactive REPL session.
 
     Use Ctrl+D to exit, Ctrl+C to interrupt, Ctrl+L to clear.
+    Use --resume/-r to resume a session (most recent, or specify ID).
+    Use --continue/-c to continue the most recent session.
     """
+    import asyncio as _asyncio
+
     from coding_agent.config import Settings
     from coding_agent.logging import setup_logging
 
@@ -666,9 +705,106 @@ def repl(
     log_file = Settings().log_file
     setup_logging(level=effective_level, log_file=log_file)
 
+    session_id = None
+    if continue_last or resume is not None:
+        session_id = _asyncio.run(_resolve_session_id(workspace, resume))
+
     from coding_agent.tui.repl import run_repl
 
-    run_repl(workspace=workspace, permission=permission)
+    run_repl(workspace=workspace, permission=permission, session_id=session_id)
+
+
+@app.command()
+def resume(
+    workspace: Path = Path("."),
+    session_id: str | None = typer.Argument(None, help="Session ID to resume (interactive if omitted)"),
+    permission: str = typer.Option("auto", help="Permission mode: auto, confirm, deny"),
+) -> None:
+    """Resume a previous session interactively.
+
+    If no session ID is provided, shows a numbered list to pick from.
+    """
+    import asyncio as _asyncio
+
+    from coding_agent.config import Settings
+    from coding_agent.session.manager import SessionManager
+
+    settings = Settings()
+    mgr = SessionManager(settings.get_db_path())
+
+    async def _pick_session() -> str | None:
+        await mgr.initialize()
+        sessions = await mgr.list_sessions(limit=30)
+        await mgr.close()
+
+        if not sessions:
+            typer.echo("No sessions found.")
+            return None
+
+        if session_id:
+            # Validate provided ID
+            info = None
+            for s in sessions:
+                if s.id == session_id:
+                    info = s
+                    break
+            if info is None:
+                typer.echo(f"Session {session_id} not found.")
+                return None
+            return session_id
+
+        # Interactive picker
+        typer.echo()
+        typer.echo(f"  {'#':<4} {'ID':<14} {'Date':<20} {'Model':<25} {'Tokens':>10} {'Summary'}")
+        typer.echo("  " + "\u2500" * 95)
+
+        for i, s in enumerate(sessions, 1):
+            date = s.created_at[:16].replace("T", " ") if s.created_at else "?"
+            model = (s.model or "?")[:24]
+            tokens = f"{s.total_tokens:,}" if s.total_tokens else "0"
+            summary = (s.summary or "(no summary)")[:30]
+            typer.echo(f"  {i:<4} {s.id:<14} {date:<20} {model:<25} {tokens:>10}  {summary}")
+
+        typer.echo()
+        try:
+            choice = typer.prompt("Pick a session number (or 'q' to quit)")
+            if choice.strip().lower() == "q":
+                return None
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                return sessions[idx].id
+            typer.echo("Invalid selection.")
+            return None
+        except (ValueError, typer.Abort):
+            return None
+
+    resolved = _asyncio.run(_pick_session())
+    if resolved is None:
+        raise typer.Exit(0)
+
+    typer.echo(f"\n  Resuming session {resolved}...\n")
+    from coding_agent.tui.repl import run_repl
+    run_repl(workspace=workspace, permission=permission, session_id=resolved)
+
+
+@app.command()
+def browse(
+    workspace: Path = Path("."),
+    permission: str = typer.Option("auto", help="Permission mode: auto, confirm, deny"),
+) -> None:
+    """Browse and resume sessions with a visual TUI interface.
+
+    Opens a session browser where you can search, filter, and pick sessions.
+    """
+    from coding_agent.tui.browser import run_browser
+
+    session_id = run_browser(workspace=workspace)
+    if session_id is None:
+        raise typer.Exit(0)
+
+    typer.echo(f"\n  Resuming session {session_id}...\n")
+    from coding_agent.tui.repl import run_repl
+    run_repl(workspace=workspace, permission=permission, session_id=session_id)
 
 
 @app.command()

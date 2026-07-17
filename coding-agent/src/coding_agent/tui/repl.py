@@ -11,8 +11,9 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, Input
 
-from coding_agent.tui.theme import REPL_CSS, create_nord_theme
+from coding_agent.commands import CommandContext, get_registry
 from coding_agent.logging import logger
+from coding_agent.tui.theme import REPL_CSS, create_nord_theme
 from coding_agent.tui.widgets import (
     AssistantMessage,
     StatusBar,
@@ -43,11 +44,13 @@ class CodingAgentREPL(App[None]):
         self,
         workspace: Path = Path("."),
         permission: str = "auto",
+        session_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.workspace = workspace
         self.permission = permission
+        self._resume_session_id = session_id
         self._agent: Any = None
         self._current_assistant: AssistantMessage | None = None
         self._current_tool: ToolCallBlock | None = None
@@ -78,6 +81,9 @@ class CodingAgentREPL(App[None]):
         self.theme = "coding-agent"
         await self._init_agent()
         self._update_toolbar_undo()
+        self._load_custom_commands()
+        if self._resume_session_id:
+            await self._restore_session(self._resume_session_id)
         self.query_one("#input").focus()
 
     async def _init_agent(self) -> None:
@@ -179,6 +185,62 @@ class CodingAgentREPL(App[None]):
 
         # Update subtitle
         self.sub_title = f"{model} \u2502 {self.workspace.name}"
+
+    def _load_custom_commands(self) -> None:
+        """Load custom commands from .coding-agent/commands/ directories."""
+        from coding_agent.commands import get_registry
+
+        registry = get_registry()
+        global_commands = Path.home() / ".coding-agent" / "commands"
+        local_commands = self.workspace / ".coding-agent" / "commands"
+        count = registry.load_custom_commands(global_commands, local_commands)
+        if count:
+            logger.info("custom_commands_loaded", count=count)
+
+    async def _restore_session(self, session_id: str) -> None:
+        """Load and display messages from a previous session."""
+        if not self._agent or not self._agent.session_manager:
+            self._show_system("Session persistence not available.", "error")
+            return
+
+        messages = await self._agent.session_manager.load_session(session_id)
+        if not messages:
+            self._show_system(f"Session {session_id} has no messages.", "warning")
+            return
+
+        # Rebuild context from loaded messages
+        for msg in messages:
+            if msg.role == "user":
+                self._agent.context.add_user_message(msg.content)
+            elif msg.role == "assistant":
+                self._agent.context.add_assistant_message(msg.content, msg.tool_calls)
+            elif msg.role == "tool" and msg.tool_call_id:
+                self._agent.context.add_tool_result(
+                    msg.tool_call_id, msg.name or "", msg.content,
+                )
+
+        # Point agent at the same session so new messages are appended
+        self._agent.session_id = session_id
+
+        # Display previous messages in the chat view
+        chat_view = self.query_one("#chat-view")
+        for msg in messages:
+            if msg.role == "user":
+                await chat_view.mount(UserMessage(msg.content))
+            elif msg.role == "assistant" and msg.content:
+                widget = AssistantMessage()
+                widget._text = msg.content
+                await chat_view.mount(widget)
+        chat_view.scroll_end(animate=False)
+
+        # Show resume summary
+        info = await self._agent.session_manager.get_session(session_id)
+        if info:
+            date = info.created_at[:10] if info.created_at else "?"
+            self._show_system(
+                f"Resumed session {session_id} from {date}. {len(messages)} messages loaded.",
+                "info",
+            )
 
     @work
     async def _process_input(self, user_input: str) -> None:
@@ -474,52 +536,14 @@ class CodingAgentREPL(App[None]):
         )
 
     async def _handle_command(self, command: str) -> bool:
-        """Handle slash commands. Returns True if command was handled."""
-        from coding_agent.agent.permissions import PermissionMode
-
-        parts = command.split(maxsplit=1)
-        cmd = parts[0].lower()
-        arg = parts[1].strip() if len(parts) > 1 else ""
-
-        if cmd == "/permissions":
-            if not self._agent:
-                self._show_system("Agent not initialized", "error")
-                return True
-
-            pm = self._agent.permissions
-
-            if not arg:
-                # Show current mode
-                mode = pm.mode.value
-                self._show_system(f"Current permission mode: {mode}", "info")
-                return True
-
-            # Try to parse mode
-            mode_map = {m.value: m for m in PermissionMode}
-            # Also accept short aliases
-            mode_map[">"] = PermissionMode.DEFAULT
-            mode_map[">>"] = PermissionMode.ACCEPT_EDITS
-            mode_map["?"] = PermissionMode.PLAN
-            mode_map["!"] = PermissionMode.BYPASS
-
-            mode = mode_map.get(arg)
-            if mode is None:
-                valid = ", ".join(m.value for m in PermissionMode)
-                self._show_system(
-                    f"Unknown mode: {arg}. Options: {valid}",
-                    "error",
-                )
-                return True
-
-            warning = pm.set_mode(mode, str(self.workspace))
-            self._show_system(f"Permission mode: {mode.value}", "info")
-            if warning:
-                self._show_system(warning, "warning")
-            logger.info("permission_mode_changed", mode=mode.value, workspace=str(self.workspace))
-            return True
-
-        # Unknown command — don't handle, let it pass through to agent
-        return False
+        """Handle slash commands via the registry. Returns True if handled."""
+        registry = get_registry()
+        ctx = CommandContext(agent=self._agent, workspace=self.workspace, repl=self)
+        result = await registry.execute(command, ctx)
+        if result is None:
+            return False
+        self._show_system(result, "info")
+        return True
 
     async def action_undo(self) -> None:
         """Undo the last file mutation."""
@@ -597,7 +621,10 @@ class CodingAgentREPL(App[None]):
 def run_repl(
     workspace: Path = Path("."),
     permission: str = "auto",
+    session_id: str | None = None,
 ) -> None:
     """Run the interactive REPL."""
-    app = CodingAgentREPL(workspace=workspace, permission=permission)
+    app = CodingAgentREPL(
+        workspace=workspace, permission=permission, session_id=session_id,
+    )
     app.run()
