@@ -16,7 +16,7 @@ from coding_agent.logging import logger
 from coding_agent.sandbox.protected_paths import is_protected_path
 from coding_agent.tools.base import ToolResult
 from coding_agent.tools.registry import tool
-from coding_agent.tools.undo import get_undo_stack
+from coding_agent.tools.undo import get_undo_manager
 from coding_agent.agent.undo import UndoEntry
 
 # Directories always excluded from listing
@@ -48,10 +48,10 @@ def _check_protected_path(path: Path) -> ToolResult | None:
 
 
 def _push_undo(tool_name: str, file_path: str, before: str, after: str, desc: str = "") -> None:
-    """Push an undo entry if the undo stack is available."""
-    stack = get_undo_stack()
-    if stack is not None:
-        stack.push(UndoEntry(
+    """Push an undo entry if the undo manager is available."""
+    manager = get_undo_manager()
+    if manager is not None:
+        manager.push(UndoEntry(
             tool_name=tool_name,
             file_path=file_path,
             before=before,

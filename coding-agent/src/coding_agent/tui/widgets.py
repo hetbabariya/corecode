@@ -224,25 +224,28 @@ class StatusBar(Static):
 
 
 class Toolbar(Static):
-    """Toolbar with undo/redo buttons and checkpoint info."""
+    """Toolbar with undo/redo buttons and state info."""
 
-    _last_checkpoint: reactive[str] = reactive("")
     _can_undo: reactive[bool] = reactive(False)
     _can_redo: reactive[bool] = reactive(False)
+    _undo_count: reactive[int] = reactive(0)
+    _redo_count: reactive[int] = reactive(0)
 
-    def set_checkpoint(self, checkpoint_id: str, can_undo: bool = True) -> None:
-        """Update checkpoint info."""
-        self._last_checkpoint = checkpoint_id
+    def update_undo_state(self, can_undo: bool, can_redo: bool, undo_count: int = 0, redo_count: int = 0) -> None:
+        """Update the undo/redo state displayed in the toolbar."""
         self._can_undo = can_undo
-        self._can_redo = False
+        self._can_redo = can_redo
+        self._undo_count = undo_count
+        self._redo_count = redo_count
 
     def render(self) -> Text:
         text = Text()
 
         # Undo button
         if self._can_undo:
+            label = f"Ctrl+Z Undo ({self._undo_count})"
             text.append(" [", style="dim")
-            text.append("Ctrl+Z Undo", style=f"bold {_NORD['primary']}")
+            text.append(label, style=f"bold {_NORD['primary']}")
             text.append("]", style="dim")
         else:
             text.append(" [", style="dim")
@@ -253,17 +256,13 @@ class Toolbar(Static):
 
         # Redo button
         if self._can_redo:
+            label = f"Ctrl+Y Redo ({self._redo_count})"
             text.append("[", style="dim")
-            text.append("Ctrl+Y Redo", style=f"bold {_NORD['primary']}")
+            text.append(label, style=f"bold {_NORD['primary']}")
             text.append("]", style="dim")
         else:
             text.append("[", style="dim")
             text.append("Ctrl+Y Redo", style=f"dim {_NORD['dim']}")
             text.append("]", style="dim")
-
-        # Checkpoint info
-        if self._last_checkpoint:
-            text.append("  \u2502 ", style="dim")
-            text.append(f"cp: {self._last_checkpoint}", style=f"bold {_NORD['accent']}")
 
         return text

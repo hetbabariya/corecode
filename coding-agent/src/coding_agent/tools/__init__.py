@@ -1,7 +1,6 @@
 """Tool system — registry, base types, and schema inference."""
 
 from coding_agent.tools import (
-    checkpoint_tool,  # noqa: F401 — registers checkpoint tools
     file_ops,  # noqa: F401 — registers file tools
     git,  # noqa: F401 — registers git tools
     memory,  # noqa: F401 — registers memory tools
@@ -26,7 +25,6 @@ __all__ = [
     "FunctionTool",
     "ToolRegistry",
     "ToolResult",
-    "checkpoint_tool",
     "file_ops",
     "git",
     "infer_schema",

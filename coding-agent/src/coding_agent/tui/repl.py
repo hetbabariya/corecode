@@ -254,20 +254,17 @@ class CodingAgentREPL(App[None]):
                         "warning",
                     )
 
-                elif event.type == EventType.CHECKPOINT:
+                elif event.type == EventType.UNDO_PUSH:
                     data = event.data if isinstance(event.data, dict) else {}
-                    checkpoint_id = data.get("checkpoint_id", "")
-                    label = data.get("label", "")
-                    tool = data.get("tool", "")
+                    file_path = data.get("file_path", "")
+                    tool_name = data.get("tool_name", "")
                     self.call_from_thread(
                         self._show_system,
-                        f"Checkpoint: {checkpoint_id} ({label}) before {tool}",
-                        "warning",
+                        f"Undoable: {tool_name} on {file_path}",
+                        "info",
                     )
-                    # Update toolbar with checkpoint info
-                    self.call_from_thread(
-                        self._update_toolbar_checkpoint, checkpoint_id
-                    )
+                    # Update toolbar undo state
+                    self.call_from_thread(self._update_toolbar_undo)
 
                 elif event.type == EventType.CONTEXT_HEALTH:
                     data = event.data if isinstance(event.data, dict) else {}
@@ -353,10 +350,18 @@ class CodingAgentREPL(App[None]):
         chat_view.mount(SystemMessage(message, level=level))
         chat_view.scroll_end(animate=False)
 
-    def _update_toolbar_checkpoint(self, checkpoint_id: str) -> None:
-        """Update the toolbar with checkpoint info."""
-        toolbar = self.query_one("#toolbar", Toolbar)
-        toolbar.set_checkpoint(checkpoint_id, can_undo=True)
+    def _update_toolbar_undo(self) -> None:
+        """Update the toolbar with undo/redo state."""
+        from coding_agent.agent.undo import get_undo_manager
+        manager = get_undo_manager()
+        if manager:
+            toolbar = self.query_one("#toolbar", Toolbar)
+            toolbar.update_undo_state(
+                can_undo=manager.can_undo,
+                can_redo=manager.can_redo,
+                undo_count=manager.undo_count,
+                redo_count=manager.redo_count,
+            )
 
     def _update_status(self) -> None:
         """Update the status bar."""
@@ -427,40 +432,76 @@ class CodingAgentREPL(App[None]):
         )
 
     async def action_undo(self) -> None:
-        """Undo the last change by restoring to previous checkpoint."""
+        """Undo the last file mutation."""
         if self._processing:
             return
 
         import asyncio
+        from coding_agent.agent.undo import get_undo_manager, UndoManager
+
+        manager = get_undo_manager()
+        if not manager:
+            self._show_system("Undo system not available.", "error")
+            return
+
+        def _do_undo() -> tuple[bool, str]:
+            entry = manager.undo()
+            if entry is None:
+                return False, ""
+            try:
+                UndoManager.apply_entry(entry, redo=False)
+                desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
+                return True, desc
+            except Exception as e:
+                # Re-push on failure so the entry isn't lost
+                manager.push(entry)
+                raise
 
         try:
-            from coding_agent.sandbox.checkpoint import CheckpointManager
-
-            def _do_undo() -> tuple[bool, str]:
-                manager = CheckpointManager(self.workspace)
-                checkpoint = manager.undo()
-                if checkpoint:
-                    return True, f"{checkpoint.id} - {checkpoint.label}"
-                return False, ""
-
-            success, info = await asyncio.to_thread(_do_undo)
+            success, desc = await asyncio.to_thread(_do_undo)
             if success:
-                self._show_system(
-                    f"Undone to checkpoint: {info}",
-                    "warning",
-                )
-                # Update toolbar
-                checkpoint_id = info.split(" - ")[0]
-                toolbar = self.query_one("#toolbar", Toolbar)
-                toolbar.set_checkpoint(checkpoint_id, can_undo=True)
+                self._show_system(f"Undone: {desc}", "warning")
+                self.call_from_thread(self._update_toolbar_undo)
             else:
                 self._show_system("Nothing to undo.", "info")
         except Exception as e:
             self._show_system(f"Undo failed: {e}", "error")
 
-    def action_redo(self) -> None:
-        """Redo is not fully supported yet."""
-        self._show_system("Redo is not fully supported yet.", "info")
+    async def action_redo(self) -> None:
+        """Redo the last undone mutation."""
+        if self._processing:
+            return
+
+        import asyncio
+        from coding_agent.agent.undo import get_undo_manager, UndoManager
+
+        manager = get_undo_manager()
+        if not manager:
+            self._show_system("Undo system not available.", "error")
+            return
+
+        def _do_redo() -> tuple[bool, str]:
+            entry = manager.redo()
+            if entry is None:
+                return False, ""
+            try:
+                UndoManager.apply_entry(entry, redo=True)
+                desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
+                return True, desc
+            except Exception as e:
+                # Re-push on failure so the entry isn't lost
+                manager.push(entry)
+                raise
+
+        try:
+            success, desc = await asyncio.to_thread(_do_redo)
+            if success:
+                self._show_system(f"Redone: {desc}", "warning")
+                self.call_from_thread(self._update_toolbar_undo)
+            else:
+                self._show_system("Nothing to redo.", "info")
+        except Exception as e:
+            self._show_system(f"Redo failed: {e}", "error")
 
 
 def run_repl(

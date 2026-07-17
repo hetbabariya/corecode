@@ -444,6 +444,7 @@ class TestPermissionBypassFix:
             "summarize_count", "summarize_success", "summarize_fail",
             "summarize_duration_ms", "context_suggestion_count",
             "token_estimate_calls", "prompt_cache_hits", "prompt_cache_misses",
+            "micro_compact_count",
         }
         assert expected_keys == set(agent.metrics.keys())
 

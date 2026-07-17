@@ -24,6 +24,10 @@ class TestEventType:
             "ask_user",
             "context_health",
             "reflection",
+            "max_tokens_recovery",
+            "reactive_compact",
+            "micro_compact",
+            "undo_push",
         }
         actual = {e.value for e in EventType}
         assert actual == expected

@@ -333,11 +333,10 @@ async def _run_agent_clean(
         elif event.type == EventType.MAX_TOKENS_RECOVERY:
             print(f"    \u2503   \u26a0 max tokens recovery triggered")
 
-        elif event.type == EventType.CHECKPOINT:
-            checkpoint_id = d.get("checkpoint_id", "")
-            label = d.get("label", "")
-            tool = d.get("tool", "")
-            print(f"    \u2503   \u26a0 checkpoint: {checkpoint_id} ({label}) before {tool}")
+        elif event.type == EventType.UNDO_PUSH:
+            file_path = d.get("file_path", "")
+            tool_name = d.get("tool_name", "")
+            print(f"    \u2503   \u21a9 undoable: {tool_name} on {file_path}")
 
         elif event.type == EventType.VERIFICATION:
             file_path = d.get("file_path", "")
@@ -714,25 +713,26 @@ def history(
 
 @app.command()
 def checkpoints(
-    limit: int = typer.Option(20, "--limit", "-n", help="Number of checkpoints to show"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of entries to show"),
 ) -> None:
-    """List available checkpoints."""
-    from coding_agent.sandbox.checkpoint import CheckpointManager
+    """List undo history."""
+    from coding_agent.agent.undo import UndoManager
 
     try:
-        manager = CheckpointManager(".")
-        checkpoints = manager.list_checkpoints(limit)
-        if not checkpoints:
-            typer.echo("No checkpoints found.")
+        manager = UndoManager(".")
+        manager.init_session()
+        entries = manager.list_entries(limit=limit)
+        if not entries:
+            typer.echo("No undo history.")
             return
 
-        typer.echo(f"{'ID':<10} {'Label':<40} {'Date':<22}")
-        typer.echo("-" * 72)
-        for cp in checkpoints:
+        typer.echo(f"{'#':<4} {'Time':<10} {'Tool':<15} {'File':<40} {'Description'}")
+        typer.echo("-" * 90)
+        for i, entry in enumerate(entries, 1):
             from datetime import datetime
-
-            date = datetime.fromtimestamp(cp.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-            typer.echo(f"{cp.id:<10} {cp.label:<40} {date:<22}")
+            ts = datetime.fromtimestamp(entry.timestamp).strftime("%H:%M:%S")
+            desc = entry.description or ""
+            typer.echo(f"{i:<4} {ts:<10} {entry.tool_name:<15} {entry.file_path:<40} {desc}")
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
@@ -740,14 +740,17 @@ def checkpoints(
 
 @app.command()
 def undo() -> None:
-    """Undo the last change by restoring to previous checkpoint."""
-    from coding_agent.sandbox.checkpoint import CheckpointManager
+    """Undo the last file mutation."""
+    from coding_agent.agent.undo import UndoManager, UndoManager as UM
 
     try:
-        manager = CheckpointManager(".")
-        checkpoint = manager.undo()
-        if checkpoint:
-            typer.echo(f"Undone to checkpoint: {checkpoint.id} - {checkpoint.label}")
+        manager = UndoManager(".")
+        manager.init_session()
+        entry = manager.undo()
+        if entry:
+            UM.apply_entry(entry, redo=False)
+            desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
+            typer.echo(f"Undone: {desc}")
         else:
             typer.echo("Nothing to undo.")
     except Exception as e:
@@ -757,8 +760,22 @@ def undo() -> None:
 
 @app.command()
 def redo() -> None:
-    """Redo by moving forward one checkpoint (limited support)."""
-    typer.echo("Redo is not fully supported yet. Use 'undo' to go back.")
+    """Redo the last undone mutation."""
+    from coding_agent.agent.undo import UndoManager, UndoManager as UM
+
+    try:
+        manager = UndoManager(".")
+        manager.init_session()
+        entry = manager.redo()
+        if entry:
+            UM.apply_entry(entry, redo=True)
+            desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
+            typer.echo(f"Redone: {desc}")
+        else:
+            typer.echo("Nothing to redo.")
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

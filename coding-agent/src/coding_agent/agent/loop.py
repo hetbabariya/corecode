@@ -28,7 +28,7 @@ from coding_agent.agent.reflector import Assessment, Reflector
 from coding_agent.agent.permissions import PermissionManager
 from coding_agent.agent.planner import PlanManager
 from coding_agent.agent.system_prompt import build_system_prompt
-from coding_agent.agent.undo import UndoStack
+from coding_agent.agent.undo import UndoManager
 from coding_agent.agent.verifier import PostEditVerifier
 from coding_agent.agent.workspace_index import WorkspaceIndex
 from coding_agent.llm.client import LLMClient
@@ -143,9 +143,10 @@ class AgentLoop:
             set_memory_manager(memory_manager)
 
         # Undo/redo system
-        self.undo_stack = UndoStack()
-        from coding_agent.tools.undo import set_undo_stack
-        set_undo_stack(self.undo_stack)
+        self.undo_manager = UndoManager(workspace)
+        self.undo_manager.init_session()
+        from coding_agent.tools.undo import set_undo_manager
+        set_undo_manager(self.undo_manager)
 
         # Planning system
         self.plan_manager = PlanManager()
@@ -895,40 +896,22 @@ class AgentLoop:
                         data={"tool_name": pc["name"], "approved": True},
                     )
 
-                # Auto-checkpoint before file modifications
-                _EDIT_TOOLS = {"write_file", "edit_file", "apply_patch", "multi_edit"}
-                if pc["name"] in _EDIT_TOOLS:
-                    try:
-                        import asyncio
-                        from coding_agent.sandbox.checkpoint import CheckpointManager
-
-                        def _create_checkpoint() -> tuple[str, str]:
-                            mgr = CheckpointManager(".")
-                            cp = mgr.create_checkpoint(f"before {pc['name']}")
-                            return cp.id, cp.label
-
-                        checkpoint_id, checkpoint_label = await asyncio.to_thread(
-                            _create_checkpoint
-                        )
-                        logger.info(
-                            "auto_checkpoint",
-                            checkpoint_id=checkpoint_id,
-                            tool=pc["name"],
-                        )
-                        yield AgentEvent(
-                            type=EventType.CHECKPOINT,
-                            data={
-                                "checkpoint_id": checkpoint_id,
-                                "label": checkpoint_label,
-                                "tool": pc["name"],
-                            },
-                        )
-                    except Exception as e:
-                        logger.warning("auto_checkpoint_failed", error=str(e))
-
                 result = await tool_registry.execute_from_llm(pc["tc"])
                 tool_duration_ms = (time.monotonic() - tool_start) * 1000
                 self._tool_count += 1
+
+                # Emit UNDO_PUSH event for file-modifying tools
+                _EDIT_TOOLS = {"write_file", "edit_file", "apply_patch", "multi_edit"}
+                if pc["name"] in _EDIT_TOOLS and self.undo_manager.can_undo:
+                    yield AgentEvent(
+                        type=EventType.UNDO_PUSH,
+                        data={
+                            "tool_name": pc["name"],
+                            "file_path": pc["tc"].get("path", ""),
+                            "undo_count": self.undo_manager.undo_count,
+                        },
+                    )
+
                 async for event in self._finalize_tool_execution(pc, result, tool_duration_ms):
                     yield event
 
@@ -1541,7 +1524,7 @@ class AgentLoop:
         self.permissions.reset()
         self.plan_manager.reset()
         self.context_engine.clear_history()
-        self.undo_stack.clear()
+        self.undo_manager.clear()
         self.session_id = None
         if self.memory_manager is not None:
             self.memory_manager.clear_working()
