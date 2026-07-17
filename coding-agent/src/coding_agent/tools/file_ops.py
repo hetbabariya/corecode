@@ -136,6 +136,71 @@ def _is_binary(data: bytes, check_bytes: int = 8192) -> bool:
     return b"\x00" in chunk
 
 
+def _normalize_whitespace(text: str) -> str:
+    """Collapse multiple spaces to one and strip trailing whitespace per line."""
+    lines = text.splitlines()
+    return "\n".join(" ".join(line.split()) for line in lines)
+
+
+def _fuzzy_find_closest(
+    file_text: str, old_text: str, threshold: float = 0.8
+) -> str | None:
+    """Find the closest matching substring in *file_text* using difflib.
+
+    Uses a sliding window matching the line count of *old_text*. Returns the
+    matched text if similarity >= *threshold*, otherwise ``None``.
+    """
+    old_lines = old_text.splitlines()
+    file_lines = file_text.splitlines()
+    window = len(old_lines)
+    if window == 0 or not file_lines:
+        return None
+
+    best_match: str | None = None
+    best_ratio = 0.0
+
+    for i in range(len(file_lines) - window + 1):
+        candidate = "\n".join(file_lines[i : i + window])
+        ratio = difflib.SequenceMatcher(None, old_text, candidate).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_match = candidate
+
+    if best_ratio >= threshold and best_match is not None:
+        logger.info(
+            "fuzzy_edit_match",
+            similarity=f"{best_ratio:.2f}",
+            preview=best_match[:80],
+        )
+        return best_match
+    return None
+
+
+def _fuzzy_resolve_old_text(
+    file_text: str, old_text: str
+) -> str | None:
+    """Resolve *old_text* via fuzzy strategies. Returns the original-text span to replace, or ``None``."""
+    # Strategy 1: whitespace-normalized match
+    norm_file = _normalize_whitespace(file_text)
+    norm_old = _normalize_whitespace(old_text)
+    norm_count = norm_file.count(norm_old)
+    if norm_count == 1:
+        # Locate the matching span in the original text
+        old_lines = old_text.splitlines()
+        file_lines = file_text.splitlines()
+        window = len(old_lines)
+        for i in range(len(file_lines) - window + 1):
+            candidate = "\n".join(file_lines[i : i + window])
+            if _normalize_whitespace(candidate) == norm_old:
+                logger.info("fuzzy_edit_whitespace_match", preview=candidate[:80])
+                return candidate
+    if norm_count > 1:
+        return None  # ambiguous — caller should report
+
+    # Strategy 2: close substring match
+    return _fuzzy_find_closest(file_text, old_text)
+
+
 # ------------------------------------------------------------------
 # Tools
 # ------------------------------------------------------------------
@@ -206,6 +271,7 @@ async def read_file(
     name="write_file",
     description="Write content to a file. Creates parent directories if needed.",
     permission="write",
+    retryable=False,
 )
 async def write_file(path: str, content: str) -> ToolResult:
     """Create or overwrite a file with the given content."""
@@ -256,11 +322,16 @@ async def write_file(path: str, content: str) -> ToolResult:
 
 @tool(
     name="edit_file",
-    description="Replace text in a file. The old_text must appear exactly once.",
+    description="Replace text in a file. The old_text must appear exactly once. Set fuzzy=true for whitespace-tolerant matching.",
     permission="write",
+    retryable=False,
 )
-async def edit_file(path: str, old_text: str, new_text: str) -> ToolResult:
-    """Perform a targeted string replacement in a file."""
+async def edit_file(path: str, old_text: str, new_text: str, fuzzy: bool = False) -> ToolResult:
+    """Perform a targeted string replacement in a file.
+
+    When *fuzzy* is ``True`` and exact matching fails, whitespace differences
+    are tolerated and close matches (>80%% similarity) are used as a fallback.
+    """
     p = Path(path).resolve()
     if not p.exists():
         return ToolResult(success=False, error=f"File not found: {path}")
@@ -279,10 +350,36 @@ async def edit_file(path: str, old_text: str, new_text: str) -> ToolResult:
 
     count = text.count(old_text)
     if count == 0:
-        return ToolResult(
-            success=False,
-            error=f"old_text not found in {path}. Make sure the text matches exactly (including whitespace and indentation).",
-        )
+        # --- Fuzzy fallback ---
+        if fuzzy:
+            resolved = _fuzzy_resolve_old_text(text, old_text)
+            if resolved is None:
+                # Check if it was ambiguous (whitespace match found multiple)
+                norm_count = _normalize_whitespace(text).count(_normalize_whitespace(old_text))
+                if norm_count > 1:
+                    return ToolResult(
+                        success=False,
+                        error=f"old_text appears {norm_count} times (whitespace-normalized) in {path}. Provide more context.",
+                    )
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"old_text not found in {path} (even with fuzzy matching). "
+                        "Make sure the text matches closely."
+                    ),
+                )
+            old_text = resolved
+            count = text.count(old_text)
+            if count == 0:
+                return ToolResult(
+                    success=False,
+                    error=f"Fuzzy match found but not locatable in {path}.",
+                )
+        else:
+            return ToolResult(
+                success=False,
+                error=f"old_text not found in {path}. Make sure the text matches exactly (including whitespace and indentation).",
+            )
     if count > 1:
         return ToolResult(
             success=False,
@@ -477,6 +574,7 @@ def _apply_hunks(lines: list[str], hunks: list[dict[str, Any]]) -> list[str] | s
     name="apply_patch",
     description="Apply a unified diff patch to a file. Accepts standard unified diff format with @@ headers.",
     permission="write",
+    retryable=False,
 )
 async def apply_patch(path: str, patch: str) -> ToolResult:
     """Apply a unified diff patch to a file.
@@ -550,22 +648,19 @@ async def apply_patch(path: str, patch: str) -> ToolResult:
 
 @tool(
     name="multi_edit",
-    description="Apply multiple text replacements to a single file in one call. Each edit specifies old_text and new_text.",
+    description="Apply multiple text replacements to a single file in one call. Each edit specifies old_text and new_text. Set fuzzy=true for whitespace-tolerant matching.",
     permission="write",
+    retryable=False,
 )
-async def multi_edit(path: str, edits: list[dict[str, str]]) -> ToolResult:
+async def multi_edit(path: str, edits: list[dict[str, str]], fuzzy: bool = False) -> ToolResult:
     """Apply multiple text replacements to a file in one call.
 
     Each edit in the list should have ``old_text`` and ``new_text`` keys.
     Edits are applied in order. All old_text values must be found exactly
     once in the file before any edits are applied (to prevent ordering issues).
 
-    Example::
-
-        multi_edit("app.py", [
-            {"old_text": "def foo():", "new_text": "def bar():"},
-            {"old_text": "return None", "new_text": "return 0"},
-        ])
+    When *fuzzy* is ``True`` and exact matching fails, whitespace differences
+    are tolerated and close matches (>80%% similarity) are used as a fallback.
     """
     p = Path(path).resolve()
     if not p.exists():
@@ -589,6 +684,7 @@ async def multi_edit(path: str, edits: list[dict[str, str]]) -> ToolResult:
     original_text = text
 
     # Validate all old_text values exist before applying any
+    resolved_edits: list[tuple[str, str]] = []  # (resolved_old_text, new_text)
     for i, edit in enumerate(edits):
         old_text = edit.get("old_text", "")
         new_text = edit.get("new_text", "")
@@ -596,21 +692,41 @@ async def multi_edit(path: str, edits: list[dict[str, str]]) -> ToolResult:
             return ToolResult(success=False, error=f"Edit {i+1}: old_text is empty.")
         count = text.count(old_text)
         if count == 0:
-            return ToolResult(
-                success=False,
-                error=f"Edit {i+1}: old_text not found in {path}.",
-            )
+            if fuzzy:
+                resolved = _fuzzy_resolve_old_text(text, old_text)
+                if resolved is None:
+                    norm_count = _normalize_whitespace(text).count(_normalize_whitespace(old_text))
+                    if norm_count > 1:
+                        return ToolResult(
+                            success=False,
+                            error=f"Edit {i+1}: old_text appears {norm_count} times (whitespace-normalized) in {path}. Provide more context.",
+                        )
+                    return ToolResult(
+                        success=False,
+                        error=f"Edit {i+1}: old_text not found in {path} (even with fuzzy matching).",
+                    )
+                old_text = resolved
+                count = text.count(old_text)
+                if count == 0:
+                    return ToolResult(
+                        success=False,
+                        error=f"Edit {i+1}: fuzzy match found but not locatable in {path}.",
+                    )
+            else:
+                return ToolResult(
+                    success=False,
+                    error=f"Edit {i+1}: old_text not found in {path}.",
+                )
         if count > 1:
             return ToolResult(
                 success=False,
                 error=f"Edit {i+1}: old_text appears {count} times in {path}. Provide more context.",
             )
+        resolved_edits.append((old_text, new_text))
 
     # Apply edits sequentially
-    for i, edit in enumerate(edits):
-        old_text = edit["old_text"]
-        new_text = edit["new_text"]
-        text = text.replace(old_text, new_text, 1)
+    for resolved_old, new_text in resolved_edits:
+        text = text.replace(resolved_old, new_text, 1)
 
     try:
         p.write_text(text, encoding="utf-8")

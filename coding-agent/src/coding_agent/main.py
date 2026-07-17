@@ -223,6 +223,7 @@ async def _run_agent_clean(
         session_manager=session_mgr,
         max_cost=settings.max_cost_per_session,
         max_time=settings.max_time_per_task,
+        agent_timeout_per_iteration=settings.agent_timeout_per_iteration,
     )
 
     W = 60  # box width
@@ -337,6 +338,25 @@ async def _run_agent_clean(
             file_path = d.get("file_path", "")
             tool_name = d.get("tool_name", "")
             print(f"    \u2503   \u21a9 undoable: {tool_name} on {file_path}")
+
+        elif event.type == EventType.SIBLING_ABORT:
+            tool_name = d.get("tool_name", "?")
+            print(f"    \u2503   \u26a0 sibling abort: {tool_name} cancelled")
+
+        elif event.type == EventType.HOOK_BLOCK:
+            tool_name = d.get("tool_name", "?")
+            reason = d.get("reason", "Hook blocked")
+            print(f"    \u2503   \u26a0 hook blocked: {tool_name} — {reason}")
+
+        elif event.type == EventType.HOOK_OUTPUT:
+            hook_event = d.get("event", "?")
+            tool_name = d.get("tool_name", "?")
+            output = d.get("output", "")
+            print(f"    \u2503   hook [{hook_event}] {tool_name}: {output}")
+
+        elif event.type == EventType.PERMISSION_MODE_CHANGED:
+            mode = d.get("mode", "?")
+            print(f"    \u2503   permission mode: {mode}")
 
         elif event.type == EventType.VERIFICATION:
             file_path = d.get("file_path", "")
@@ -542,6 +562,7 @@ async def _run_agent_raw(
         session_manager=session_mgr,
         max_cost=settings.max_cost_per_session,
         max_time=settings.max_time_per_task,
+        agent_timeout_per_iteration=settings.agent_timeout_per_iteration,
     )
 
     async for event in agent.process_input(prompt):

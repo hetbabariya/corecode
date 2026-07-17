@@ -12,6 +12,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, Input
 
 from coding_agent.tui.theme import REPL_CSS, create_nord_theme
+from coding_agent.logging import logger
 from coding_agent.tui.widgets import (
     AssistantMessage,
     StatusBar,
@@ -76,6 +77,7 @@ class CodingAgentREPL(App[None]):
         self.register_theme(create_nord_theme())
         self.theme = "coding-agent"
         await self._init_agent()
+        self._update_toolbar_undo()
         self.query_one("#input").focus()
 
     async def _init_agent(self) -> None:
@@ -168,6 +170,7 @@ class CodingAgentREPL(App[None]):
             session_manager=session_mgr,
             max_cost=settings.max_cost_per_session,
             max_time=settings.max_time_per_task,
+            agent_timeout_per_iteration=settings.agent_timeout_per_iteration,
         )
 
         # Update status bar
@@ -177,16 +180,21 @@ class CodingAgentREPL(App[None]):
         # Update subtitle
         self.sub_title = f"{model} \u2502 {self.workspace.name}"
 
-    @work(thread=True)
+    @work
     async def _process_input(self, user_input: str) -> None:
-        """Process user input in a background thread."""
+        """Process user input on the main event loop.
+
+        Runs on the main event loop (not a thread) so that shared resources
+        like the httpx AsyncClient and aiosqlite connection — which are
+        created on the main loop — remain usable across calls.
+        """
         if self._agent is None:
-            self.call_from_thread(self._show_error, "Agent not initialized")
+            self._show_error("Agent not initialized")
             return
 
         self._processing = True
-        self.call_from_thread(self._set_input_enabled, False)
-        self.call_from_thread(self._start_thinking)
+        self._set_input_enabled(False)
+        self._start_thinking()
 
         try:
             from coding_agent.agent.events import EventType
@@ -197,18 +205,18 @@ class CodingAgentREPL(App[None]):
 
             async for event in self._agent.process_input(user_input):
                 if event.type == EventType.TEXT:
-                    self.call_from_thread(self._handle_text, str(event.data))
+                    self._handle_text(str(event.data))
 
                 elif event.type == EventType.LOOP_START:
                     self._iteration += 1
-                    self.call_from_thread(self._update_status)
+                    self._update_status()
 
                 elif event.type == EventType.TOOL_START:
-                    self.call_from_thread(self._stop_thinking)
+                    self._stop_thinking()
                     data = event.data if isinstance(event.data, dict) else {}
                     name = data.get("name", "?")
                     args = data.get("args", "")
-                    self.call_from_thread(self._handle_tool_start, name, str(args))
+                    self._handle_tool_start(name, str(args))
 
                 elif event.type == EventType.TOOL_RESULT:
                     data = event.data if isinstance(event.data, dict) else {}
@@ -217,29 +225,24 @@ class CodingAgentREPL(App[None]):
                     if hasattr(result, "success"):
                         success = result.success
                         result = result.output or result.error or ""
-                    self.call_from_thread(
-                        self._handle_tool_result, str(result), success
-                    )
+                    self._handle_tool_result(str(result), success)
 
                 elif event.type == EventType.USAGE:
                     data = event.data if isinstance(event.data, dict) else {}
                     self._prompt_tokens += int(data.get("prompt_tokens", 0))
                     self._completion_tokens += int(data.get("completion_tokens", 0))
-                    self.call_from_thread(self._update_status)
+                    self._update_status()
 
                 elif event.type == EventType.ERROR:
                     data = event.data if isinstance(event.data, dict) else {}
                     err = data.get("error", str(event.data))
-                    self.call_from_thread(self._show_error, str(err))
+                    self._show_error(str(err))
 
                 elif event.type == EventType.MAX_TOKENS_RECOVERY:
-                    self.call_from_thread(
-                        self._show_system, "Max tokens recovery triggered", "warning"
-                    )
+                    self._show_system("Max tokens recovery triggered", "warning")
 
                 elif event.type == EventType.REACTIVE_COMPACT:
-                    self.call_from_thread(
-                        self._show_system,
+                    self._show_system(
                         "Context overflow recovery triggered",
                         "warning",
                     )
@@ -248,8 +251,7 @@ class CodingAgentREPL(App[None]):
                     data = event.data if isinstance(event.data, dict) else {}
                     compacted = data.get("compacted", 0)
                     remaining = data.get("remaining_messages", 0)
-                    self.call_from_thread(
-                        self._show_system,
+                    self._show_system(
                         f"Micro-compact: {compacted} old results cleared ({remaining} messages remain)",
                         "warning",
                     )
@@ -258,18 +260,43 @@ class CodingAgentREPL(App[None]):
                     data = event.data if isinstance(event.data, dict) else {}
                     file_path = data.get("file_path", "")
                     tool_name = data.get("tool_name", "")
-                    self.call_from_thread(
-                        self._show_system,
+                    self._show_system(
                         f"Undoable: {tool_name} on {file_path}",
                         "info",
                     )
-                    # Update toolbar undo state
-                    self.call_from_thread(self._update_toolbar_undo)
+                    self._update_toolbar_undo()
+
+                elif event.type == EventType.SIBLING_ABORT:
+                    data = event.data if isinstance(event.data, dict) else {}
+                    tool_name = data.get("tool_name", "?")
+                    self._show_system(
+                        f"Sibling abort: {tool_name} cancelled (sibling failed)",
+                        "warning",
+                    )
+
+                elif event.type == EventType.HOOK_BLOCK:
+                    data = event.data if isinstance(event.data, dict) else {}
+                    tool_name = data.get("tool_name", "?")
+                    reason = data.get("reason", "Hook blocked this action")
+                    self._show_system(
+                        f"Hook blocked: {tool_name} — {reason}",
+                        "warning",
+                    )
+
+                elif event.type == EventType.HOOK_OUTPUT:
+                    data = event.data if isinstance(event.data, dict) else {}
+                    hook_event = data.get("event", "?")
+                    tool_name = data.get("tool_name", "?")
+                    output = data.get("output", "")
+                    self._show_system(
+                        f"Hook [{hook_event}] {tool_name}: {output}",
+                        "info",
+                    )
 
                 elif event.type == EventType.CONTEXT_HEALTH:
                     data = event.data if isinstance(event.data, dict) else {}
                     ratio = data.get("usage_ratio", 0)
-                    self.call_from_thread(self._update_context_pct, ratio)
+                    self._update_context_pct(ratio)
 
                 elif event.type == EventType.DONE:
                     pass
@@ -282,15 +309,15 @@ class CodingAgentREPL(App[None]):
                 elif self._agent._accumulated_cost > 0:
                     self._cost = self._agent._accumulated_cost
 
-            self.call_from_thread(self._update_status)
+            self._update_status()
 
         except Exception as exc:
-            self.call_from_thread(self._show_error, f"Error: {exc}")
+            self._show_error(f"Error: {exc}")
         finally:
             self._processing = False
-            self.call_from_thread(self._stop_thinking)
-            self.call_from_thread(self._set_input_enabled, True)
-            self.call_from_thread(self._finish_response)
+            self._stop_thinking()
+            self._set_input_enabled(True)
+            self._finish_response()
 
     def _start_thinking(self) -> None:
         """Show thinking indicator."""
@@ -352,7 +379,7 @@ class CodingAgentREPL(App[None]):
 
     def _update_toolbar_undo(self) -> None:
         """Update the toolbar with undo/redo state."""
-        from coding_agent.agent.undo import get_undo_manager
+        from coding_agent.tools.undo import get_undo_manager
         manager = get_undo_manager()
         if manager:
             toolbar = self.query_one("#toolbar", Toolbar)
@@ -397,6 +424,12 @@ class CodingAgentREPL(App[None]):
         user_input = event.value.strip()
         event.input.clear()
 
+        # Handle slash commands before sending to agent
+        if user_input.startswith("/"):
+            handled = await self._handle_command(user_input)
+            if handled:
+                return
+
         # Add user message to chat
         chat_view = self.query_one("#chat-view")
         await chat_view.mount(UserMessage(user_input))
@@ -431,13 +464,62 @@ class CodingAgentREPL(App[None]):
             )
         )
 
+    async def _handle_command(self, command: str) -> bool:
+        """Handle slash commands. Returns True if command was handled."""
+        from coding_agent.agent.permissions import PermissionMode
+
+        parts = command.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "/permissions":
+            if not self._agent:
+                self._show_system("Agent not initialized", "error")
+                return True
+
+            pm = self._agent.permissions
+
+            if not arg:
+                # Show current mode
+                mode = pm.mode.value
+                self._show_system(f"Current permission mode: {mode}", "info")
+                return True
+
+            # Try to parse mode
+            mode_map = {m.value: m for m in PermissionMode}
+            # Also accept short aliases
+            mode_map[">"] = PermissionMode.DEFAULT
+            mode_map[">>"] = PermissionMode.ACCEPT_EDITS
+            mode_map["?"] = PermissionMode.PLAN
+            mode_map["!"] = PermissionMode.BYPASS
+
+            mode = mode_map.get(arg)
+            if mode is None:
+                valid = ", ".join(m.value for m in PermissionMode)
+                self._show_system(
+                    f"Unknown mode: {arg}. Options: {valid}",
+                    "error",
+                )
+                return True
+
+            warning = pm.set_mode(mode, str(self.workspace))
+            self._show_system(f"Permission mode: {mode.value}", "info")
+            if warning:
+                self._show_system(warning, "warning")
+            logger.info("permission_mode_changed", mode=mode.value, workspace=str(self.workspace))
+            return True
+
+        # Unknown command — don't handle, let it pass through to agent
+        return False
+
     async def action_undo(self) -> None:
         """Undo the last file mutation."""
         if self._processing:
             return
 
         import asyncio
-        from coding_agent.agent.undo import get_undo_manager, UndoManager
+        from coding_agent.tools.undo import get_undo_manager
+        from coding_agent.agent.undo import UndoManager
 
         manager = get_undo_manager()
         if not manager:
@@ -453,7 +535,6 @@ class CodingAgentREPL(App[None]):
                 desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
                 return True, desc
             except Exception as e:
-                # Re-push on failure so the entry isn't lost
                 manager.push(entry)
                 raise
 
@@ -461,7 +542,7 @@ class CodingAgentREPL(App[None]):
             success, desc = await asyncio.to_thread(_do_undo)
             if success:
                 self._show_system(f"Undone: {desc}", "warning")
-                self.call_from_thread(self._update_toolbar_undo)
+                self._update_toolbar_undo()
             else:
                 self._show_system("Nothing to undo.", "info")
         except Exception as e:
@@ -473,7 +554,8 @@ class CodingAgentREPL(App[None]):
             return
 
         import asyncio
-        from coding_agent.agent.undo import get_undo_manager, UndoManager
+        from coding_agent.tools.undo import get_undo_manager
+        from coding_agent.agent.undo import UndoManager
 
         manager = get_undo_manager()
         if not manager:
@@ -489,7 +571,6 @@ class CodingAgentREPL(App[None]):
                 desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
                 return True, desc
             except Exception as e:
-                # Re-push on failure so the entry isn't lost
                 manager.push(entry)
                 raise
 
@@ -497,7 +578,7 @@ class CodingAgentREPL(App[None]):
             success, desc = await asyncio.to_thread(_do_redo)
             if success:
                 self._show_system(f"Redone: {desc}", "warning")
-                self.call_from_thread(self._update_toolbar_undo)
+                self._update_toolbar_undo()
             else:
                 self._show_system("Nothing to redo.", "info")
         except Exception as e:

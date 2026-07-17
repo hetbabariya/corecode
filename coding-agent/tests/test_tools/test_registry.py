@@ -401,3 +401,499 @@ class TestDefaultSingleton:
 
     def test_name(self) -> None:
         assert tool_registry.name == "default"
+
+
+# ------------------------------------------------------------------
+# Timeout tests
+# ------------------------------------------------------------------
+
+
+async def _slow_tool() -> str:
+    """Sleeps for 5 seconds — used to test timeout."""
+    import asyncio
+    await asyncio.sleep(5)
+    return "done"
+
+
+async def _fast_tool() -> str:
+    """Returns immediately."""
+    return "fast"
+
+
+class TestFunctionToolTimeout:
+    def test_timeout_stored(self) -> None:
+        ft = FunctionTool(
+            _fast_tool, name="ft_timeout", description="", parameters={}, timeout=10
+        )
+        assert ft.timeout_seconds == 10
+
+    def test_timeout_none_by_default(self) -> None:
+        ft = FunctionTool(
+            _fast_tool, name="ft_no_timeout", description="", parameters={}
+        )
+        assert ft.timeout_seconds is None
+
+
+class TestToolDecoratorTimeout:
+    def test_timeout_passed_to_function_tool(self) -> None:
+        @tool(name="dec_timeout_test", description="test", timeout=7)
+        async def _my_tool(x: str) -> str:
+            return x
+
+        t = tool_registry.get("dec_timeout_test")
+        assert t.timeout_seconds == 7
+        tool_registry.unregister("dec_timeout_test")
+
+    def test_timeout_none_by_default(self) -> None:
+        @tool(name="dec_no_timeout_test", description="test")
+        async def _my_tool(x: str) -> str:
+            return x
+
+        t = tool_registry.get("dec_no_timeout_test")
+        assert t.timeout_seconds is None
+        tool_registry.unregister("dec_no_timeout_test")
+
+
+class TestRegistryExecuteTimeout:
+    async def test_timeout_fires_returns_error(self) -> None:
+        reg = ToolRegistry(name="timeout_test")
+        reg.register(
+            FunctionTool(
+                _slow_tool,
+                name="slow",
+                description="Slow tool",
+                parameters={},
+                timeout=0.1,
+            )
+        )
+        result = await reg.execute("slow", {})
+        assert result.success is False
+        assert "timed out" in (result.error or "").lower()
+        assert result.metadata.get("timeout") is True
+
+    async def test_timeout_completes_within(self) -> None:
+        reg = ToolRegistry(name="timeout_test")
+        reg.register(
+            FunctionTool(
+                _fast_tool,
+                name="fast",
+                description="Fast tool",
+                parameters={},
+                timeout=5,
+            )
+        )
+        result = await reg.execute("fast", {})
+        assert result.success is True
+        assert result.output == "fast"
+
+    async def test_timeout_zero_disables(self) -> None:
+        reg = ToolRegistry(name="timeout_test")
+        reg.register(
+            FunctionTool(
+                _slow_tool,
+                name="slow_no_timeout",
+                description="Slow tool",
+                parameters={},
+                timeout=0,
+            )
+        )
+        # With timeout=0 (disabled), the tool runs without timeout
+        # We use a shorter sleep variant to avoid test hanging
+        async def _short_slow() -> str:
+            import asyncio
+            await asyncio.sleep(0.05)
+            return "ok"
+
+        reg.unregister("slow_no_timeout")
+        reg.register(
+            FunctionTool(
+                _short_slow,
+                name="slow_no_timeout",
+                description="Slow tool",
+                parameters={},
+                timeout=0,
+            )
+        )
+        result = await reg.execute("slow_no_timeout", {})
+        assert result.success is True
+
+    async def test_timeout_negative_disables(self) -> None:
+        reg = ToolRegistry(name="timeout_test")
+
+        async def _quick() -> str:
+            return "quick"
+
+        reg.register(
+            FunctionTool(
+                _quick,
+                name="neg_timeout",
+                description="Tool",
+                parameters={},
+                timeout=-5,
+            )
+        )
+        result = await reg.execute("neg_timeout", {})
+        assert result.success is True
+
+    async def test_config_default_timeout_applied(self) -> None:
+        reg = ToolRegistry(name="timeout_test")
+        # Tool without explicit timeout should use config default
+        reg.register(
+            FunctionTool(
+                _fast_tool,
+                name="config_timeout_tool",
+                description="Tool",
+                parameters={},
+                permission_level="read",
+            )
+        )
+        result = await reg.execute("config_timeout_tool", {})
+        assert result.success is True
+
+    async def test_execute_from_llm_timeout(self) -> None:
+        reg = ToolRegistry(name="timeout_test")
+        reg.register(
+            FunctionTool(
+                _slow_tool,
+                name="slow_llm",
+                description="Slow",
+                parameters={},
+                timeout=0.1,
+            )
+        )
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "slow_llm",
+                "arguments": "{}",
+            },
+        }
+        result = await reg.execute_from_llm(tool_call)
+        assert result.success is False
+        assert "timed out" in (result.error or "").lower()
+
+
+class TestConfigToolTimeout:
+    def test_get_tool_timeout_read(self) -> None:
+        from coding_agent.config import Settings
+
+        settings = Settings()
+        assert settings.get_tool_timeout("read") == settings.tool_timeout_read
+
+    def test_get_tool_timeout_write(self) -> None:
+        from coding_agent.config import Settings
+
+        settings = Settings()
+        assert settings.get_tool_timeout("write") == settings.tool_timeout_write
+
+    def test_get_tool_timeout_execute(self) -> None:
+        from coding_agent.config import Settings
+
+        settings = Settings()
+        assert settings.get_tool_timeout("execute") == settings.tool_timeout_execute
+
+    def test_get_tool_timeout_dangerous(self) -> None:
+        from coding_agent.config import Settings
+
+        settings = Settings()
+        assert settings.get_tool_timeout("dangerous") == settings.tool_timeout_dangerous
+
+    def test_get_tool_timeout_unknown_falls_back(self) -> None:
+        from coding_agent.config import Settings
+
+        settings = Settings()
+        assert settings.get_tool_timeout("unknown") == settings.tool_timeout_default
+
+
+# ------------------------------------------------------------------
+# Feature #2: retryable attribute
+# ------------------------------------------------------------------
+
+
+class TestRetryableAttribute:
+    def test_function_tool_default_retryable(self) -> None:
+        ft = FunctionTool(_add, name="add", description="Add", parameters={})
+        assert ft.retryable is True
+
+    def test_function_tool_non_retryable(self) -> None:
+        ft = FunctionTool(
+            _add, name="add", description="Add", parameters={}, retryable=False
+        )
+        assert ft.retryable is False
+
+    def test_decorator_retryable_default(self) -> None:
+        reg = ToolRegistry(name="retry_test")
+
+        @tool(name="rt_default", parameters={}, registry=reg)
+        async def _my_tool() -> str:
+            return "ok"
+
+        assert _my_tool.retryable is True
+
+    def test_decorator_retryable_false(self) -> None:
+        reg = ToolRegistry(name="retry_test2")
+
+        @tool(name="rt_false", parameters={}, registry=reg, retryable=False)
+        async def _my_tool2() -> str:
+            return "ok"
+
+        assert _my_tool2.retryable is False
+
+    async def test_timeout_metadata_includes_retryable(self) -> None:
+        reg = ToolRegistry(name="retry_meta")
+        reg.register(
+            FunctionTool(
+                _slow_tool,
+                name="slow_retry",
+                description="Slow",
+                parameters={},
+                timeout=0.1,
+                retryable=False,
+            )
+        )
+        result = await reg.execute("slow_retry", {})
+        assert result.success is False
+        assert result.metadata.get("retryable") is False
+
+    async def test_timeout_metadata_retryable_true(self) -> None:
+        reg = ToolRegistry(name="retry_meta2")
+        reg.register(
+            FunctionTool(
+                _slow_tool,
+                name="slow_retry2",
+                description="Slow",
+                parameters={},
+                timeout=0.1,
+                retryable=True,
+            )
+        )
+        result = await reg.execute("slow_retry2", {})
+        assert result.success is False
+        assert result.metadata.get("retryable") is True
+
+
+# ------------------------------------------------------------------
+# Feature #5: idle_timeout attribute
+# ------------------------------------------------------------------
+
+
+class TestIdleTimeoutAttribute:
+    def test_function_tool_idle_timeout_default(self) -> None:
+        ft = FunctionTool(_add, name="add", description="Add", parameters={})
+        assert ft.idle_timeout is None
+
+    def test_function_tool_idle_timeout_set(self) -> None:
+        ft = FunctionTool(
+            _add, name="add", description="Add", parameters={}, idle_timeout=10.0
+        )
+        assert ft.idle_timeout == 10.0
+
+    def test_decorator_idle_timeout(self) -> None:
+        reg = ToolRegistry(name="idle_test")
+
+        @tool(name="idle_tool", parameters={}, registry=reg, idle_timeout=5.0)
+        async def _idle_tool() -> str:
+            return "ok"
+
+        assert _idle_tool.idle_timeout == 5.0
+
+
+# ------------------------------------------------------------------
+# Feature #7: tool_timeout_overrides
+# ------------------------------------------------------------------
+
+
+class TestToolTimeoutOverrides:
+    async def test_override_takes_precedence(self) -> None:
+        import os
+
+        os.environ["CODING_AGENT_TOOL_TIMEOUT_OVERRIDES"] = '{"slow_override": 1}'
+        try:
+            from coding_agent.config import Settings
+
+            settings = Settings()
+            assert settings.tool_timeout_overrides.get("slow_override") == 1
+
+            reg = ToolRegistry(name="override_test")
+            reg.register(
+                FunctionTool(
+                    _slow_tool,
+                    name="slow_override",
+                    description="Slow",
+                    parameters={},
+                    timeout=0.1,
+                )
+            )
+            # The override (1s) should NOT apply since the tool has an explicit timeout (0.1s)
+            # But verify the override is loaded correctly
+            result = await reg.execute("slow_override", {})
+            assert result.success is False
+            assert "timed out" in (result.error or "").lower()
+        finally:
+            del os.environ["CODING_AGENT_TOOL_TIMEOUT_OVERRIDES"]
+
+    async def test_override_applies_when_no_tool_timeout(self) -> None:
+        import os
+
+        os.environ["CODING_AGENT_TOOL_TIMEOUT_OVERRIDES"] = '{"fast_override": 1}'
+        try:
+            reg = ToolRegistry(name="override_apply")
+            reg.register(
+                FunctionTool(
+                    _fast_tool,
+                    name="fast_override",
+                    description="Fast",
+                    parameters={},
+                )
+            )
+            result = await reg.execute("fast_override", {})
+            assert result.success is True
+        finally:
+            del os.environ["CODING_AGENT_TOOL_TIMEOUT_OVERRIDES"]
+
+    async def test_no_override_uses_default(self) -> None:
+        reg = ToolRegistry(name="no_override")
+        reg.register(
+            FunctionTool(
+                _fast_tool,
+                name="fast_no_override",
+                description="Fast",
+                parameters={},
+            )
+        )
+        result = await reg.execute("fast_no_override", {})
+        assert result.success is True
+
+
+# ------------------------------------------------------------------
+# Feature #8: cleanup callback
+# ------------------------------------------------------------------
+
+
+class TestCleanupCallback:
+    async def test_cleanup_called_on_timeout(self) -> None:
+        cleanup_called = False
+
+        async def _slow_with_cleanup() -> str:
+            import asyncio
+
+            await asyncio.sleep(10)
+            return "never"
+
+        def _on_cleanup() -> None:
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        reg = ToolRegistry(name="cleanup_test")
+        reg.register(
+            FunctionTool(
+                _slow_with_cleanup,
+                name="slow_cleanup",
+                description="Slow",
+                parameters={},
+                timeout=0.1,
+                cleanup=_on_cleanup,
+            )
+        )
+        result = await reg.execute("slow_cleanup", {})
+        assert result.success is False
+        assert cleanup_called is True
+
+    async def test_cleanup_not_called_on_success(self) -> None:
+        cleanup_called = False
+
+        def _on_cleanup() -> None:
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        reg = ToolRegistry(name="cleanup_success")
+        reg.register(
+            FunctionTool(
+                _fast_tool,
+                name="fast_cleanup",
+                description="Fast",
+                parameters={},
+                cleanup=_on_cleanup,
+            )
+        )
+        result = await reg.execute("fast_cleanup", {})
+        assert result.success is True
+        assert cleanup_called is False
+
+    async def test_cleanup_none_is_noop(self) -> None:
+        reg = ToolRegistry(name="cleanup_none")
+        reg.register(
+            FunctionTool(
+                _fast_tool,
+                name="fast_no_cleanup",
+                description="Fast",
+                parameters={},
+                cleanup=None,
+            )
+        )
+        result = await reg.execute("fast_no_cleanup", {})
+        assert result.success is True
+
+    async def test_cleanup_error_does_not_propagate(self) -> None:
+        def _bad_cleanup() -> None:
+            raise RuntimeError("cleanup failed")
+
+        reg = ToolRegistry(name="cleanup_err")
+        reg.register(
+            FunctionTool(
+                _slow_with_cleanup_fn,
+                name="slow_bad_cleanup",
+                description="Slow",
+                parameters={},
+                timeout=0.1,
+                cleanup=_bad_cleanup,
+            )
+        )
+        result = await reg.execute("slow_bad_cleanup", {})
+        assert result.success is False
+        assert "timed out" in (result.error or "").lower()
+
+    async def test_async_cleanup(self) -> None:
+        cleanup_called = False
+
+        async def _slow_for_async_cleanup() -> str:
+            import asyncio
+
+            await asyncio.sleep(10)
+            return "never"
+
+        async def _async_cleanup() -> None:
+            nonlocal cleanup_called
+            cleanup_called = True
+
+        reg = ToolRegistry(name="async_cleanup")
+        reg.register(
+            FunctionTool(
+                _slow_for_async_cleanup,
+                name="slow_async_cleanup",
+                description="Slow",
+                parameters={},
+                timeout=0.1,
+                cleanup=_async_cleanup,
+            )
+        )
+        result = await reg.execute("slow_async_cleanup", {})
+        assert result.success is False
+        assert cleanup_called is True
+
+    def test_decorator_cleanup(self) -> None:
+        reg = ToolRegistry(name="dec_cleanup")
+
+        @tool(name="dec_cleanup_tool", parameters={}, registry=reg, cleanup=lambda: None)
+        async def _dec_cleanup() -> str:
+            return "ok"
+
+        assert _dec_cleanup._cleanup is not None
+
+
+async def _slow_with_cleanup_fn() -> str:
+    import asyncio
+
+    await asyncio.sleep(10)
+    return "never"

@@ -10,42 +10,55 @@
 - [x] A.3 Max Output Tokens Recovery
 - [x] A.4 Prompt Too Long Recovery (Reactive Compact)
 - [x] A.5 Interactive REPL
+- [x] A.6 Checkpointing and Rewind *(implemented as Undo/Redo system with file snapshots, disk persistence, CLI tools)*
 
 ### Phase B — Foundation
 - [x] B.1 Micro-Compact (Old Tool Results)
-- [x] B.2 Undo/Redo Persistence
-- [ ] B.3 Permission Presets
-- [ ] B.4 Cost Tracking Dashboard
+- [x] B.2 Sibling Abort (Parallel Tool Cancellation)
+- [x] B.3 Tool Timeouts
+- [x] B.4 Fuzzy Edit Matching
+- [x] B.5 Hooks System
+- [x] B.6 Streaming Display in REPL *(built into REPL during A.5)*
+- [x] B.7 Permission Modes
 
 ### Phase C — Intelligence
-- [ ] C.1 Auto-Compact (Proactive)
-- [ ] C.2 Tool Result Summarization
-- [ ] C.3 Context Budget Manager
-- [ ] C.4 Memory Consolidation
+- [ ] C.1 Subagent Delegation
+- [ ] C.2 Session Resumption
+- [ ] C.3 CLAUDE.md Hierarchy (AGENTS.md Hierarchy)
+- [ ] C.4 Slash Commands
+- [ ] C.5 Context Window Sliding
+- [x] C.6 Intent Re-injection After Failures
 
 ### Phase D — UX
-- [ ] D.1 Streaming Output
-- [ ] D.2 Progress Indicators
-- [ ] D.3 Diff Visualization
-- [ ] D.4 Keyboard Shortcuts
+- [ ] D.1 MCP Integration
+- [ ] D.2 Model Switching
+- [ ] D.3 Prompt Caching (API-Level)
+- [ ] D.4 Diff Viewer
+- [ ] D.5 Status Bar
+- [ ] D.6 Progress Indicators
 
 ### Phase E — Advanced
-- [ ] E.1 Subagent System
-- [ ] E.2 Tool Composition
-- [ ] E.3 Custom Slash Commands
-- [ ] E.4 Hook System
+- [ ] E.1 Plan Mode (Read-Only)
+- [ ] E.2 Semantic Memory Search
+- [ ] E.3 Session Forking
+- [ ] E.4 Team Mode (Multi-Agent Collaboration)
+- [ ] E.5 Circuit Breaker
 
 ### Phase F — Claude Code Parity
-- [ ] F.1 CLAUDE.md Support
-- [ ] F.2 Multi-Model Routing
-- [ ] F.3 Parallel Tool Execution
-- [ ] F.4 Headless Mode
+- [ ] F.1 Vim Mode
+- [ ] F.2 DreamTask (Background Memory Consolidation)
+- [ ] F.3 HTML Stats Report
+- [ ] F.4 Git Worktree Isolation
+- [ ] F.5 Conflict Resolution
+- [ ] F.6 Transcript Viewer
 
 ### Phase G — Beyond Claude Code
-- [ ] G.1 Plugin System
-- [ ] G.2 Remote Execution
-- [ ] G.3 Team Collaboration
-- [ ] G.4 Analytics Dashboard
+- [ ] G.1 Autonomous Background Tasks
+- [ ] G.2 Predictive Context Prefetching
+- [ ] G.3 Knowledge Graph of Codebase
+- [ ] G.4 Multi-Model Orchestration
+- [ ] G.5 Workflow Automation
+- [ ] G.6 Rich Observability Dashboards
 
 ---
 
@@ -551,6 +564,16 @@ These features improve robustness, extensibility, and correctness of the existin
 
 **Effort:** 3-5 days
 
+**Status:** ✅ Complete (2026-07-17)
+- Created `hooks/types.py` — `HookEvent`, `HookConfig`, `HookResult` dataclasses
+- Created `hooks/executor.py` — `run_hook()` async subprocess with timeout, exit code handling
+- Created `hooks/manager.py` — `HookManager` loads `~/.coding-agent/hooks.json`, matches tool names via regex, runs pre/post hooks
+- Created `hooks/__init__.py` — public exports
+- Updated `config.py` — `hooks_enabled` and `hooks_config_path` fields
+- Updated `loop.py` — `HookManager` init, pre-hook blocking (exit code 2 → skip tool), post-hook logging
+- Updated `events.py` — `HOOK_BLOCK` event type
+- Updated `repl.py` — renders hook-blocked tool warnings in TUI
+
 ---
 
 ### B.6 Streaming Display in REPL
@@ -909,6 +932,13 @@ These features make the agent smarter about how it works — better context mana
 - The agent visibly changes its approach after the reminder.
 
 **Effort:** 3-5 hours
+
+**Status:** ✅ Complete (2026-07-17)
+- Added `_original_user_input`, `_last_reminder_iteration`, `_reminder_cooldown`, `_current_iteration` state vars to `AgentLoop.__init__`
+- Stored original user input in `process_input()` for re-injection access
+- Tracked `_current_iteration` in main loop for cooldown checks
+- Added re-injection logic in `_post_tool_actions()`: when `error_tracker.is_stuck()` and cooldown elapsed, injects `[system] REMINDER: Your current task is: <original prompt>. You have failed <N> times.` as a user message
+- Uses existing `ErrorTracker.is_stuck()`, `get_consecutive_errors()`, `context.add_user_message()`, and `EventType.STUCK_DETECTED`
 
 ---
 
@@ -1821,8 +1851,8 @@ Phase G (Beyond Claude Code)
 | Priority | Features | Count |
 |----------|----------|-------|
 | **Critical** | A.1-A.6 (dangerous commands, protected files, max output, prompt overflow, REPL, checkpoints) | 6 |
-| **High** | B.1-B.7 (micro-compact, sibling abort, timeouts, fuzzy edit, hooks, streaming, permissions) + C.1, C.2, C.3, C.4 | 11 |
-| **Medium** | D.1-D.6 (MCP, model switching, prompt caching, diff viewer, status bar, progress) + E.1-E.3 | 9 |
-| **Low** | E.4-E.5, F.1-F.6, G.1-G.6 (team mode, circuit breaker, vim, dream, stats, worktrees, conflicts, transcript, background tasks, prefetch, knowledge graph, orchestration, workflows, dashboard) | 14 |
+| **High** | B.1-B.7 (micro-compact, sibling abort, timeouts, fuzzy edit, hooks, streaming, permissions) + C.1-C.4 (subagents, session resumption, AGENTS.md, slash commands) | 11 |
+| **Medium** | C.5-C.6 (context sliding, intent re-injection) + D.1-D.6 (MCP, model switching, prompt caching, diff viewer, status bar, progress) + E.1-E.3 (plan mode, semantic memory, session forking) | 11 |
+| **Low** | E.4-E.5 (team mode, circuit breaker) + F.1-F.6 (vim, dream, stats, worktrees, conflicts, transcript) + G.1-G.6 (background tasks, prefetch, knowledge graph, orchestration, workflows, dashboard) | 14 |
 
-**Total features: 40**
+**Total features: 42**

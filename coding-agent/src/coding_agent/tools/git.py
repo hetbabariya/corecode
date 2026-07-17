@@ -140,6 +140,7 @@ async def git_log(
     name="git_commit",
     description="Stage files and create a commit. Use files=[] to stage all changes.",
     permission="write",
+    retryable=False,
 )
 async def git_commit(
     message: str,

@@ -312,19 +312,4 @@ class _LazyStore:
         return getattr(self._store, name)
 
 
-# ---------------------------------------------------------------------------
-# Module-level singleton (set by AgentLoop)
-# ---------------------------------------------------------------------------
 
-_manager: UndoManager | None = None
-
-
-def set_undo_manager(manager: UndoManager) -> None:
-    """Register the global undo manager (called by AgentLoop)."""
-    global _manager
-    _manager = manager
-
-
-def get_undo_manager() -> UndoManager | None:
-    """Return the current undo manager, or ``None``."""
-    return _manager

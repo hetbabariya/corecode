@@ -441,6 +441,7 @@ class TestPermissionBypassFix:
         agent = self._make_agent()
         expected_keys = {
             "permission_check_count", "permission_deny_count", "tool_count",
+            "tool_timeout_count", "tool_cancelled_count",
             "summarize_count", "summarize_success", "summarize_fail",
             "summarize_duration_ms", "context_suggestion_count",
             "token_estimate_calls", "prompt_cache_hits", "prompt_cache_misses",

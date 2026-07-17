@@ -185,23 +185,54 @@ class DockerSandbox:
             workdir = "/workspace"
 
         t0 = time.monotonic()
+        timed_out = False
         try:
-            result = await asyncio.to_thread(
-                self._exec_with_timeout,
-                exec_cmd,
-                workdir,
-            )
+            if timeout and timeout > 0:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._exec_with_timeout,
+                        exec_cmd,
+                        workdir,
+                    ),
+                    timeout=timeout,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    self._exec_with_timeout,
+                    exec_cmd,
+                    workdir,
+                )
             duration_ms = (time.monotonic() - t0) * 1000
 
             return SandboxResult(
                 exit_code=result["exit_code"],
                 stdout=result["stdout"],
                 stderr=result["stderr"],
-                timed_out=result.get("timed_out", False),
+                timed_out=False,
                 duration_ms=duration_ms,
                 metadata={
                     "container_id": self._container_id,
                     "workdir": workdir,
+                },
+            )
+
+        except asyncio.TimeoutError:
+            duration_ms = (time.monotonic() - t0) * 1000
+            logger.warning(
+                "sandbox_exec_timeout",
+                container_id=self._container_id,
+                timeout=timeout,
+                duration_ms=round(duration_ms, 1),
+            )
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr=f"Container command timed out after {timeout}s",
+                timed_out=True,
+                duration_ms=duration_ms,
+                metadata={
+                    "container_id": self._container_id,
+                    "timeout_s": timeout,
                 },
             )
 

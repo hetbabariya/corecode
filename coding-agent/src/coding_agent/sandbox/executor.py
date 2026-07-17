@@ -34,6 +34,7 @@ class SandboxExecutor:
         self._sandbox = sandbox
         self._fallback_to_host = fallback_to_host
         self._sandbox_unavailable_warned = False
+        self._current_proc: asyncio.subprocess.Process | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -147,6 +148,7 @@ class SandboxExecutor:
         """Run directly on the host — mirrors tools/shell.py logic."""
         exec_start = time.monotonic()
         use_shell = sys.platform == "win32"
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -155,10 +157,14 @@ class SandboxExecutor:
                 cwd=cwd,
                 shell=use_shell,
             )
+            self._current_proc = proc
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
-            proc.kill()  # type: ignore[union-attr]
-            await proc.wait()  # type: ignore[union-attr]
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
+                proc.close()
+            self._current_proc = None
             duration_ms = (time.monotonic() - exec_start) * 1000
             logger.warning("host_exec_timeout", command=command[:200], timeout=timeout, duration_ms=round(duration_ms, 1))
             return ToolResult(
@@ -167,6 +173,12 @@ class SandboxExecutor:
                 metadata={"timeout": True, "exit_code": -1, "sandbox": False},
             )
         except OSError as exc:
+            if proc is not None:
+                try:
+                    proc.close()
+                except Exception:
+                    pass
+            self._current_proc = None
             duration_ms = (time.monotonic() - exec_start) * 1000
             logger.error("host_exec_os_error", command=command[:200], error=str(exc), duration_ms=round(duration_ms, 1))
             return ToolResult(
@@ -176,6 +188,11 @@ class SandboxExecutor:
             )
 
         exit_code = proc.returncode or 0  # type: ignore[union-attr]
+        self._current_proc = None
+        try:
+            proc.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
         stdout_text = stdout.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
         stderr_text = stderr.decode("utf-8", errors="replace").strip()  # type: ignore[union-attr]
         duration_ms = (time.monotonic() - exec_start) * 1000

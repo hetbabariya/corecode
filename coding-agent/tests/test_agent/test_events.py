@@ -28,6 +28,10 @@ class TestEventType:
             "reactive_compact",
             "micro_compact",
             "undo_push",
+            "sibling_abort",
+            "hook_block",
+            "hook_output",
+            "perm_mode_changed",
         }
         actual = {e.value for e in EventType}
         assert actual == expected

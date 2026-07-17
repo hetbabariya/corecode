@@ -23,6 +23,7 @@ from coding_agent.agent.context_limits import (
 )
 from coding_agent.agent.error_recovery import ErrorTracker
 from coding_agent.agent.events import AgentEvent, EventType
+from coding_agent.hooks.types import HookEvent
 from coding_agent.agent.memory import MemoryManager
 from coding_agent.agent.reflector import Assessment, Reflector
 from coding_agent.agent.permissions import PermissionManager
@@ -118,17 +119,21 @@ class AgentLoop:
         verify_after_edit: bool = True,
         memory_manager: MemoryManager | None = None,
         session_manager: Any | None = None,
+        agent_timeout_per_iteration: int = 0,
+        config: Any = None,
     ) -> None:
         self.llm_client = llm_client
         self.permissions = permission_manager
         self.context = context_manager
         self.workspace = workspace
+        self.permissions._workspace = str(workspace)
         self.max_iterations = max_iterations  # 0 = unlimited
         self.max_iterations_safety = max_iterations_safety
         self.permission_callback = permission_callback
         self.summary_llm_client = summary_llm_client
         self.max_cost = max_cost
         self.max_time = max_time
+        self.agent_timeout_per_iteration = agent_timeout_per_iteration
         self._start_time: float = 0.0
         self._accumulated_cost: float = 0.0
 
@@ -171,6 +176,13 @@ class AgentLoop:
         # Post-action reflection
         self.reflector = Reflector()
 
+        # Phase B.5: Hooks system
+        from coding_agent.hooks.manager import HookManager
+        self.hook_manager = HookManager(
+            config_path=config.hooks_config_path if config else None
+        )
+        self.hook_config_enabled = config.hooks_enabled if config else True
+
         # Phase B.4: Progress evaluation interval
         self._progress_eval_interval: int = 5
 
@@ -183,11 +195,19 @@ class AgentLoop:
         self._reactive_compact_count: int = 0
         self._reactive_compact_max: int = 3
 
+        # Phase C.6: Intent re-injection after failures
+        self._original_user_input: str = ""
+        self._last_reminder_iteration: int = 0
+        self._reminder_cooldown: int = 3
+        self._current_iteration: int = 0
+
         # Phase A metrics
         self.metrics: dict[str, int | float] = {
             "permission_check_count": 0,
             "permission_deny_count": 0,
             "tool_count": 0,
+            "tool_timeout_count": 0,
+            "tool_cancelled_count": 0,
             "summarize_count": 0,
             "summarize_success": 0,
             "summarize_fail": 0,
@@ -348,6 +368,7 @@ class AgentLoop:
         * The LLM produces a response with **no** tool calls (task complete).
         * Budget (cost/time) is exceeded.
         * The safety net iteration limit is reached (should never happen).
+        * The user cancels (Ctrl+C).
         """
         # Load cross-session memories into the system prompt
         if self.memory_manager is not None:
@@ -375,6 +396,9 @@ class AgentLoop:
                     goal=plan_data.get("goal", ""),
                     current_step=plan_data.get("current_step", 0),
                 )
+
+        # Phase C.6: Store original user input for re-injection
+        self._original_user_input = user_input
 
         self.context.add_user_message(user_input)
         self._start_time = time.monotonic()
@@ -411,6 +435,8 @@ class AgentLoop:
         _iteration = 0
         while True:
             _iteration += 1
+            self._current_iteration = _iteration
+            _iteration_start = time.monotonic()
             logger.info("agent_iteration", iteration=_iteration)
             yield AgentEvent(
                 type=EventType.LOOP_START,
@@ -638,8 +664,18 @@ class AgentLoop:
                         await self._run_session_cleanup("", _iteration)
                         return
                 else:
-                    # Not a context overflow error — re-raise
-                    raise
+                    # Not a context overflow error — surface to user
+                    logger.error(
+                        "stream_error",
+                        error=str(exc)[:200],
+                        error_type=type(exc).__name__,
+                    )
+                    yield AgentEvent(
+                        type=EventType.ERROR,
+                        data={"error": f"LLM request failed: {exc}"},
+                    )
+                    await self._run_session_cleanup("", _iteration)
+                    return
 
             # --- Store assistant turn in context ---
             full_text = "".join(text_parts)
@@ -813,24 +849,66 @@ class AgentLoop:
                     approved_parallel.append(pc)
 
                 if approved_parallel:
-                    async def _exec_one(pc: dict[str, Any]) -> tuple[dict[str, Any], ToolResult]:
-                        return pc, await tool_registry.execute_from_llm(pc["tc"])
+                    abort_event = asyncio.Event()
 
-                    results = await asyncio.gather(
-                        *[_exec_one(pc) for pc in approved_parallel],
-                        return_exceptions=True,
-                    )
-                else:
-                    results = []
+                    async def _exec_one(
+                        pc: dict[str, Any],
+                        _abort: asyncio.Event = abort_event,
+                    ) -> tuple[dict[str, Any], ToolResult]:
+                        if _abort.is_set():
+                            return pc, ToolResult(
+                                success=False,
+                                error="Cancelled: sibling tool failed in parallel batch",
+                            )
+                        result = await tool_registry.execute_from_llm(pc["tc"])
+                        return pc, result
 
-                for item in results:
-                    if isinstance(item, Exception):
-                        logger.error("tool_parallel_error", error=str(item))
-                        continue
-                    pc, result = item
-                    async for event in self._finalize_tool_execution(pc, result):
-                        yield event
-                self._tool_count += len(approved_parallel)
+                    tasks = [asyncio.create_task(_exec_one(pc)) for pc in approved_parallel]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    # Detect failure and abort pending siblings
+                    batch_has_failure = False
+                    for item in results:
+                        if isinstance(item, Exception):
+                            batch_has_failure = True
+                            break
+                        if isinstance(item, tuple) and len(item) == 2:
+                            _, result = item
+                            if isinstance(result, ToolResult) and not result.success:
+                                batch_has_failure = True
+                                break
+
+                    if batch_has_failure:
+                        abort_event.set()
+
+                    for item in results:
+                        if isinstance(item, asyncio.CancelledError):
+                            self.metrics["tool_cancelled_count"] += 1
+                            logger.warning("tool_cancelled_parallel", error=str(item))
+                            continue
+                        elif isinstance(item, Exception):
+                            logger.error("tool_parallel_error", error=str(item))
+                            self.metrics["tool_cancelled_count"] += 1
+                            continue
+                        pc, result = item
+                        # Skip siblings that were aborted
+                        if (
+                            not result.success
+                            and result.error
+                            and "Cancelled: sibling" in result.error
+                        ):
+                            self.metrics["tool_cancelled_count"] += 1
+                            logger.info("sibling_abort", tool=pc["name"])
+                            yield AgentEvent(
+                                type=EventType.SIBLING_ABORT,
+                                data={"tool_name": pc["name"]},
+                            )
+                            continue
+                        async for event in self._finalize_tool_execution(pc, result):
+                            yield event
+                        if getattr(result, "metadata", None) and result.metadata.get("timeout"):
+                            self.metrics["tool_timeout_count"] += 1
+                    self._tool_count += len(approved_parallel)
 
             # Execute sequential tools one at a time
             for pc in sequential_calls:
@@ -841,6 +919,40 @@ class AgentLoop:
                     args=pc["args"],
                     tc_id=pc["tc_id"],
                 )
+
+                # Phase B.5: Pre-execution hook
+                if self.hook_manager and self.hook_config_enabled:
+                    pre_results = await self.hook_manager.run_pre_hooks(
+                        HookEvent.PRE_TOOL_USE,
+                        pc["name"],
+                        pc["args"],
+                        str(self.workspace),
+                    )
+                    for pre_result in pre_results:
+                        if pre_result.blocked:
+                            logger.info(
+                                "hook_blocked_tool",
+                                tool=pc["name"],
+                                stderr=pre_result.stderr[:200],
+                            )
+                            yield AgentEvent(
+                                type=EventType.HOOK_BLOCK,
+                                data={
+                                    "tool_name": pc["name"],
+                                    "reason": pre_result.stderr,
+                                },
+                            )
+                            continue
+                        if pre_result.stdout:
+                            yield AgentEvent(
+                                type=EventType.HOOK_OUTPUT,
+                                data={
+                                    "event": "PreToolUse",
+                                    "tool_name": pc["name"],
+                                    "output": pre_result.stdout,
+                                },
+                            )
+
                 # Permission check
                 perm_level = self._resolve_permission_level(pc)
 
@@ -896,7 +1008,12 @@ class AgentLoop:
                         data={"tool_name": pc["name"], "approved": True},
                     )
 
-                result = await tool_registry.execute_from_llm(pc["tc"])
+                try:
+                    result = await tool_registry.execute_from_llm(pc["tc"])
+                except asyncio.CancelledError:
+                    self.metrics["tool_cancelled_count"] += 1
+                    logger.warning("tool_cancelled", tool=pc["name"])
+                    raise
                 tool_duration_ms = (time.monotonic() - tool_start) * 1000
                 self._tool_count += 1
 
@@ -914,6 +1031,72 @@ class AgentLoop:
 
                 async for event in self._finalize_tool_execution(pc, result, tool_duration_ms):
                     yield event
+
+                # Phase B.5: Post-execution hook
+                if self.hook_manager and self.hook_config_enabled:
+                    post_results = await self.hook_manager.run_post_hooks(
+                        HookEvent.POST_TOOL_USE,
+                        pc["name"],
+                        pc["args"],
+                        result.output[:4096] if result.success else "",
+                        str(self.workspace),
+                    )
+                    for post_result in post_results:
+                        if post_result.stdout:
+                            yield AgentEvent(
+                                type=EventType.HOOK_OUTPUT,
+                                data={
+                                    "event": "PostToolUse",
+                                    "tool_name": pc["name"],
+                                    "output": post_result.stdout,
+                                },
+                            )
+
+                # Track timeout metrics
+                if getattr(result, "metadata", None) and result.metadata.get("timeout"):
+                    self.metrics["tool_timeout_count"] += 1
+
+                # Plan mode: pause after every tool call and ask user to continue
+                if self.permissions.should_pause_after_tool():
+                    yield AgentEvent(
+                        type=EventType.PERMISSION_REQUEST,
+                        data={
+                            "tool_name": pc["name"],
+                            "plan_pause": True,
+                            "result_success": result.success,
+                        },
+                    )
+                    if self.permission_callback is not None:
+                        approved = await self.permission_callback(
+                            pc["name"], pc["args"], "plan_pause"
+                        )
+                    else:
+                        approved = True
+                    if not approved:
+                        logger.info("plan_pause_stopped", tool=pc["name"])
+                        break
+
+            # --- Check per-iteration timeout ---
+            if self.agent_timeout_per_iteration > 0:
+                elapsed_iter = time.monotonic() - _iteration_start
+                if elapsed_iter > self.agent_timeout_per_iteration:
+                    logger.warning(
+                        "agent_iteration_timeout",
+                        iteration=_iteration,
+                        elapsed_s=round(elapsed_iter, 1),
+                        limit_s=self.agent_timeout_per_iteration,
+                    )
+                    yield AgentEvent(
+                        type=EventType.BUDGET_EXCEEDED,
+                        data={
+                            "reason": "iteration_timeout",
+                            "elapsed": elapsed_iter,
+                            "limit": self.agent_timeout_per_iteration,
+                            "iteration": _iteration,
+                        },
+                    )
+                    await self._run_session_cleanup("", _iteration)
+                    return
 
             # --- Phase B.1: Micro-compact old tool results ---
             compacted = self.context.compact_old_tool_results(keep_recent=10)
@@ -985,9 +1168,14 @@ class AgentLoop:
                                 f"Progress stalled after {progress['tool_count']} tools, "
                                 f"{progress['completed']}/{progress['total']} plan steps done."
                             ),
-                            "progress": progress,
+                             "progress": progress,
                         },
                     )
+
+        # Guarantee session cleanup runs even on cancellation
+        if not self._cleanup_done:
+            logger.info("agent_cleanup_finally", iteration=_iteration)
+            await self._run_session_cleanup("finally", _iteration)
 
     # ------------------------------------------------------------------
     # Tool result processing
@@ -1111,6 +1299,31 @@ class AgentLoop:
             success=result.success,
             error=result.error or "",
         )
+
+        # Phase C.6: Intent re-injection after consecutive failures
+        if (
+            not result.success
+            and self.error_tracker.is_stuck()
+            and self._original_user_input
+            and (self._current_iteration - self._last_reminder_iteration) >= self._reminder_cooldown
+        ):
+            consecutive = self.error_tracker.get_consecutive_errors()
+            fail_count = max(consecutive.values()) if consecutive else 0
+            reminder = (
+                f"[system] REMINDER: Your current task is: {self._original_user_input}\n"
+                f"You have failed {fail_count} times. Try a different approach."
+            )
+            self.context.add_user_message(reminder)
+            self._last_reminder_iteration = self._current_iteration
+            logger.info(
+                "intent_reinjected",
+                fail_count=fail_count,
+                iteration=self._current_iteration,
+            )
+            yield AgentEvent(
+                type=EventType.STUCK_DETECTED,
+                data={"message": reminder, "strategy": "replan"},
+            )
 
         # Post-action reflection (signal-only: assessment + reason + confidence)
         reflection = self.reflector.reflect_on_tool(pc["name"], pc["args"], result)

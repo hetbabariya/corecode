@@ -32,6 +32,10 @@ class EventType(Enum):
     REACTIVE_COMPACT = "reactive_compact"
     MICRO_COMPACT = "micro_compact"
     UNDO_PUSH = "undo_push"
+    SIBLING_ABORT = "sibling_abort"
+    HOOK_BLOCK = "hook_block"
+    HOOK_OUTPUT = "hook_output"
+    PERMISSION_MODE_CHANGED = "perm_mode_changed"
 
 
 @dataclass

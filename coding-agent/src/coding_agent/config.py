@@ -131,6 +131,31 @@ class Settings(BaseSettings):
         default=0.1, description="Min importance score to keep during pruning"
     )
 
+    # Tool Timeouts (seconds)
+    tool_timeout_read: int = Field(
+        default=30, description="Timeout for read-only tools"
+    )
+    tool_timeout_write: int = Field(
+        default=30, description="Timeout for write tools"
+    )
+    tool_timeout_execute: int = Field(
+        default=120, description="Timeout for shell execution tools"
+    )
+    tool_timeout_dangerous: int = Field(
+        default=300, description="Timeout for dangerous tools"
+    )
+    tool_timeout_default: int = Field(
+        default=30, description="Global fallback timeout for tools without explicit timeout"
+    )
+    agent_timeout_per_iteration: int = Field(
+        default=0,
+        description="Max seconds for a single agent iteration (LLM call + tools). 0 = unlimited.",
+    )
+    tool_timeout_overrides: dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-tool timeout overrides by name. E.g. {\"shell_execute\": 60}.",
+    )
+
     # Verification
     verify_after_edit: bool = Field(
         default=True, description="Run syntax/lint checks after file edits"
@@ -142,6 +167,15 @@ class Settings(BaseSettings):
     )
     protect_critical_paths: bool = Field(
         default=True, description="Protect critical files (.gitconfig, .ssh, .env, etc.)"
+    )
+
+    # Hooks
+    hooks_enabled: bool = Field(
+        default=True, description="Enable pre/post tool execution hooks"
+    )
+    hooks_config_path: str = Field(
+        default="~/.coding-agent/hooks.json",
+        description="Path to hooks configuration file",
     )
 
     # Workspace
@@ -259,6 +293,15 @@ class Settings(BaseSettings):
             else:
                 model = self.llm_model
         return provider, model
+
+    def get_tool_timeout(self, permission_level: str) -> int:
+        """Return timeout in seconds for a given permission level."""
+        return {
+            "read": self.tool_timeout_read,
+            "write": self.tool_timeout_write,
+            "execute": self.tool_timeout_execute,
+            "dangerous": self.tool_timeout_dangerous,
+        }.get(permission_level, self.tool_timeout_default)
 
     def is_sandbox_mode(self) -> bool:
         """Return True if exec_mode is set to 'sandbox'."""
