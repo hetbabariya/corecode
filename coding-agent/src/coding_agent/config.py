@@ -115,6 +115,12 @@ class Settings(BaseSettings):
         default="~/.coding-agent/sessions.db", description="SQLite database path"
     )
 
+    # Models registry
+    models_config_path: str = Field(
+        default="~/.coding-agent/models.json",
+        description="Path to models registry JSON file",
+    )
+
     # Budgets
     max_cost_per_session: float = Field(
         default=5.0, description="Max cost per session in USD"
@@ -261,6 +267,9 @@ class Settings(BaseSettings):
 
     def get_db_path(self) -> Path:
         return Path(self.db_path).expanduser()
+
+    def get_models_config_path(self) -> Path:
+        return Path(self.models_config_path).expanduser()
 
     def get_active_model(self) -> str:
         """Return the model name for the active provider."""

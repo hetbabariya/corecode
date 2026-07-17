@@ -62,6 +62,7 @@ class CodingAgentREPL(App[None]):
         self._processing: bool = False
         self._model_name: str = ""
         self._provider_name: str = ""
+        self._model_registry: Any = None
 
     def compose(self) -> ComposeResult:
         yield Header(icon="\u2593")
@@ -186,6 +187,9 @@ class CodingAgentREPL(App[None]):
         # Update subtitle
         self.sub_title = f"{model} \u2502 {self.workspace.name}"
 
+        # Initialize model registry
+        await self._init_model_registry()
+
     def _load_custom_commands(self) -> None:
         """Load custom commands from .coding-agent/commands/ directories."""
         from coding_agent.commands import get_registry
@@ -196,6 +200,15 @@ class CodingAgentREPL(App[None]):
         count = registry.load_custom_commands(global_commands, local_commands)
         if count:
             logger.info("custom_commands_loaded", count=count)
+
+    async def _init_model_registry(self) -> None:
+        """Initialize the dynamic model registry."""
+        from coding_agent.config import Settings
+        from coding_agent.llm.models import ModelRegistry
+
+        settings = Settings()
+        self._model_registry = ModelRegistry(settings.get_models_config_path())
+        await self._model_registry.load()
 
     async def _restore_session(self, session_id: str) -> None:
         """Load and display messages from a previous session."""

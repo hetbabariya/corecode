@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from coding_agent.commands.registry import CommandContext
 from coding_agent.commands.types import Command
 
@@ -115,23 +117,222 @@ async def _tokens_handler(ctx: CommandContext, args: str) -> str:
 # ------------------------------------------------------------------
 
 async def _model_handler(ctx: CommandContext, args: str) -> str:
-    """Switch model mid-session or show current model."""
+    """Switch model or show available models.
+
+    /model              — show numbered list of all available models
+    /model <name>       — switch to that model
+    /model add <provider> <name> [--base-url URL] — add custom model
+    /model remove <name> — remove a custom model
+    """
     repl = ctx.repl
     agent = repl._agent
     if not agent:
         return "Agent not initialized."
 
-    if not args:
-        return f"Current model: {repl._model_name} ({repl._provider_name})"
+    registry = repl._model_registry
+    if not registry:
+        return "Model registry not available."
 
-    new_model = args.strip()
-    agent.llm_client.model = new_model
-    repl._model_name = new_model
+    if not args.strip():
+        return _format_model_list(registry, repl._model_name)
 
-    status_bar = repl.query_one("#status-bar")
-    status_bar.update_stats(model=f"{new_model} ({repl._provider_name})")
+    parts = args.strip().split(None, 1)
+    subcmd = parts[0].lower()
 
-    return f"Model switched to: {new_model}"
+    # /model add <provider> <name> [--base-url URL]
+    if subcmd == "add" and len(parts) > 1:
+        return await _model_add(registry, parts[1])
+
+    # /model remove <name>
+    if subcmd == "remove" and len(parts) > 1:
+        return await _model_remove(registry, parts[1].strip())
+
+    # /model <name> — switch
+    model_name = args.strip()
+    entry = registry.resolve(model_name)
+    if not entry:
+        # Try as raw name on default provider
+        entry = registry.resolve_or_raw(model_name)
+
+    # Check API key availability
+    if not entry.api_key:
+        prov = registry.get_provider(entry.provider)
+        env_name = prov.api_key_env if prov else "UNKNOWN"
+        return (
+            f"No API key for {entry.provider}. "
+            f"Set {env_name} in your .env file."
+        )
+
+    # Perform the switch
+    old_model = repl._model_name
+    old_provider = repl._provider_name
+    old_tokens = agent.llm_client.total_usage.prompt_tokens + agent.llm_client.total_usage.completion_tokens
+    old_cost = agent.llm_client.total_usage.estimated_cost
+
+    agent.llm_client.switch_model(
+        model=entry.name,
+        provider=entry.provider,
+        api_key=entry.api_key,
+        base_url=entry.base_url,
+        extra_headers=entry.extra_headers,
+        sdk=entry.sdk,
+    )
+
+    repl._model_name = entry.name
+    repl._provider_name = entry.provider
+
+    # Update status bar
+    try:
+        status_bar = repl.query_one("#status-bar")
+        status_bar.update_stats(model=f"{entry.name} ({entry.provider})")
+    except Exception:
+        pass
+
+    lines = [f"Switched to: {entry.name} ({entry.provider}) [{entry.tier}]"]
+    if old_tokens > 0:
+        lines.insert(
+            0,
+            f"Previous: {old_tokens:,} tokens, ${old_cost:.4f} cost "
+            f"({old_model} — {old_provider}).",
+        )
+    return "\n".join(lines)
+
+
+def _format_model_list(registry: Any, current_model: str) -> str:
+    """Format a numbered list of available models."""
+    models = registry.list_models()
+    if not models:
+        return "No models available. Add one with: /model add <provider> <name> --base-url URL"
+
+    lines = [
+        f"  Current: {current_model} ({registry.default_provider})",
+        "",
+        "  #   Model                              Provider      Tier",
+        "  " + "\u2500" * 65,
+    ]
+    for i, m in enumerate(models, 1):
+        marker = " (active)" if m.name == current_model else ""
+        default = " (default)" if m.is_default else ""
+        name_str = f"{m.name}{default}{marker}"
+        if len(name_str) > 36:
+            name_str = name_str[:33] + "..."
+        lines.append(
+            f"  {i:<4} {name_str:<36} {m.provider:<14} {m.tier}"
+        )
+
+    lines.extend([
+        "",
+        "  Usage: /model <name>  |  /model add <provider> <name> --base-url URL",
+        "  Aliases: /fast (cheapest), /smart (most capable)",
+    ])
+    return "\n".join(lines)
+
+
+async def _model_add(registry: Any, args: str) -> str:
+    """Handle /model add <provider> <name> [--base-url URL]."""
+    import shlex
+    try:
+        tokens = shlex.split(args)
+    except ValueError:
+        tokens = args.split()
+
+    if len(tokens) < 2:
+        return "Usage: /model add <provider> <name> [--base-url URL]"
+
+    provider = tokens[0]
+    name = tokens[1]
+    base_url = None
+
+    # Parse --base-url
+    for i, t in enumerate(tokens):
+        if t == "--base-url" and i + 1 < len(tokens):
+            base_url = tokens[i + 1]
+
+    if not base_url:
+        prov = registry.get_provider(provider)
+        if prov and prov.base_url:
+            base_url = prov.base_url
+        else:
+            return f"base_url required for new provider '{provider}'. Use: --base-url URL"
+
+    ok = await registry.add_model(
+        provider=provider,
+        name=name,
+        base_url=base_url,
+    )
+    if ok:
+        return f"Added {name} to provider {provider}. Use /model {name} to switch."
+    return "Failed to add model. Check provider name and base_url."
+
+
+async def _model_remove(registry: Any, name: str) -> str:
+    """Handle /model remove <name>."""
+    ok = await registry.remove_model(name)
+    if ok:
+        return f"Removed model: {name}"
+    return f"Model '{name}' not found."
+
+
+# ------------------------------------------------------------------
+# /fast
+# ------------------------------------------------------------------
+
+async def _fast_handler(ctx: CommandContext, args: str) -> str:
+    """Switch to the fastest available model."""
+    return await _switch_by_tier(ctx, "fast")
+
+
+# ------------------------------------------------------------------
+# /smart
+# ------------------------------------------------------------------
+
+async def _smart_handler(ctx: CommandContext, args: str) -> str:
+    """Switch to the most capable available model."""
+    return await _switch_by_tier(ctx, "smart")
+
+
+async def _switch_by_tier(ctx: CommandContext, tier: str) -> str:
+    """Switch to the best model for a given tier."""
+    repl = ctx.repl
+    agent = repl._agent
+    if not agent:
+        return "Agent not initialized."
+
+    registry = repl._model_registry
+    if not registry:
+        return "Model registry not available."
+
+    entry = registry.get_by_tier(tier)
+    if not entry:
+        return f"No '{tier}' model available."
+
+    if not entry.api_key:
+        prov = registry.get_provider(entry.provider)
+        env_name = prov.api_key_env if prov else "UNKNOWN"
+        return (
+            f"No API key for {entry.provider}. "
+            f"Set {env_name} in your .env file."
+        )
+
+    agent.llm_client.switch_model(
+        model=entry.name,
+        provider=entry.provider,
+        api_key=entry.api_key,
+        base_url=entry.base_url,
+        extra_headers=entry.extra_headers,
+        sdk=entry.sdk,
+    )
+
+    repl._model_name = entry.name
+    repl._provider_name = entry.provider
+
+    try:
+        status_bar = repl.query_one("#status-bar")
+        status_bar.update_stats(model=f"{entry.name} ({entry.provider})")
+    except Exception:
+        pass
+
+    return f"Switched to: {entry.name} ({entry.provider}) [{tier}]"
 
 
 # ------------------------------------------------------------------
@@ -474,9 +675,21 @@ def get_builtin_commands() -> list[Command]:
         ),
         Command(
             name="model",
-            description="Switch model mid-session",
+            description="Switch model or show available models",
             handler=_model_handler,
-            usage="/model [model-name]",
+            usage="/model [name|add|remove]",
+        ),
+        Command(
+            name="fast",
+            description="Switch to fastest model",
+            handler=_fast_handler,
+            usage="/fast",
+        ),
+        Command(
+            name="smart",
+            description="Switch to most capable model",
+            handler=_smart_handler,
+            usage="/smart",
         ),
         Command(
             name="permissions",

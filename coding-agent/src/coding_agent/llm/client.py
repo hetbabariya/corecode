@@ -259,6 +259,110 @@ class LLMClient:
         )
 
     # ------------------------------------------------------------------
+    # Model switching
+    # ------------------------------------------------------------------
+
+    def switch_model(
+        self,
+        model: str,
+        provider: str,
+        api_key: str | None = None,
+        api_keys: list[str] | None = None,
+        base_url: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        sdk: str = "openai",
+    ) -> None:
+        """Switch to a different model, potentially a different provider.
+
+        Reinitializes the internal client when the provider changes.
+        Resets usage counters for clean cost tracking.
+        """
+        old_model = self.model
+        old_provider = self.provider
+
+        self.model = model
+
+        if provider != self.provider or base_url:
+            # Provider changed — full reinit
+            self.provider = provider
+            keys = api_keys or ([api_key] if api_key else [])
+            self._key_pool = KeyPool(keys) if keys else None
+            self._current_api_key = (
+                self._key_pool.get_key() if self._key_pool else api_key
+            )
+            self._reinit_provider(
+                base_url=base_url,
+                extra_headers=extra_headers or {},
+                sdk=sdk,
+            )
+        elif api_key or api_keys:
+            # Same provider but new key(s) — rotate
+            keys = api_keys or ([api_key] if api_key else [])
+            self._key_pool = KeyPool(keys) if keys else None
+            new_key = self._key_pool.get_key() if self._key_pool else api_key
+            if new_key:
+                self._swap_client(new_key)
+
+        # Reset usage for clean cost tracking
+        self.total_usage = TokenUsage(
+            prompt_tokens=0, completion_tokens=0, model=model,
+        )
+
+        logger.info(
+            "model_switched",
+            old=f"{old_model} ({old_provider})",
+            new=f"{model} ({provider})",
+        )
+
+    def _reinit_provider(
+        self,
+        base_url: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        sdk: str = "openai",
+    ) -> None:
+        """Reinitialize the internal client for the current provider.
+
+        Called when switching providers (e.g. gemini → openrouter).
+        """
+        # Close old http client if present
+        if self._http_client is not None:
+            self._old_clients.append(self._http_client)
+            self._http_client = None
+
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {self._current_api_key}",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        if sdk == "gemini":
+            self._init_gemini()
+        elif self.provider == "omniroute":
+            self._omniroute_base_url = base_url or self._omniroute_base_url
+            self._init_omniroute()
+        elif self.provider == "zenmux":
+            self._zenmux_base_url = base_url or self._zenmux_base_url
+            self._init_zenmux()
+        elif base_url:
+            # Custom OpenAI-compatible provider
+            self._http_client = httpx.AsyncClient(
+                base_url=base_url,
+                headers=headers,
+                timeout=httpx.Timeout(120.0),
+            )
+        elif self.provider == "openrouter":
+            self._init_openrouter()
+        elif self.provider == "cerebras":
+            self._init_cerebras()
+        else:
+            # Unknown provider with no base_url — try as openai-compat
+            self._http_client = httpx.AsyncClient(
+                headers=headers,
+                timeout=httpx.Timeout(120.0),
+            )
+
+    # ------------------------------------------------------------------
     # Gemini message / tool conversion (OpenAI → Google)
     # ------------------------------------------------------------------
 

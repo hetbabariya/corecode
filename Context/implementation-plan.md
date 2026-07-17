@@ -31,7 +31,7 @@
 
 ### Phase D — UX
 - [ ] D.1 MCP Integration
-- [ ] D.2 Model Switching
+- [x] D.2 Model Switching
 - [ ] D.3 Prompt Caching (API-Level)
 - [ ] D.4 Diff Viewer
 - [ ] D.5 Status Bar
