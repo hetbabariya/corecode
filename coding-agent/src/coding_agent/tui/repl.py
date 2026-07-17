@@ -293,6 +293,15 @@ class CodingAgentREPL(App[None]):
                         "info",
                     )
 
+                elif event.type == EventType.STUCK_DETECTED:
+                    data = event.data if isinstance(event.data, dict) else {}
+                    msg = data.get("message", "")
+                    strategy = data.get("strategy", "")
+                    self._show_system(
+                        f"Stuck detected: {msg} (strategy: {strategy})",
+                        "warning",
+                    )
+
                 elif event.type == EventType.CONTEXT_HEALTH:
                     data = event.data if isinstance(event.data, dict) else {}
                     ratio = data.get("usage_ratio", 0)
