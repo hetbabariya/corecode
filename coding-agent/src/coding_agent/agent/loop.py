@@ -1697,11 +1697,36 @@ class AgentLoop:
                 max=max_tokens,
                 ratio=f"{ratio:.1%}",
             )
+            # Phase C.5: Drop oldest 40% of messages (context sliding)
+            dropped = self.context.drop_oldest_messages(fraction=0.4)
+            if dropped:
+                logger.info(
+                    "context_sliding",
+                    dropped=dropped,
+                    remaining=len(self.context.messages),
+                    threshold="95%",
+                )
             # Critical: await summarization to prevent context overflow
             async with self._summarize_lock:
                 await self._summarize_context()
                 self.metrics["summarize_count"] += 1
                 self.metrics["summarize_success"] += 1
+        elif ratio >= 0.90:
+            logger.info(
+                "context_usage_high",
+                tokens=tokens,
+                max=max_tokens,
+                ratio=f"{ratio:.1%}",
+            )
+            # Phase C.5: Drop oldest 20% of messages (context sliding)
+            dropped = self.context.drop_oldest_messages(fraction=0.2)
+            if dropped:
+                logger.info(
+                    "context_sliding",
+                    dropped=dropped,
+                    remaining=len(self.context.messages),
+                    threshold="90%",
+                )
         elif ratio >= 0.85:
             logger.info(
                 "context_usage_high",

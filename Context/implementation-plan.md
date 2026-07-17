@@ -26,7 +26,7 @@
 - [ ] C.2 Session Resumption
 - [ ] C.3 CLAUDE.md Hierarchy (AGENTS.md Hierarchy)
 - [ ] C.4 Slash Commands
-- [ ] C.5 Context Window Sliding
+- [x] C.5 Context Window Sliding
 - [x] C.6 Intent Re-injection After Failures
 
 ### Phase D — UX
@@ -899,6 +899,13 @@ These features make the agent smarter about how it works — better context mana
 - The agent continues functioning normally after the drop.
 
 **Effort:** 1 day
+
+**Status:** ✅ Complete (2026-07-17)
+- Added `drop_oldest_messages(fraction)` to `context.py` — drops oldest N% of messages, preserves at least 1
+- Added 90% threshold in `_check_context_usage()` — drops oldest 20% before summarization
+- Added 95% threshold in `_check_context_usage()` — drops oldest 40% before summarization
+- Logs `context_sliding` events with dropped count, remaining count, and threshold
+- Cheaper alternative to LLM summarization
 
 ---
 

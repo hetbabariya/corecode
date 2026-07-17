@@ -219,6 +219,40 @@ class ContextManager:
 
         return compacted
 
+    def drop_oldest_messages(self, fraction: float = 0.2) -> int:
+        """Drop the oldest messages from the conversation.
+
+        This is the "context window sliding" — a cheaper alternative to
+        summarization. Drops the oldest ``fraction`` of messages while
+        preserving the system prompt, summary, and project context.
+
+        Parameters
+        ----------
+        fraction:
+            Fraction of messages to drop (0.0–1.0). Default 0.2 drops 20%.
+
+        Returns
+        -------
+        int
+            Number of messages actually dropped.
+        """
+        if not self.messages:
+            return 0
+
+        count = max(1, int(len(self.messages) * fraction))
+        count = min(count, len(self.messages) - 1)  # keep at least 1
+
+        if count <= 0:
+            return 0
+
+        dropped = 0
+        for _ in range(count):
+            if self.messages:
+                self.messages.pop(0)
+                dropped += 1
+
+        return dropped
+
     def set_context_summary(self, summary: str) -> None:
         """Set prioritized context summary from SmartContextEngine.
 
