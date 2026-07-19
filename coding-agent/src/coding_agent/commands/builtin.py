@@ -375,16 +375,60 @@ async def _permissions_handler(ctx: CommandContext, args: str) -> str:
 # ------------------------------------------------------------------
 
 async def _plan_handler(ctx: CommandContext, args: str) -> str:
-    """Show current plan state."""
+    """Enter plan mode or show current plan state."""
     agent = ctx.repl._agent
     if not agent:
         return "Agent not initialized."
 
-    prompt = agent.plan_manager.to_prompt()
-    if not prompt:
-        return "No active plan."
+    # If already in plan mode, show current plan
+    if agent._plan_mode:
+        prompt = agent.plan_manager.to_prompt()
+        if prompt:
+            return prompt
+        return "In plan mode. No plan created yet — the agent will create one on its next turn."
 
-    return prompt
+    # Enter plan mode
+    agent.set_plan_mode(True)
+
+    # Auto-create plan template if no plan exists
+    if not agent.plan_manager.has_plan:
+        goal = args.strip() if args.strip() else "Implementation plan"
+        agent.plan_manager.create_plan(
+            goal=goal,
+            steps=[
+                "Analyze codebase and understand current state",
+                "Identify files and changes needed",
+                "Design the implementation approach",
+                "List specific changes with file:line references",
+                "Identify risks, edge cases, and testing strategy",
+            ],
+        )
+
+    return (
+        "Plan mode enabled. Only read-only tools available.\n"
+        "The agent can read files, search code, and create plans, but cannot write.\n"
+        "Use /build to exit plan mode and start execution."
+    )
+
+
+# ------------------------------------------------------------------
+# /build
+# ------------------------------------------------------------------
+
+async def _build_handler(ctx: CommandContext, args: str) -> str:
+    """Exit plan mode and enter execution mode."""
+    agent = ctx.repl._agent
+    if not agent:
+        return "Agent not initialized."
+
+    if not agent._plan_mode:
+        return "Already in execution mode."
+
+    agent.set_plan_mode(False)
+
+    if agent.plan_manager.has_plan:
+        return f"Execution mode active. Plan: {agent.plan_manager.plan.goal}"
+    return "Execution mode active."
 
 
 # ------------------------------------------------------------------
@@ -700,9 +744,15 @@ def get_builtin_commands() -> list[Command]:
         ),
         Command(
             name="plan",
-            description="Show current plan state",
+            description="Enter plan mode (read-only) or show current plan",
             handler=_plan_handler,
-            usage="/plan",
+            usage="/plan [goal]",
+        ),
+        Command(
+            name="build",
+            description="Exit plan mode and start execution",
+            handler=_build_handler,
+            usage="/build",
         ),
         Command(
             name="memory",

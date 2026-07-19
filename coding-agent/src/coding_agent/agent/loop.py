@@ -23,20 +23,21 @@ from coding_agent.agent.context_limits import (
 )
 from coding_agent.agent.error_recovery import ErrorTracker
 from coding_agent.agent.events import AgentEvent, EventType
-from coding_agent.hooks.types import HookEvent
 from coding_agent.agent.memory import MemoryManager
-from coding_agent.agent.reflector import Assessment, Reflector
 from coding_agent.agent.permissions import PermissionManager
 from coding_agent.agent.planner import PlanManager
+from coding_agent.agent.reflector import Assessment, Reflector
 from coding_agent.agent.system_prompt import build_system_prompt
 from coding_agent.agent.undo import UndoManager
 from coding_agent.agent.verifier import PostEditVerifier
 from coding_agent.agent.workspace_index import WorkspaceIndex
+from coding_agent.hooks.types import HookEvent
 from coding_agent.llm.client import LLMClient
 from coding_agent.llm.streaming import StreamEventType
 from coding_agent.logging import logger
+from coding_agent.tools import scratchpad as scratchpad_tool
+from coding_agent.tools import todo as todo_tool
 from coding_agent.tools.base import ToolResult
-from coding_agent.tools.registry import tool_registry
 
 
 class PermissionCallback(Protocol):
@@ -121,6 +122,8 @@ class AgentLoop:
         session_manager: Any | None = None,
         agent_timeout_per_iteration: int = 0,
         config: Any = None,
+        tool_registry: Any = None,
+        depth: int = 0,
     ) -> None:
         self.llm_client = llm_client
         self.permissions = permission_manager
@@ -136,6 +139,13 @@ class AgentLoop:
         self.agent_timeout_per_iteration = agent_timeout_per_iteration
         self._start_time: float = 0.0
         self._accumulated_cost: float = 0.0
+
+        # Tool registry (allows subagent filtering)
+        from coding_agent.tools.registry import tool_registry as _default_registry
+        self.tool_registry = tool_registry or _default_registry
+
+        # Depth tracking (0 = main agent, 1 = direct subagent)
+        self._depth = depth
 
         # Session persistence
         self.session_manager = session_manager
@@ -158,6 +168,12 @@ class AgentLoop:
         from coding_agent.tools.planning import set_plan_manager
 
         set_plan_manager(self.plan_manager)
+
+        # Plan mode (E.1) — read-only mode for planning before execution
+        self._plan_mode: bool = False
+        self._plan_mode_registry = self.tool_registry.filter_by_permission(
+            frozenset({"read"})
+        )
 
         # Workspace index
         self.workspace_index = WorkspaceIndex()
@@ -195,6 +211,14 @@ class AgentLoop:
         self._reactive_compact_count: int = 0
         self._reactive_compact_max: int = 3
 
+        # Phase A.5: Stream error recovery (API errors, transient failures)
+        self._stream_error_count: int = 0
+        self._stream_error_max: int = 3
+
+        # Phase A.6: Stuck retry circuit breaker (no-tool-calls with pending plan)
+        self._stuck_retry_count: int = 0
+        self._stuck_retry_max: int = 5
+
         # Phase C.6: Intent re-injection after failures
         self._original_user_input: str = ""
         self._last_reminder_iteration: int = 0
@@ -229,6 +253,12 @@ class AgentLoop:
         self._bg_tasks: set[asyncio.Task[None]] = set()
         self._summarize_lock = asyncio.Lock()
 
+        # Subagent tracking (C.1)
+        self._subagent_tasks: set[asyncio.Task[None]] = set()
+        self._subagent_semaphore: asyncio.Semaphore = asyncio.Semaphore(
+            config.subagent_max_concurrent if config else 3
+        )
+
         # Session cleanup guard — ensures one-time cleanup on exit
         self._cleanup_done = False
 
@@ -240,15 +270,22 @@ class AgentLoop:
         """Reactive compact — summarize older messages to reduce context size.
 
         This is called when the context window is full and we need to
-        compress the conversation to continue. Keeps the last 3 messages
-        and summarizes everything else.
+        compress the conversation to continue. Finds a safe boundary that
+        preserves tool_call/tool alternation and summarizes everything
+        before it.
         """
         if len(self.context.messages) <= 3:
             return
 
-        # Get the old messages to summarize
-        old_messages = self.context.messages[:-3]
-        recent_messages = self.context.messages[-3:]
+        # Find a safe boundary that preserves tool_call/tool alternation
+        boundary = self.context._find_safe_boundary_from_end(
+            self.context.messages, prefer_keep=3,
+        )
+        if boundary <= 0:
+            return
+
+        old_messages = self.context.messages[:boundary]
+        recent_messages = self.context.messages[boundary:]
 
         # Build a summary prompt
         summary_parts: list[str] = []
@@ -269,7 +306,7 @@ class AgentLoop:
         # Generate summary
         try:
             messages = [
-                {"role": "system", "content": "Summarize the following conversation concisely, keeping key facts and decisions:"},
+                {"role": "system", "content": "Summarize the following conversation concisely, keeping key facts, decisions, and the reasoning behind them. Focus on what was learned and what changed, not just what was said. Preserve the reasoning chains so the agent can continue where it left off:"},
                 {"role": "user", "content": old_content},
             ]
             response = await summary_client.complete(messages)
@@ -361,8 +398,18 @@ class AgentLoop:
     async def process_input(
         self,
         user_input: str,
+        fresh: bool = False,
     ) -> AsyncIterator[AgentEvent]:
         """Process user input and yield events for the TUI / REPL.
+
+        Parameters
+        ----------
+        user_input:
+            The user's prompt or message.
+        fresh:
+            When True, archive any existing plan instead of resuming it.
+            Use for brand-new tasks (``run`` command).
+            When False, auto-resume the active plan from the previous session.
 
         The loop runs until one of:
         * The LLM produces a response with **no** tool calls (task complete).
@@ -370,6 +417,8 @@ class AgentLoop:
         * The safety net iteration limit is reached (should never happen).
         * The user cancels (Ctrl+C).
         """
+        self._fresh_session = fresh
+
         # Load cross-session memories into the system prompt
         if self.memory_manager is not None:
             memory_content = await self.memory_manager.build_prompt_content(
@@ -381,6 +430,7 @@ class AgentLoop:
                 )
 
         # Resume active plan from previous session (D.3)
+        # When fresh=True, skip loading existing plans and archive them instead
         if (
             self.plan_manager is not None
             and self.session_manager is not None
@@ -390,12 +440,20 @@ class AgentLoop:
                 str(self.workspace)
             )
             if plan_data:
-                self.plan_manager.load_from_dict(plan_data)
-                logger.info(
-                    "plan_resumed",
-                    goal=plan_data.get("goal", ""),
-                    current_step=plan_data.get("current_step", 0),
-                )
+                if getattr(self, "_fresh_session", False):
+                    logger.info(
+                        "plan_archived_for_fresh_session",
+                        goal=plan_data.get("goal", ""),
+                        current_step=plan_data.get("current_step", 0),
+                    )
+                    await self.session_manager.complete_plan(plan_data["id"])
+                else:
+                    self.plan_manager.load_from_dict(plan_data)
+                    logger.info(
+                        "plan_resumed",
+                        goal=plan_data.get("goal", ""),
+                        current_step=plan_data.get("current_step", 0),
+                    )
 
         # Phase C.6: Store original user input for re-injection
         self._original_user_input = user_input
@@ -432,6 +490,11 @@ class AgentLoop:
             input_length=len(user_input),
         )
 
+        # Inject parent loop and semaphore into delegate_task tool (C.1)
+        from coding_agent.tools.subagent import set_parent_loop, set_semaphore
+        set_parent_loop(self)
+        set_semaphore(self._subagent_semaphore)
+
         _iteration = 0
         while True:
             _iteration += 1
@@ -442,6 +505,14 @@ class AgentLoop:
                 type=EventType.LOOP_START,
                 data={"iteration": _iteration},
             )
+
+            # --- Emit plan mode transition events ---
+            if self._plan_mode and not getattr(self, "_plan_mode_emitted", False):
+                self._plan_mode_emitted = True
+                yield AgentEvent(type=EventType.PLAN_MODE_ENTERED, data={})
+            elif not self._plan_mode and getattr(self, "_plan_mode_emitted", False):
+                self._plan_mode_emitted = False
+                yield AgentEvent(type=EventType.PLAN_MODE_EXITED, data={})
 
             # --- Check safety net ---
             if (
@@ -555,22 +626,28 @@ class AgentLoop:
                 strategy = self.error_tracker.suggest_strategy()
                 logger.warning("agent_stuck_detected", message=stuck_msg, strategy=strategy.value)
 
+                yield AgentEvent(
+                    type=EventType.STUCK_DETECTED,
+                    data={"message": stuck_msg, "strategy": strategy.value},
+                )
                 if strategy.value == "ask_user":
-                    yield AgentEvent(
-                        type=EventType.ASK_USER,
-                        data={"message": stuck_msg},
+                    # Inject a replanning prompt instead of terminating
+                    self.context.add_user_message(
+                        f"[system] The agent seems stuck. {stuck_msg}\n"
+                        "Please take a step back, review what's been accomplished, "
+                        "analyze what went wrong and why, "
+                        "and try a completely different approach. "
+                        "Consider creating a new plan with a fundamentally different strategy."
                     )
-                    await self._run_session_cleanup("", _iteration)
-                    return
-                else:
-                    yield AgentEvent(
-                        type=EventType.STUCK_DETECTED,
-                        data={"message": stuck_msg, "strategy": strategy.value},
-                    )
+                    self.error_tracker.reset()
 
             # --- Build messages for LLM ---
             messages = self.context.build_messages()
-            tools = tool_registry.get_schemas()
+            tools = (
+                self._plan_mode_registry.get_schemas()
+                if self._plan_mode
+                else self.tool_registry.get_schemas()
+            )
 
             # --- Stream LLM response (with context overflow recovery) ---
             tool_calls: list[dict[str, Any]] = []
@@ -664,18 +741,48 @@ class AgentLoop:
                         await self._run_session_cleanup("", _iteration)
                         return
                 else:
-                    # Not a context overflow error — surface to user
-                    logger.error(
-                        "stream_error",
-                        error=str(exc)[:200],
-                        error_type=type(exc).__name__,
-                    )
-                    yield AgentEvent(
-                        type=EventType.ERROR,
-                        data={"error": f"LLM request failed: {exc}"},
-                    )
-                    await self._run_session_cleanup("", _iteration)
-                    return
+                    # Not a context overflow error — retry with backoff
+                    self._stream_error_count += 1
+                    if self._stream_error_count <= self._stream_error_max:
+                        backoff = min(2 ** self._stream_error_count, 15)
+                        logger.warning(
+                            "stream_error_retry",
+                            attempt=self._stream_error_count,
+                            max_attempts=self._stream_error_max,
+                            backoff_s=backoff,
+                            error=str(exc)[:200],
+                            error_type=type(exc).__name__,
+                        )
+                        yield AgentEvent(
+                            type=EventType.ERROR,
+                            data={
+                                "error": (
+                                    f"LLM request failed (attempt "
+                                    f"{self._stream_error_count}/{self._stream_error_max}): "
+                                    f"{exc}. Retrying in {backoff}s..."
+                                ),
+                            },
+                        )
+                        await asyncio.sleep(backoff)
+                        continue  # retry the LLM call
+                    else:
+                        logger.error(
+                            "stream_error_exhausted",
+                            max_attempts=self._stream_error_max,
+                            error=str(exc)[:200],
+                            error_type=type(exc).__name__,
+                        )
+                        yield AgentEvent(
+                            type=EventType.ERROR,
+                            data={
+                                "error": (
+                                    f"LLM request failed after "
+                                    f"{self._stream_error_max} attempts: {exc}"
+                                ),
+                            },
+                        )
+                        await self._run_session_cleanup("", _iteration)
+                        return
 
             # --- Store assistant turn in context ---
             full_text = "".join(text_parts)
@@ -744,11 +851,92 @@ class AgentLoop:
                     # Reset counter and fall through to normal completion
                     self._max_tokens_recovery_count = 0
 
-            # Reset recovery count on successful completion
+            # Reset recovery counts on successful stream completion
             self._max_tokens_recovery_count = 0
+            self._stream_error_count = 0
+            self._stuck_retry_count = 0
 
-            # --- No tool calls → done ---
+            # --- No tool calls → check if truly done ---
             if not tool_calls:
+                # If there's an active plan with unfinished steps, DON'T exit.
+                # Push the LLM to continue instead of declaring completion early.
+                has_pending_steps = (
+                    self.plan_manager.has_plan
+                    and self.plan_manager.plan is not None
+                    and not self.plan_manager.is_complete()
+                )
+                stream_was_weak = len(full_text.strip()) < 50 and has_pending_steps
+
+                if has_pending_steps:
+                    self._stuck_retry_count += 1
+                    logger.info(
+                        "no_tool_calls_with_pending_steps",
+                        text_length=len(full_text.strip()),
+                        completed=(
+                            len(self.plan_manager.plan.completed_steps)
+                            if self.plan_manager.plan else 0
+                        ),
+                        total=(
+                            len(self.plan_manager.plan.steps)
+                            if self.plan_manager.plan else 0
+                        ),
+                        retry=self._stuck_retry_count,
+                        max_retries=self._stuck_retry_max,
+                    )
+
+                    # Circuit breaker: too many consecutive empty retries
+                    if self._stuck_retry_count > self._stuck_retry_max:
+                        logger.error(
+                            "stuck_retry_exhausted",
+                            retries=self._stuck_retry_max,
+                            text_length=len(full_text.strip()),
+                        )
+                        yield AgentEvent(
+                            type=EventType.ERROR,
+                            data={
+                                "error": (
+                                    "The LLM keeps returning empty responses "
+                                    "with no tool calls after consecutive retries. "
+                                    "The conversation may have a structural issue "
+                                    "(broken tool_call/tool alternation). "
+                                    "Try starting a fresh session."
+                                ),
+                            },
+                        )
+                        await self._run_session_cleanup("", _iteration)
+                        return
+
+                    yield AgentEvent(
+                        type=EventType.STUCK_DETECTED,
+                        data={
+                            "message": (
+                                "The plan still has unfinished steps, but "
+                                "the LLM returned no tool calls. Re-engaging."
+                            ),
+                        },
+                    )
+                    # Remind the LLM of the task and plan state
+                    reminder = (
+                        f"[system] CONTINUING TASK — Your plan still has incomplete steps. "
+                        f"Do NOT stop. Here is the current plan state:\n"
+                        f"{self.plan_manager.to_prompt()}\n\n"
+                        f"Continue executing the next step. "
+                        f"Before proceeding, briefly review what went wrong in previous attempts "
+                        f"and adjust your approach accordingly."
+                    )
+                    if stream_was_weak:
+                        reminder += (
+                            "Your previous response was very short (possibly due to a "
+                            "transient API error). Please regenerate a proper response "
+                            "with tool calls to advance the plan."
+                        )
+                    self.context.add_user_message(reminder)
+                    if self.session_manager is not None and self.session_id is not None:
+                        await self.session_manager.save_message(
+                            self.session_id, "user", reminder,
+                        )
+                    continue  # go back to LLM
+
                 # Run progress evaluation one last time before exiting
                 if _iteration > 0 and _iteration % self._progress_eval_interval == 0:
                     progress = self._evaluate_progress()
@@ -786,6 +974,13 @@ class AgentLoop:
                 tc_id: str = tc.get("id", "")
                 try:
                     tool_args: dict[str, Any] = json.loads(raw_args)
+                    # Handle _raw envelope: some LLMs wrap the actual
+                    # arguments inside {"_raw": "<json string>"}. If so,
+                    # unwrap and re-parse.
+                    if "_raw" in tool_args and isinstance(tool_args["_raw"], str):
+                        inner = json.loads(tool_args["_raw"])
+                        if isinstance(inner, dict):
+                            tool_args = inner
                 except json.JSONDecodeError:
                     tool_args = {}
                 parsed_calls.append({
@@ -810,6 +1005,51 @@ class AgentLoop:
                     parallel_batch.append(pc)
                 else:
                     sequential_calls.append(pc)
+
+            # --- Plan mode: block non-read tool calls ---
+            if self._plan_mode:
+                blocked_names = set()
+                for pc in parsed_calls:
+                    tool_obj = self.tool_registry.get(pc["name"])
+                    if tool_obj.permission_level != "read":
+                        blocked_names.add(pc["name"])
+                        self.context.add_tool_result(
+                            tool_call_id=pc["tc_id"],
+                            name=pc["name"],
+                            result=(
+                                "BLOCKED: You are in Plan Mode. "
+                                "Only read-only tools are available. "
+                                "Use /build to switch to execution mode."
+                            ),
+                        )
+                        yield AgentEvent(
+                            type=EventType.TOOL_RESULT,
+                            data={
+                                "name": pc["name"],
+                                "result": ToolResult(
+                                    success=False,
+                                    error=(
+                                        "Plan mode — read-only tools only. "
+                                        "Use /build to exit plan mode."
+                                    ),
+                                ),
+                                "tc_id": pc["tc_id"],
+                            },
+                        )
+                if blocked_names:
+                    logger.info(
+                        "plan_mode_blocked",
+                        tools=sorted(blocked_names),
+                    )
+                # Rebuild batches with only read-only tools
+                parallel_batch = [
+                    pc for pc in parallel_batch
+                    if self.tool_registry.get(pc["name"]).permission_level == "read"
+                ]
+                sequential_calls = [
+                    pc for pc in sequential_calls
+                    if self.tool_registry.get(pc["name"]).permission_level == "read"
+                ]
 
             # Execute parallel-safe tools concurrently
             if parallel_batch:
@@ -860,7 +1100,7 @@ class AgentLoop:
                                 success=False,
                                 error="Cancelled: sibling tool failed in parallel batch",
                             )
-                        result = await tool_registry.execute_from_llm(pc["tc"])
+                        result = await self.tool_registry.execute_from_llm(pc["tc"])
                         return pc, result
 
                     tasks = [asyncio.create_task(_exec_one(pc)) for pc in approved_parallel]
@@ -1009,7 +1249,7 @@ class AgentLoop:
                     )
 
                 try:
-                    result = await tool_registry.execute_from_llm(pc["tc"])
+                    result = await self.tool_registry.execute_from_llm(pc["tc"])
                 except asyncio.CancelledError:
                     self.metrics["tool_cancelled_count"] += 1
                     logger.warning("tool_cancelled", tool=pc["name"])
@@ -1184,7 +1424,7 @@ class AgentLoop:
     def _resolve_permission_level(self, pc: dict[str, Any]) -> str:
         """Look up the permission level for a tool call."""
         try:
-            return tool_registry.get(pc["name"]).permission_level
+            return self.tool_registry.get(pc["name"]).permission_level
         except KeyError:
             return "read"
 
@@ -1226,6 +1466,14 @@ class AgentLoop:
             name=pc["name"],
             result=output,
         )
+
+        # Drain subagent events after delegate_task execution (C.1)
+        if pc["name"] == "delegate_task":
+            from coding_agent.tools.subagent import drain_events
+            sub_queue = (result.metadata or {}).get("_subagent_event_queue")
+            async for sub_event in drain_events(sub_queue):
+                yield sub_event
+
         async for sub_event in self._post_tool_actions(pc, result, output, tool_duration_ms):
             yield sub_event
 
@@ -1311,7 +1559,11 @@ class AgentLoop:
             fail_count = max(consecutive.values()) if consecutive else 0
             reminder = (
                 f"[system] REMINDER: Your current task is: {self._original_user_input}\n"
-                f"You have failed {fail_count} times. Try a different approach."
+                f"You have failed {fail_count} times. Stop and reassess:\n"
+                f"1. What pattern do you see in the failures?\n"
+                f"2. What have you tried that didn't work?\n"
+                f"3. What's a fundamentally different approach you haven't tried?\n"
+                f"Try a completely different approach."
             )
             self.context.add_user_message(reminder)
             self._last_reminder_iteration = self._current_iteration
@@ -1388,11 +1640,16 @@ class AgentLoop:
             pc["name"], output, success=result.success,
         )
 
-        # Persist tool operation
+        # Persist tool operation and result message
         if self.session_manager is not None and self.session_id is not None:
             await self.session_manager.save_operation(
                 self.session_id, pc["name"], pc["args"],
                 output[:500], success=result.success,
+            )
+            await self.session_manager.save_message(
+                self.session_id, "tool", output,
+                tool_call_id=pc["tc_id"],
+                name=pc["name"],
             )
 
         # Verify after edit
@@ -1469,12 +1726,11 @@ class AgentLoop:
     # Phase B.2: Auto-replanning
     # ------------------------------------------------------------------
 
-    async def _generate_replan(self) -> "Plan | None":
+    async def _generate_replan(self) -> Plan | None:
         """Generate a new plan using the LLM when a step fails.
 
         Returns a new Plan or None if replanning fails.
         """
-        from coding_agent.agent.planner import Plan, PlanStep, PlanStatus
 
         current_state = self.plan_manager.to_prompt()
         failed_step = ""
@@ -1487,9 +1743,17 @@ class AgentLoop:
                 "content": (
                     "You are a planning assistant. The previous plan had a step that failed. "
                     "Generate a NEW plan that accounts for what was already accomplished. "
+                    "\n\nBefore generating the plan, reason through:\n"
+                    "1. What was the original goal?\n"
+                    "2. What was already accomplished? (List completed steps and their results)\n"
+                    "3. Why did the failed step fail? (Root cause analysis — not just the error message)\n"
+                    "4. What alternative approaches could work? (Consider at least 2 alternatives)\n"
+                    "5. How can we avoid the same failure? (Specific prevention strategy)\n"
+                    "6. Are there any dependencies between steps that need reordering?\n\n"
+                    "After reasoning, generate the new plan.\n\n"
                     "Return ONLY a JSON object with this exact format:\n"
                     '{"goal": "...", "steps": ["step 1", "step 2", ...]}\n'
-                    "3-10 steps. Be specific and actionable."
+                    "3-10 steps. Be specific, actionable, and include verification steps."
                 ),
             },
             {
@@ -1497,7 +1761,7 @@ class AgentLoop:
                 "content": (
                     f"Previous plan state:\n{current_state}\n\n"
                     f"Failed step: {failed_step}\n\n"
-                    "Generate a new plan."
+                    "Reason through the failure, then generate a new plan."
                 ),
             },
         ]
@@ -1509,14 +1773,14 @@ class AgentLoop:
             logger.error("replan_failed", error=str(e))
             return None
 
-    def _parse_plan_response(self, content: str) -> "Plan | None":
+    def _parse_plan_response(self, content: str) -> Plan | None:
         """Parse an LLM response into a Plan object.
 
         Expects JSON with {"goal": "...", "steps": [...]}.
         """
         import json
 
-        from coding_agent.agent.planner import Plan, PlanStep, PlanStatus
+        from coding_agent.agent.planner import Plan, PlanStatus, PlanStep
 
         try:
             # Try to extract JSON from the response (may be wrapped in markdown)
@@ -1641,9 +1905,12 @@ class AgentLoop:
                 "role": "system",
                 "content": (
                     "You are a summarization assistant. "
-                    "Summarize the following conversation concisely. "
-                    "Focus on: what the user asked, what was found, "
-                    "what was changed. Max 500 tokens."
+                    "Summarize the following conversation concisely, preserving the reasoning and context. "
+                    "Focus on: what the user asked (and why), what was found (key insights), "
+                    "what was changed (and the reasoning behind changes), and any unresolved issues. "
+                    "Preserve the reasoning chains — don't just summarize outcomes, summarize the thinking process. "
+                    "Keep factual accuracy — don't infer information not present in the conversation. "
+                    "Max 500 tokens."
                 ),
             },
             {
@@ -1748,6 +2015,15 @@ class AgentLoop:
         return ratio
 
     # ------------------------------------------------------------------
+    # Plan mode (E.1)
+    # ------------------------------------------------------------------
+
+    def set_plan_mode(self, enabled: bool) -> None:
+        """Enable or disable plan mode (read-only)."""
+        self._plan_mode = enabled
+        logger.info("plan_mode_changed", enabled=enabled)
+
+    # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
 
@@ -1757,6 +2033,11 @@ class AgentLoop:
         for task in self._bg_tasks:
             task.cancel()
         self._bg_tasks.clear()
+
+        # Cancel subagent tasks
+        for task in self._subagent_tasks:
+            task.cancel()
+        self._subagent_tasks.clear()
 
         self.context.clear()
         self.permissions.reset()
@@ -1795,12 +2076,24 @@ class AgentLoop:
         else:
             self.metrics["prompt_cache_hits"] += 1
 
-        # Append dynamic sections (plan, memory) that may change per iteration
+        # Append dynamic sections (plan, memory, scratchpad, todos)
+        # that may change per iteration
         base = self._cached_system_prompt
+        if self._plan_mode:
+            base += "\n\n## PLAN MODE ACTIVE\n\nYou are in Plan Mode. Only read-only tools are available (reads, searches, git status). You cannot write files, run commands, or spawn subagents. Create a detailed implementation plan, then tell the user to use `/build` to start execution."
         if plan_prompt:
             base += f"\n\n## Current Plan\n\n{plan_prompt}"
         if memory_content:
             base += f"\n\n## Memory\n\n{memory_content}"
+
+        # Scratchpad and todos — read from tool module state (visible every turn)
+        sp_content = scratchpad_tool.get_scratchpad_content()
+        if sp_content:
+            base += f"\n\n## Current Scratchpad\n\n{sp_content}"
+
+        todos_content = todo_tool.get_todos_summary()
+        if todos_content:
+            base += f"\n\n## Current Todos\n\n{todos_content}"
 
         return base
 

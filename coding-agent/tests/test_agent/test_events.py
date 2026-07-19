@@ -32,6 +32,12 @@ class TestEventType:
             "hook_block",
             "hook_output",
             "perm_mode_changed",
+            "subagent_started",
+            "subagent_tool_start",
+            "subagent_tool_result",
+            "subagent_completed",
+            "plan_mode_entered",
+            "plan_mode_exited",
         }
         actual = {e.value for e in EventType}
         assert actual == expected

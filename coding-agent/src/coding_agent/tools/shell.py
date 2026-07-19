@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import sys
 from typing import TYPE_CHECKING
 
 from coding_agent.logging import logger
@@ -11,6 +13,52 @@ from coding_agent.tools.registry import tool
 
 if TYPE_CHECKING:
     from coding_agent.sandbox.executor import SandboxExecutor
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform command normalization
+# ---------------------------------------------------------------------------
+
+
+_UNIX_TO_WIN: list[tuple[re.Pattern[str], str]] = []
+
+
+def _add_xlate(pattern: str, replacement: str) -> None:
+    """Register a Unix→Windows command translation rule."""
+    _UNIX_TO_WIN.append((re.compile(pattern, re.IGNORECASE), replacement))
+
+
+# Common Unix commands and their Windows CMD equivalents
+# mkdir -p: CMD's mkdir creates intermediate dirs in modern Windows, just strip -p
+_add_xlate(r"\bmkdir\s+-p\b", "mkdir")
+_add_xlate(r"\brm\s+-rf\b", "rmdir /s /q")
+_add_xlate(r"\brm\s+-r\b", "rmdir /s")
+_add_xlate(r"\brm\s+-f\b", "del /f")
+_add_xlate(r"\bcat\b", "type")
+_add_xlate(r"\bcp\s+(-[a-zA-Z]+\s+)?", "copy ")
+_add_xlate(r"\bmv\b", "move")
+_add_xlate(r"\bwhich\b", "where")
+_add_xlate(r"\bgrep\b", "findstr")
+_add_xlate(r"\bless\b", "more")
+_add_xlate(r"\bclear\b", "cls")
+_add_xlate(r"\btouch\b", "copy /b nul+")
+_add_xlate(r"\bhead\b", "more")
+_add_xlate(r"\bwc\s+-l\b", "find /c /v \"\"")
+
+
+def _xlate_command(command: str) -> str:
+    """Translate Unix shell commands to Windows equivalents.
+
+    Only applies when running on Windows (``sys.platform == "win32"``).
+    Uses a set of regex-based substitution rules for common commands.
+    """
+    if sys.platform != "win32":
+        return command
+
+    result = command
+    for pattern, replacement in _UNIX_TO_WIN:
+        result = pattern.sub(replacement, result)
+    return result
 
 # ---------------------------------------------------------------------------
 # Lazy sandbox executor singleton
@@ -87,24 +135,39 @@ async def execute_command(
     if not command.strip():
         return ToolResult(success=False, error="Command cannot be empty")
 
+    # Cross-platform: translate Unix commands to Windows equivalents
+    translated = _xlate_command(command)
+    if translated != command:
+        logger.debug(
+            "command_translated",
+            original=command,
+            translated=translated,
+            platform=sys.platform,
+        )
+
     # Dangerous command check
     from coding_agent.config import Settings
 
     settings = Settings()
     if settings.block_dangerous_commands:
-        result = check_dangerous_command(command)
+        result = check_dangerous_command(translated)
         if result.is_dangerous:
             logger.warning(
                 "dangerous_command_blocked",
                 command=command,
+                translated=translated,
                 reason=result.reason,
             )
             return ToolResult(success=False, error=f"Blocked: {result.reason}")
 
     executor = await _get_executor()
     result = await executor.execute(
-        command,
+        translated,
         timeout=timeout,
         cwd=cwd,
     )
+    # Log translation in output metadata so the LLM knows about it
+    if translated != command and result.metadata is not None:
+        result.metadata["command_original"] = command
+        result.metadata["command_translated"] = translated
     return result

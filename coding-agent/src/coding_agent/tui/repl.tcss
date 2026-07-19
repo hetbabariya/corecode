@@ -1,0 +1,139 @@
+Screen {
+    background: $background;
+}
+
+#chat-view {
+    background: $background;
+    padding: 0 1;
+}
+
+#input {
+    dock: bottom;
+    height: auto;
+    min-height: 1;
+    background: $background;
+    color: $foreground;
+    padding: 0 1;
+    margin: 0;
+    border: tall $border-blurred;
+}
+
+#input:focus {
+    border: tall $primary;
+}
+
+#status-bar {
+    dock: bottom;
+    height: 1;
+    background: $panel;
+    color: $foreground;
+    padding: 0 1;
+}
+
+UserMessage {
+    color: $foreground;
+    padding: 0 0 0 2;
+    margin: 1 0 0 0;
+}
+
+AssistantMessage {
+    color: $foreground;
+    padding: 0 0 0 2;
+    margin: 1 0 0 0;
+}
+
+AssistantMessage > .markdown--code {
+    background: $surface;
+    color: $success;
+    margin: 0 2;
+    padding: 0 1;
+}
+
+AssistantMessage > .markdown--code_inline {
+    background: $surface;
+    color: $warning;
+}
+
+AssistantMessage > .markdown--h1,
+AssistantMessage > .markdown--h2,
+AssistantMessage > .markdown--h3 {
+    color: $primary;
+    margin: 1 0 0 0;
+}
+
+AssistantMessage > .markdown--link {
+    color: $primary;
+    text-style: underline;
+}
+
+AssistantMessage > .markdown--blockquote {
+    color: $text-muted;
+    border-left: tall $primary;
+}
+
+ToolCallBlock {
+    background: transparent;
+    color: $text-muted;
+    padding: 0 0 0 4;
+    margin: 1 0 0 0;
+}
+
+ToolCallBlock.-success {
+    color: $text-muted;
+}
+
+ToolCallBlock.-error {
+    color: $text-muted;
+}
+
+SystemMessage {
+    color: $text-muted;
+    padding: 0 1;
+    margin: 0 0 0 2;
+}
+
+SystemMessage.-warning {
+    color: $warning;
+}
+
+SystemMessage.-error {
+    color: $error;
+}
+
+SystemMessage.-info {
+    color: $text-muted;
+}
+
+ThinkingIndicator {
+    color: $text-muted;
+    padding: 0 1;
+    margin: 0 0 0 2;
+}
+
+PlanPanel {
+    background: $surface;
+    color: $foreground;
+    padding: 0 1;
+    margin: 0 0 0 4;
+    border: tall $border-blurred;
+}
+
+StatusPanel {
+    background: $surface;
+    color: $foreground;
+    padding: 0 1;
+    margin: 0 0 0 4;
+    border: tall $border-blurred;
+}
+
+DiffViewer {
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+    margin: 0 0 0 4;
+    border: tall $border-blurred;
+}
+
+DiffViewer:focus {
+    border: tall $primary;
+}

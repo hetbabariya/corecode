@@ -108,6 +108,14 @@ class Reflector:
                 "role": "system",
                 "content": (
                     "You are evaluating whether a tool call achieved its expected outcome. "
+                    "Be rigorous and honest in your assessment. "
+                    "Before assessing, reason through:\n"
+                    "1. What was the expected outcome?\n"
+                    "2. What actually happened? (Describe the actual result)\n"
+                    "3. What is the gap between expected and actual?\n"
+                    "4. Is this gap acceptable or does it indicate failure?\n"
+                    "5. What would have made this succeed? (Missing information, different approach, etc.)\n"
+                    "6. Is there a systemic issue, or was this a one-off failure?\n\n"
                     "Return ONLY a JSON object: "
                     '{"assessment": "success"|"partial"|"failure", "reason": "...", "confidence": 0.0-1.0}'
                 ),
@@ -119,7 +127,7 @@ class Reflector:
                     f"Expected: {expected_outcome}\n"
                     f"Actual output: {actual_output[:500]}\n"
                     f"Success flag: {result.success}\n\n"
-                    "Did the tool achieve the expected outcome?"
+                    "Did the tool achieve the expected outcome? Why or why not?"
                 ),
             },
         ]

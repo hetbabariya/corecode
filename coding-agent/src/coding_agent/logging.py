@@ -137,20 +137,21 @@ def setup_logging(
     for h in list(root.handlers):
         root.removeHandler(h)
 
-    # Stderr handler (human-readable)
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(log_level)
-    stderr_handler.setFormatter(
-        structlog.stdlib.ProcessorFormatter(
-            processor=console_renderer,
-            foreign_pre_chain=[
-                structlog.contextvars.merge_contextvars,
-                structlog.processors.add_log_level,
-                structlog.processors.TimeStamper(fmt="iso"),
-            ],
+    # Stderr handler (human-readable) — skip when TUI owns the terminal
+    if not capture_for_tui:
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setLevel(log_level)
+        stderr_handler.setFormatter(
+            structlog.stdlib.ProcessorFormatter(
+                processor=console_renderer,
+                foreign_pre_chain=[
+                    structlog.contextvars.merge_contextvars,
+                    structlog.processors.add_log_level,
+                    structlog.processors.TimeStamper(fmt="iso"),
+                ],
+            )
         )
-    )
-    root.addHandler(stderr_handler)
+        root.addHandler(stderr_handler)
 
     # File handler (JSON format for structured logs)
     if log_file:

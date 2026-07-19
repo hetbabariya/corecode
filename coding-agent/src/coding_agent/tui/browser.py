@@ -10,93 +10,17 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
+from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
-
-_NORD = {
-    "primary": "#88C0D0",
-    "secondary": "#81A1C1",
-    "accent": "#B48EAD",
-    "foreground": "#ECEFF4",
-    "success": "#A3BE8C",
-    "warning": "#EBCB8B",
-    "error": "#BF616A",
-    "dim": "#7B88A1",
-    "surface": "#3B4252",
-    "panel": "#434C5E",
-}
-
-BROWSER_CSS = """
-Screen {
-    background: $background;
-}
-
-#search-bar {
-    dock: top;
-    height: 3;
-    background: $surface;
-    padding: 0 1;
-    border-bottom: tall $panel;
-}
-
-#search-bar Input {
-    background: $panel;
-    color: $foreground;
-    border: tall $primary;
-    padding: 0 1;
-    width: 100%;
-}
-
-#session-table {
-    height: 1fr;
-    background: $background;
-}
-
-#info-panel {
-    dock: bottom;
-    height: 3;
-    background: $surface;
-    padding: 0 1;
-    border-top: tall $panel;
-    color: $text-muted;
-}
-
-#info-panel Static {
-    color: $text-muted;
-}
-
-.help-hint {
-    color: $text-muted;
-    padding: 0 1;
-}
-
-DataTable > .datatable--header {
-    background: $panel;
-    color: $primary;
-    text-style: bold;
-}
-
-DataTable > .datatable--cursor {
-    background: $primary 30%;
-    color: $foreground;
-}
-
-DataTable > .datatable--even-row {
-    background: $surface;
-}
-
-DataTable > .datatable--odd-row {
-    background: $background;
-}
-"""
+from coding_agent.tui.theme import create_nord_theme
 
 
-class SessionBrowser(App[None]):
-    """TUI session browser for listing, searching, and resuming sessions."""
+class BrowserScreen(Screen[str | None]):
+    """Screen for browsing, searching, and resuming sessions."""
 
-    TITLE = "Coding Agent — Sessions"
-    SUB_TITLE = ""
-    CSS = BROWSER_CSS
+    TITLE = "Coding Agent \u2014 Sessions"
+    CSS_PATH = "browser.tcss"
 
     BINDINGS = [
         Binding("ctrl+d", "quit", "Quit", show=True),
@@ -109,7 +33,6 @@ class SessionBrowser(App[None]):
 
     selected_session_id: reactive[str | None] = reactive(None)
     _sessions: list[dict[str, Any]] = []
-    _launch_session_id: str | None = None
 
     def __init__(self, workspace: Path = Path(".")) -> None:
         super().__init__()
@@ -160,7 +83,6 @@ class SessionBrowser(App[None]):
             summary = (s.summary or "(no summary)")[:60]
             sid = s.id
 
-            # Apply filter
             if filter_text:
                 flt = filter_text.lower()
                 searchable = f"{sid} {model} {summary} {date}".lower()
@@ -190,49 +112,35 @@ class SessionBrowser(App[None]):
 
     async def action_resume(self) -> None:
         """Resume the selected session."""
-        table = self.query_one("#session-table", DataTable)
-        cursor = table.cursor_coordinate
-        if cursor.row < len(self._sessions):
-            session_id = self._sessions[cursor.row]["id"]
-            self._launch_session_id = session_id
-            self.exit()
+        if self.selected_session_id:
+            self.dismiss(self.selected_session_id)
 
     async def action_new_session(self) -> None:
-        """Launch a new session (no resumption)."""
-        self._launch_session_id = None
-        self.exit()
+        """Start a new session."""
+        self.dismiss("__new__")
 
     async def action_delete_session(self) -> None:
-        """Delete the selected session after confirmation."""
-        table = self.query_one("#session-table", DataTable)
-        cursor = table.cursor_coordinate
-        if cursor.row >= len(self._sessions):
+        """Delete the selected session."""
+        if not self.selected_session_id:
             return
-
-        session_id = self._sessions[cursor.row]["id"]
-
-        # Simple confirmation via system message toggle
         from coding_agent.config import Settings
         from coding_agent.session.manager import SessionManager
 
         settings = Settings()
         mgr = SessionManager(settings.get_db_path())
         await mgr.initialize()
-
-        # Delete messages first, then session
         assert mgr._db is not None
         await mgr._db.execute(
-            "DELETE FROM messages WHERE session_id = ?", (session_id,),
+            "DELETE FROM messages WHERE session_id = ?", (self.selected_session_id,),
         )
         await mgr._db.execute(
-            "DELETE FROM operations WHERE session_id = ?", (session_id,),
+            "DELETE FROM operations WHERE session_id = ?", (self.selected_session_id,),
         )
         await mgr._db.execute(
-            "DELETE FROM sessions WHERE id = ?", (session_id,),
+            "DELETE FROM sessions WHERE id = ?", (self.selected_session_id,),
         )
         await mgr._db.commit()
         await mgr.close()
-
         await self._load_sessions(
             filter_text=self.query_one("#search-input", Input).value,
         )
@@ -244,11 +152,28 @@ class SessionBrowser(App[None]):
         )
 
 
-def run_browser(workspace: Path = Path(".")) -> str | None:
-    """Run the session browser and return the selected session ID.
+class SessionBrowser(App[str | None]):
+    """Standalone session browser App (backward compat wrapper)."""
 
-    Returns None if the user chose to start a new session or quit.
-    """
+    CSS_PATH = "browser.tcss"
+
+    def __init__(self, workspace: Path = Path(".")) -> None:
+        super().__init__()
+        self.workspace = workspace
+        self._launch_session_id: str | None = None
+
+    def on_mount(self) -> None:
+        self.register_theme(create_nord_theme())
+        self.theme = "coding-agent"
+        self.push_screen(BrowserScreen(self.workspace), self._on_browser_done)
+
+    def _on_browser_done(self, session_id: str | None) -> None:
+        self._launch_session_id = session_id
+        self.exit(session_id)
+
+
+def run_browser(workspace: Path = Path(".")) -> str | None:
+    """Run the session browser and return the selected session ID."""
     browser = SessionBrowser(workspace=workspace)
     browser.run()
     return browser._launch_session_id

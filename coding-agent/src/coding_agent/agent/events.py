@@ -36,6 +36,12 @@ class EventType(Enum):
     HOOK_BLOCK = "hook_block"
     HOOK_OUTPUT = "hook_output"
     PERMISSION_MODE_CHANGED = "perm_mode_changed"
+    SUBAGENT_STARTED = "subagent_started"
+    SUBAGENT_TOOL_START = "subagent_tool_start"
+    SUBAGENT_TOOL_RESULT = "subagent_tool_result"
+    SUBAGENT_COMPLETED = "subagent_completed"
+    PLAN_MODE_ENTERED = "plan_mode_entered"
+    PLAN_MODE_EXITED = "plan_mode_exited"
 
 
 @dataclass
@@ -44,3 +50,5 @@ class AgentEvent:
 
     type: EventType
     data: Any = None
+    error: str | None = None
+    depth: int = 0

@@ -695,9 +695,31 @@ class LLMClient:
                     model=self.model,
                     status=exc.response.status_code,
                 )
-                fallback_payload = {**payload, "model": "auto"}
-                response = await self._http_client.post("/chat/completions", json=fallback_payload)
-                response.raise_for_status()
+                # Try fallback once
+                try:
+                    fallback_payload = {**payload, "model": "auto"}
+                    response = await self._http_client.post(
+                        "/chat/completions", json=fallback_payload
+                    )
+                    response.raise_for_status()
+                    logger.info(
+                        "omniroute_fallback_succeeded",
+                        original_model=self.model,
+                    )
+                    # Fallback succeeded — continue with response.
+                    # Note: the fallback model may produce lower-quality output;
+                    # the agent loop handles weak responses via its own retry logic.
+                except Exception as fb_exc:
+                    logger.error(
+                        "omniroute_fallback_failed",
+                        original_model=self.model,
+                        error=str(fb_exc)[:200],
+                    )
+                    raise RuntimeError(
+                        f"OmniRoute model '{self.model}' failed with "
+                        f"status {exc.response.status_code}, and fallback "
+                        f"to 'auto' also failed: {fb_exc}"
+                    ) from fb_exc
             else:
                 raise
 

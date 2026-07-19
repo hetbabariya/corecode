@@ -1,0 +1,61 @@
+Screen {
+    background: $background;
+}
+
+#search-bar {
+    dock: top;
+    height: 3;
+    background: $surface;
+    padding: 0 1;
+    border-bottom: tall $panel;
+}
+
+#search-bar Input {
+    background: $panel;
+    color: $foreground;
+    border: tall $primary;
+    padding: 0 1;
+    width: 100%;
+}
+
+#session-table {
+    height: 1fr;
+    background: $background;
+}
+
+#info-panel {
+    dock: bottom;
+    height: 3;
+    background: $surface;
+    padding: 0 1;
+    border-top: tall $panel;
+    color: $text-muted;
+}
+
+#info-panel Static {
+    color: $text-muted;
+}
+
+.help-hint {
+    color: $text-muted;
+    padding: 0 1;
+}
+
+DataTable > .datatable--header {
+    background: $panel;
+    color: $primary;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: $primary 30%;
+    color: $foreground;
+}
+
+DataTable > .datatable--even-row {
+    background: $surface;
+}
+
+DataTable > .datatable--odd-row {
+    background: $background;
+}

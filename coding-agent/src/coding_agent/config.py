@@ -167,6 +167,23 @@ class Settings(BaseSettings):
         default=True, description="Run syntax/lint checks after file edits"
     )
 
+    # Subagent settings (C.1)
+    subagent_max_concurrent: int = Field(
+        default=3, description="Max concurrent subagents"
+    )
+    subagent_max_iterations: int = Field(
+        default=20, description="Max iterations per subagent"
+    )
+    subagent_depth_limit: int = Field(
+        default=1, description="Max subagent nesting depth (1 = no sub-subagents)"
+    )
+    subagent_max_cost: float = Field(
+        default=2.0, description="Max cost per subagent in USD"
+    )
+    subagent_max_time: int = Field(
+        default=180, description="Max time per subagent in seconds"
+    )
+
     # Safety
     block_dangerous_commands: bool = Field(
         default=True, description="Block dangerous shell commands (rm -rf, git push --force, etc.)"

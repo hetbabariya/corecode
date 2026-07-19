@@ -25,7 +25,7 @@ class TestBuildStaticPrompt:
 
     def test_contains_core_principles(self):
         result = build_static_prompt()
-        assert "Think first" in result
+        assert "Think deeply first" in result
         assert "Minimal changes" in result
 
     def test_contains_safety(self):

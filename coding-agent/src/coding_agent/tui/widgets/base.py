@@ -7,7 +7,7 @@ import time
 from rich.markup import escape
 from rich.text import Text
 from textual.reactive import reactive
-from textual.widgets import Static
+from textual.widgets import Markdown, Static
 
 # Nord palette (hex values for Rich Text styles)
 _NORD = {
@@ -23,37 +23,30 @@ _NORD = {
 
 
 class UserMessage(Static):
-    """Displays a user message with timestamp."""
+    """Displays a user message with a clean prefix."""
 
     def __init__(self, content: str, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._content = content
-        self._timestamp = time.strftime("%H:%M")
 
     def render(self) -> Text:
         text = Text()
-        text.append(f" {self._timestamp} ", style="dim")
-        text.append("\u2502 ", style="dim")
-        text.append(self._content, style=f"bold {_NORD['primary']}")
+        text.append(" \u276f ", style=f"bold {_NORD['primary']}")
+        text.append(self._content, style=_NORD["foreground"])
         return text
 
 
-class AssistantMessage(Static):
-    """Displays an assistant message with streaming support."""
-
-    _text: reactive[str] = reactive("")
+class AssistantMessage(Markdown):
+    """Displays an assistant message with streaming support and Markdown formatting."""
 
     def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)
+        super().__init__("", **kwargs)
+        self._content_buffer = ""
 
     def append(self, token: str) -> None:
         """Append a token to the message."""
-        self._text += token
-
-    def render(self) -> Text:
-        if not self._text:
-            return Text("  ...", style="dim")
-        return Text(self._text, style=_NORD["foreground"])
+        self._content_buffer += token
+        self.update(self._content_buffer)
 
 
 class ToolCallBlock(Static):
@@ -97,16 +90,70 @@ class ToolCallBlock(Static):
         text.append(self._name, style=f"bold {_NORD['primary']}")
 
         if self._result:
-            result_preview = self._result[:300]
-            if len(self._result) > 300:
+            result_preview = self._result[:200]
+            if len(self._result) > 200:
                 result_preview += "..."
             text.append(" \u2192 ", style="dim")
             text.append(escape(result_preview), style="dim")
         elif self._args:
-            args_display = self._args[:100]
-            if len(self._args) > 100:
+            args_display = self._args[:80]
+            if len(self._args) > 80:
                 args_display += "..."
             text.append(f" {args_display}", style="dim")
+
+        text.append(f" [{status_text}]", style="dim")
+
+        return text
+
+
+class SubAgentToolCallBlock(Static):
+    """Indented display of a subagent's tool calls for TUI visibility."""
+
+    _status: reactive[str] = reactive("running")
+    _result: reactive[str] = reactive("")
+
+    def __init__(self, prompt: str, depth: int = 1, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._prompt = prompt
+        self._depth = depth
+        self._start_time = time.monotonic()
+        self._tool_calls: list[str] = []
+
+    def add_tool_call(self, name: str, args: str) -> None:
+        """Record a subagent tool call."""
+        preview = args[:60] + "..." if len(args) > 60 else args
+        self._tool_calls.append(f"{name}({preview})")
+
+    def set_completed(self, success: bool = True) -> None:
+        """Mark the subagent as completed."""
+        self._status = "success" if success else "error"
+        self._duration_ms = (time.monotonic() - self._start_time) * 1000
+
+    def render(self) -> Text:
+        indent = "  " * self._depth
+        duration = getattr(self, "_duration_ms", 0)
+
+        if self._status == "running":
+            icon = "\u25f7"
+            status_style = _NORD["accent"]
+            status_text = "running"
+        elif self._status == "success":
+            icon = "\u25b3"
+            status_style = _NORD["success"]
+            status_text = f"{duration:.0f}ms"
+        else:
+            icon = "\u25bf"
+            status_style = _NORD["error"]
+            status_text = f"{duration:.0f}ms"
+
+        text = Text()
+        text.append(f"{indent}{icon} ", style=status_style)
+        text.append("subagent", style=f"bold {_NORD['accent']}")
+        prompt_preview = self._prompt[:80] + "..." if len(self._prompt) > 80 else self._prompt
+        text.append(f" {prompt_preview}", style="dim")
+
+        if self._tool_calls:
+            text.append(f" [{len(self._tool_calls)} tools]", style="dim")
 
         text.append(f" [{status_text}]", style="dim")
 
@@ -131,11 +178,11 @@ class SystemMessage(Static):
             style = _NORD["warning"]
         else:
             icon = "\u2139"
-            style = "dim"
+            style = _NORD["dim"]
 
         text = Text()
         text.append(f" {icon} ", style=style)
-        text.append(self._content)
+        text.append(self._content, style="dim")
         return text
 
 
@@ -158,13 +205,14 @@ class ThinkingIndicator(Static):
 
 
 class StatusBar(Static):
-    """Status bar showing tokens, cost, and iteration info."""
+    """Status bar showing model, tokens, cost, and context usage."""
 
     _tokens: reactive[int] = reactive(0)
     _cost: reactive[float] = reactive(0.0)
     _iteration: reactive[int] = reactive(0)
     _model: reactive[str] = reactive("")
     _context_pct: reactive[float] = reactive(0.0)
+    _plan_mode: reactive[bool] = reactive(False)
 
     def update_stats(
         self,
@@ -173,6 +221,7 @@ class StatusBar(Static):
         iteration: int = 0,
         model: str = "",
         context_pct: float = 0.0,
+        plan_mode: bool = False,
     ) -> None:
         """Update status bar stats."""
         if tokens:
@@ -185,6 +234,7 @@ class StatusBar(Static):
             self._model = model
         if context_pct:
             self._context_pct = context_pct
+        self._plan_mode = plan_mode
 
     def render(self) -> Text:
         text = Text()
@@ -198,11 +248,11 @@ class StatusBar(Static):
                 token_str = f"{self._tokens / 1000:.1f}k"
             else:
                 token_str = str(self._tokens)
-            text.append(f" {token_str} tokens", style="dim")
+            text.append(f" {token_str}", style="dim")
 
         if self._cost > 0:
             text.append(" \u2502 ", style="dim")
-            text.append(f" ${self._cost:.4f}", style="dim")
+            text.append(f"${self._cost:.4f}", style="dim")
 
         if self._context_pct > 0:
             text.append(" \u2502 ", style="dim")
@@ -212,13 +262,13 @@ class StatusBar(Static):
                 pct_style = _NORD["warning"]
             else:
                 pct_style = _NORD["error"]
-            text.append(f" ctx {self._context_pct:.0%}", style=pct_style)
+            text.append(f"ctx {self._context_pct:.0%}", style=pct_style)
 
-        if self._iteration > 0:
+        if self._plan_mode:
             text.append(" \u2502 ", style="dim")
-            text.append(f" iter {self._iteration}", style="dim")
+            text.append("PLAN", style=f"bold {_NORD['warning']}")
 
-        text.append("  \u2502 Ctrl+D exit", style="dim")
+        text.append("  Ctrl+D exit", style="dim")
 
         return text
 

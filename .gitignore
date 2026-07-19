@@ -52,3 +52,11 @@ htmlcov/
 
 # Pyright
 .pyright/
+
+Context
+.coding-agent
+*.checkpoints.json
+hello.py
+hello.txt
+_init_memory.py
+_store_memory.py

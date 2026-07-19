@@ -59,12 +59,14 @@ class TestDropOldestToolResults:
 
         dropped = ctx.drop_oldest_tool_results(count=1)
 
-        assert dropped == 1
-        assert len(ctx.messages) == 4
-        # First tool result should be dropped, second one remains
-        tool_messages = [m for m in ctx.messages if m.role == "tool"]
-        assert len(tool_messages) == 1
-        assert tool_messages[0].content == "result2"
+        # Dropping the only tool result for assistant(id1) would orphan it,
+        # so the entire group (assistant + tool = 2 messages) is removed.
+        assert dropped == 2
+        assert len(ctx.messages) == 3
+        # First group's assistant is removed along with its tool
+        remaining = [m for m in ctx.messages if m.role == "assistant"]
+        assert len(remaining) == 1
+        assert remaining[0].content == "Done"
 
     def test_drop_multiple(self) -> None:
         ctx = ContextManager()

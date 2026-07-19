@@ -65,6 +65,16 @@ class ToolRegistry:
         """Return sorted tool names."""
         return sorted(self._tools.keys())
 
+    def filter_by_permission(
+        self, allowed_levels: frozenset[str]
+    ) -> "ToolRegistry":
+        """Return a new registry containing only tools with allowed permission levels."""
+        filtered = ToolRegistry(name=f"{self.name}_filtered")
+        for tool in self._tools.values():
+            if tool.permission_level in allowed_levels:
+                filtered.register(tool)
+        return filtered
+
     # ------------------------------------------------------------------
     # Schema generation (for LLM consumption)
     # ------------------------------------------------------------------

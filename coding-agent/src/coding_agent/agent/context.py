@@ -76,7 +76,10 @@ class ContextManager:
         2. Project context (if set separately from system prompt)
         3. Summary of older messages (if summarisation happened)
         4. Current conversation messages
+
+        Auto-repairs broken tool_call/tool alternation before building.
         """
+        self.repair_alternation()
         result: list[dict[str, Any]] = []
 
         if self.system_prompt:
@@ -148,8 +151,14 @@ class ContextManager:
     def drop_oldest_tool_results(self, count: int = 2) -> int:
         """Drop the oldest tool result messages.
 
-        This is the "overflow flush" — a cheap way to reduce context size
-        by removing old tool results while preserving the conversation flow.
+        Drops individual tool result messages from the front of the
+        conversation.  If dropping a tool result would orphan an
+        assistant-with-tool_calls (i.e. it's the last tool result for
+        that assistant), the entire assistant + tool group is removed
+        together to preserve alternation.
+
+        Use ``repair_alternation()`` after this to fill in any missing
+        tool results with placeholders.
 
         Parameters
         ----------
@@ -161,17 +170,81 @@ class ContextManager:
         int
             Number of messages actually dropped.
         """
-        # Find indices of tool result messages (oldest first)
-        tool_indices: list[int] = []
+        # Collect indices of all tool messages, oldest first
+        all_tool_indices: list[int] = []
         for i, msg in enumerate(self.messages):
             if msg.role == "tool":
-                tool_indices.append(i)
+                all_tool_indices.append(i)
 
-        # Drop oldest ones (up to count)
+        if not all_tool_indices:
+            return 0
+
+        # Determine which tool indices are safe to drop individually.
+        # A tool is unsafe if it's the ONLY remaining tool for its assistant.
+        safe_indices: list[int] = []
+        for idx in all_tool_indices:
+            # Find the assistant that produced this tool result
+            assistant_idx = idx - 1
+            while assistant_idx >= 0 and self.messages[assistant_idx].role == "tool":
+                assistant_idx -= 1
+            if assistant_idx < 0 or not (
+                self.messages[assistant_idx].role == "assistant"
+                and self.messages[assistant_idx].tool_calls
+            ):
+                # Orphaned tool — safe to drop
+                safe_indices.append(idx)
+                continue
+
+            # Count how many tool messages this assistant has
+            total = 0
+            j = assistant_idx + 1
+            while j < len(self.messages) and self.messages[j].role == "tool":
+                total += 1
+                j += 1
+
+            # Count how many of those we're keeping (not in safe_indices)
+            kept = 0
+            for k in range(assistant_idx + 1, j):
+                if k != idx and k not in all_tool_indices[:all_tool_indices.index(idx)]:
+                    kept += 1
+
+            if kept > 0:
+                safe_indices.append(idx)
+            else:
+                # Last tool for this assistant — drop the whole group
+                # This will be handled below
+                pass
+
+        # Drop safe individual tool results (oldest first)
         dropped = 0
-        for idx in reversed(tool_indices[:count]):  # Reverse to preserve indices
+        for idx in reversed(safe_indices[:count]):
             self.messages.pop(idx)
             dropped += 1
+
+        # If we still have budget, drop complete groups (assistant + all tools)
+        if dropped < count:
+            # Re-scan for groups where ALL tool results are still present
+            groups: list[tuple[int, int]] = []
+            i = 0
+            while i < len(self.messages):
+                msg = self.messages[i]
+                if msg.role == "assistant" and msg.tool_calls:
+                    start = i
+                    i += 1
+                    while i < len(self.messages) and self.messages[i].role == "tool":
+                        i += 1
+                    groups.append((start, i))
+                else:
+                    i += 1
+
+            still_needed = count - dropped
+            for start, end in groups:
+                if dropped >= count:
+                    break
+                size = end - start
+                if dropped + size <= count or dropped == 0:
+                    del self.messages[start:end]
+                    dropped += size
 
         return dropped
 
@@ -223,8 +296,10 @@ class ContextManager:
         """Drop the oldest messages from the conversation.
 
         This is the "context window sliding" — a cheaper alternative to
-        summarization. Drops the oldest ``fraction`` of messages while
+        summarization. Drops the oldest complete alternation groups while
         preserving the system prompt, summary, and project context.
+
+        Never splits an assistant-with-tool_calls from its tool results.
 
         Parameters
         ----------
@@ -245,13 +320,14 @@ class ContextManager:
         if count <= 0:
             return 0
 
-        dropped = 0
-        for _ in range(count):
-            if self.messages:
-                self.messages.pop(0)
-                dropped += 1
+        boundary = self._find_safe_boundary_from_start(
+            self.messages, prefer_drop=count,
+        )
+        if boundary <= 0:
+            return 0
 
-        return dropped
+        self.messages = self.messages[boundary:]
+        return boundary
 
     def set_context_summary(self, summary: str) -> None:
         """Set prioritized context summary from SmartContextEngine.
@@ -322,14 +398,21 @@ class ContextManager:
     def summarize_old_messages(self, summary: str) -> None:
         """Replace older messages with a compact summary.
 
-        Keeps the most recent 5 messages and folds everything else into
-        *summary* (which should be produced by the LLM via a separate call).
+        Keeps the most recent complete alternation groups and folds
+        everything else into *summary* (which should be produced by the
+        LLM via a separate call).
         """
         if len(self.messages) <= 5:
             return
 
-        recent = self.messages[-5:]
-        old = self.messages[:-5]
+        boundary = self._find_safe_boundary_from_end(
+            self.messages, prefer_keep=5,
+        )
+        if boundary <= 0:
+            return
+
+        recent = self.messages[boundary:]
+        old = self.messages[:boundary]
 
         old_content: list[str] = []
         for msg in old:
@@ -342,6 +425,173 @@ class ContextManager:
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_safe_boundary_from_end(
+        messages: list['ConversationMessage'],
+        prefer_keep: int = 5,
+    ) -> int:
+        """Find a safe split such that messages[i:] is a valid conversation tail.
+
+        Walks backward from the prefer_keep boundary to find the first
+        non-tool message boundary, ensuring tool results are never orphaned
+        from their assistant.
+
+        Parameters
+        ----------
+        messages:
+            The full message list.
+        prefer_keep:
+            Minimum number of messages to keep at the end.
+
+        Returns
+        -------
+        int
+            Index such that messages[i:] is safe to keep.
+        """
+        if not messages or len(messages) <= prefer_keep:
+            return 0
+
+        start = len(messages) - prefer_keep
+        for i in range(start, -1, -1):
+            if messages[i].role != "tool":
+                return i
+        return 0
+
+    @staticmethod
+    def _find_safe_boundary_from_start(
+        messages: list['ConversationMessage'],
+        prefer_drop: int = 1,
+    ) -> int:
+        """Find a safe split such that messages[:i] can be removed.
+
+        Walks forward to find the last safe boundary at or before
+        *prefer_drop*.  Never splits an assistant-with-tool_calls from
+        its tool results — complete groups are dropped together or not at all.
+
+        Parameters
+        ----------
+        messages:
+            The full message list.
+        prefer_drop:
+            Maximum number of messages to drop from the front.
+
+        Returns
+        -------
+        int
+            Index such that messages[:i] can be safely removed.
+        """
+        if not messages or prefer_drop <= 0:
+            return 0
+
+        last_safe = 0
+        i = 0
+        while i < len(messages) and last_safe < prefer_drop:
+            msg = messages[i]
+            if msg.role == "tool":
+                last_safe = i + 1
+                i += 1
+            elif msg.role == "assistant" and msg.tool_calls:
+                j = i + 1
+                while j < len(messages) and messages[j].role == "tool":
+                    j += 1
+                group_size = j - i
+                if last_safe + group_size <= prefer_drop:
+                    last_safe = j
+                    i = j
+                else:
+                    break
+            else:
+                last_safe = i + 1
+                i += 1
+
+        return min(last_safe, len(messages))
+
+    def repair_alternation(self) -> int:
+        """Repair broken tool_call/tool alternation in the message list.
+
+        Fixes two types of corruption:
+        1. **Orphaned tool messages** — a ``tool`` message whose
+           ``tool_call_id`` doesn't match any preceding assistant's
+           ``tool_calls``. These are removed.
+        2. **Missing tool results** — an ``assistant`` message with
+           ``tool_calls`` where some of the call IDs have no corresponding
+           ``tool`` result right after it.  Placeholder results are
+           inserted.
+
+        Called automatically from ``build_messages()``.
+
+        Returns
+        -------
+        int
+            Number of messages repaired (inserted or removed).
+        """
+        changes = 0
+
+        # Pass 1: Remove orphaned tool messages (no matching assistant)
+        i = 0
+        while i < len(self.messages):
+            msg = self.messages[i]
+            if msg.role == "tool":
+                has_assistant = False
+                for j in range(i - 1, -1, -1):
+                    prev = self.messages[j]
+                    if prev.role == "assistant" and prev.tool_calls:
+                        if msg.tool_call_id and any(
+                            tc.get("id") == msg.tool_call_id
+                            for tc in prev.tool_calls
+                        ):
+                            has_assistant = True
+                        break
+                    elif prev.role != "tool":
+                        break
+                if not has_assistant:
+                    self.messages.pop(i)
+                    changes += 1
+                    continue
+            i += 1
+
+        # Pass 2: Insert placeholder tool results for missing call IDs
+        i = 0
+        while i < len(self.messages):
+            msg = self.messages[i]
+            if msg.role == "assistant" and msg.tool_calls:
+                expected = {tc["id"] for tc in msg.tool_calls if tc.get("id")}
+                found: set[str] = set()
+                j = i + 1
+                while j < len(self.messages) and self.messages[j].role == "tool":
+                    tid = self.messages[j].tool_call_id
+                    if tid in expected:
+                        found.add(tid)
+                    j += 1
+
+                missing = expected - found
+                if missing:
+                    insert_pos = i + 1
+                    for mid in sorted(missing):
+                        for tc in msg.tool_calls:
+                            if tc.get("id") == mid:
+                                fn_name = (
+                                    tc.get("function", {}).get("name", "unknown")
+                                )
+                                placeholder = ConversationMessage(
+                                    role="tool",
+                                    content=(
+                                        f"[Tool result for '{fn_name}'\u2014"
+                                        "recovered from context compaction]"
+                                    ),
+                                    tool_call_id=mid,
+                                    name=fn_name,
+                                )
+                                self.messages.insert(insert_pos, placeholder)
+                                insert_pos += 1
+                                changes += 1
+                                break
+                i = j + (len(missing))
+            else:
+                i += 1
+
+        return changes
 
     def clear(self) -> None:
         """Clear conversation history (start fresh)."""

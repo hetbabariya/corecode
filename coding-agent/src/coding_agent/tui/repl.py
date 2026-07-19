@@ -9,28 +9,34 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.screen import Screen
 from textual.widgets import Footer, Header, Input
+from textual.worker import get_current_worker
 
+from coding_agent.agent.events import AgentEvent, EventType
 from coding_agent.commands import CommandContext, get_registry
 from coding_agent.logging import logger
-from coding_agent.tui.theme import REPL_CSS, create_nord_theme
+from coding_agent.tui.events import dispatch
+from coding_agent.tui.theme import create_nord_theme
 from coding_agent.tui.widgets import (
     AssistantMessage,
+    DiffViewer,
+    PlanPanel,
     StatusBar,
+    StatusPanel,
+    SubAgentToolCallBlock,
     SystemMessage,
     ThinkingIndicator,
-    Toolbar,
     ToolCallBlock,
     UserMessage,
 )
 
 
-class CodingAgentREPL(App[None]):
-    """Interactive REPL for the Coding Agent."""
+class ChatScreen(Screen[str | None]):
+    """Interactive chat screen for the Coding Agent."""
 
     TITLE = "Coding Agent"
-    SUB_TITLE = ""
-    CSS = REPL_CSS
+    CSS_PATH = "repl.tcss"
 
     BINDINGS = [
         Binding("ctrl+d", "quit", "Exit", show=True),
@@ -54,6 +60,7 @@ class CodingAgentREPL(App[None]):
         self._agent: Any = None
         self._current_assistant: AssistantMessage | None = None
         self._current_tool: ToolCallBlock | None = None
+        self._current_subagent: SubAgentToolCallBlock | None = None
         self._thinking: ThinkingIndicator | None = None
         self._prompt_tokens: int = 0
         self._completion_tokens: int = 0
@@ -63,29 +70,66 @@ class CodingAgentREPL(App[None]):
         self._model_name: str = ""
         self._provider_name: str = ""
         self._model_registry: Any = None
+        self._plan_mode: bool = False
+        self._plan_panel: PlanPanel | None = None
+        self._status_panel: StatusPanel | None = None
+
+    async def on_unmount(self) -> None:
+        """Graceful shutdown — cancel workers, flush session, close DB."""
+        for worker in self.workers:
+            if worker.is_running:
+                worker.cancel()
+        if self._agent:
+            try:
+                if hasattr(self._agent, "session_manager") and self._agent.session_manager:
+                    await self._agent.session_manager.close()
+                if hasattr(self._agent, "memory_manager") and self._agent.memory_manager:
+                    await self._agent.memory_manager.close()
+            except Exception as exc:
+                logger.warning("shutdown_error", error=str(exc))
 
     def compose(self) -> ComposeResult:
         yield Header(icon="\u2593")
         with VerticalScroll(id="chat-view"):
             yield SystemMessage(
-                "Welcome! Type a message to start. Ctrl+D to exit, Ctrl+C to interrupt.",
+                "Welcome! Type a message to start.",
                 level="info",
             )
-        yield Toolbar(id="toolbar")
-        yield Input(placeholder="Ask anything...", id="input", password=False)
-        yield StatusBar(id="status-bar")
         yield Footer()
+        yield StatusBar(id="status-bar")
+        yield Input(placeholder="\u276f Ask anything...", id="input", password=False)
 
     async def on_mount(self) -> None:
         """Initialize the agent after mount."""
-        self.register_theme(create_nord_theme())
-        self.theme = "coding-agent"
-        await self._init_agent()
-        self._update_toolbar_undo()
+        await self._init_agent_with_retry()
         self._load_custom_commands()
         if self._resume_session_id:
             await self._restore_session(self._resume_session_id)
         self.query_one("#input").focus()
+
+    async def action_quit(self) -> None:
+        """Dismiss the screen, returning to the browser or exiting."""
+        self.dismiss(None)
+
+    async def _init_agent_with_retry(self) -> None:
+        """Initialize the agent loop with retry logic."""
+        import asyncio
+
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                await self._init_agent()
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.warning("agent_init_retry", attempt=attempt, error=str(exc))
+                if attempt < 3:
+                    self._show_system(
+                        f"Agent init failed (attempt {attempt}/3), retrying...",
+                        "warning",
+                    )
+                    await asyncio.sleep(2)
+        self._show_system(f"Agent init failed after 3 attempts: {last_error}", "error")
 
     async def _init_agent(self) -> None:
         """Initialize the agent loop."""
@@ -240,10 +284,26 @@ class CodingAgentREPL(App[None]):
         for msg in messages:
             if msg.role == "user":
                 await chat_view.mount(UserMessage(msg.content))
-            elif msg.role == "assistant" and msg.content:
-                widget = AssistantMessage()
-                widget._text = msg.content
-                await chat_view.mount(widget)
+            elif msg.role == "assistant":
+                if msg.content:
+                    widget = AssistantMessage()
+                    widget.update(msg.content)
+                    await chat_view.mount(widget)
+                elif msg.tool_calls:
+                    tool_names = [
+                        tc.get("function", {}).get("name", "?")
+                        for tc in msg.tool_calls
+                    ]
+                    widget = AssistantMessage()
+                    widget.update("  \u21b3 Called: " + ", ".join(tool_names))
+                    await chat_view.mount(widget)
+            elif msg.role == "tool" and msg.name:
+                preview = (msg.content or "")[:300]
+                block = ToolCallBlock(name=msg.name, args="")
+                block._result = preview
+                block._status = "success"
+                block.add_class("-success")
+                await chat_view.mount(block)
         chat_view.scroll_end(animate=False)
 
         # Show resume summary
@@ -272,118 +332,15 @@ class CodingAgentREPL(App[None]):
         self._start_thinking()
 
         try:
-            from coding_agent.agent.events import EventType
-
             self._iteration = 0
             self._prompt_tokens = 0
             self._completion_tokens = 0
+            worker = get_current_worker()
 
             async for event in self._agent.process_input(user_input):
-                if event.type == EventType.TEXT:
-                    self._handle_text(str(event.data))
-
-                elif event.type == EventType.LOOP_START:
-                    self._iteration += 1
-                    self._update_status()
-
-                elif event.type == EventType.TOOL_START:
-                    self._stop_thinking()
-                    data = event.data if isinstance(event.data, dict) else {}
-                    name = data.get("name", "?")
-                    args = data.get("args", "")
-                    self._handle_tool_start(name, str(args))
-
-                elif event.type == EventType.TOOL_RESULT:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    result = data.get("result", "")
-                    success = True
-                    if hasattr(result, "success"):
-                        success = result.success
-                        result = result.output or result.error or ""
-                    self._handle_tool_result(str(result), success)
-
-                elif event.type == EventType.USAGE:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    self._prompt_tokens += int(data.get("prompt_tokens", 0))
-                    self._completion_tokens += int(data.get("completion_tokens", 0))
-                    self._update_status()
-
-                elif event.type == EventType.ERROR:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    err = data.get("error", str(event.data))
-                    self._show_error(str(err))
-
-                elif event.type == EventType.MAX_TOKENS_RECOVERY:
-                    self._show_system("Max tokens recovery triggered", "warning")
-
-                elif event.type == EventType.REACTIVE_COMPACT:
-                    self._show_system(
-                        "Context overflow recovery triggered",
-                        "warning",
-                    )
-
-                elif event.type == EventType.MICRO_COMPACT:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    compacted = data.get("compacted", 0)
-                    remaining = data.get("remaining_messages", 0)
-                    self._show_system(
-                        f"Micro-compact: {compacted} old results cleared ({remaining} messages remain)",
-                        "warning",
-                    )
-
-                elif event.type == EventType.UNDO_PUSH:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    file_path = data.get("file_path", "")
-                    tool_name = data.get("tool_name", "")
-                    self._show_system(
-                        f"Undoable: {tool_name} on {file_path}",
-                        "info",
-                    )
-                    self._update_toolbar_undo()
-
-                elif event.type == EventType.SIBLING_ABORT:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    tool_name = data.get("tool_name", "?")
-                    self._show_system(
-                        f"Sibling abort: {tool_name} cancelled (sibling failed)",
-                        "warning",
-                    )
-
-                elif event.type == EventType.HOOK_BLOCK:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    tool_name = data.get("tool_name", "?")
-                    reason = data.get("reason", "Hook blocked this action")
-                    self._show_system(
-                        f"Hook blocked: {tool_name} — {reason}",
-                        "warning",
-                    )
-
-                elif event.type == EventType.HOOK_OUTPUT:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    hook_event = data.get("event", "?")
-                    tool_name = data.get("tool_name", "?")
-                    output = data.get("output", "")
-                    self._show_system(
-                        f"Hook [{hook_event}] {tool_name}: {output}",
-                        "info",
-                    )
-
-                elif event.type == EventType.STUCK_DETECTED:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    msg = data.get("message", "")
-                    strategy = data.get("strategy", "")
-                    self._show_system(
-                        f"Stuck detected: {msg} (strategy: {strategy})",
-                        "warning",
-                    )
-
-                elif event.type == EventType.CONTEXT_HEALTH:
-                    data = event.data if isinstance(event.data, dict) else {}
-                    ratio = data.get("usage_ratio", 0)
-                    self._update_context_pct(ratio)
-
-                elif event.type == EventType.DONE:
-                    pass
+                if worker.is_cancelled:
+                    break
+                await dispatch(self, event)
 
             # Update final stats
             if self._agent:
@@ -428,7 +385,6 @@ class CodingAgentREPL(App[None]):
             chat_view.scroll_end(animate=False)
 
         self._current_assistant.append(token)
-        self._current_assistant.refresh()
         chat_view = self.query_one("#chat-view")
         chat_view.scroll_end(animate=False)
 
@@ -461,19 +417,6 @@ class CodingAgentREPL(App[None]):
         chat_view.mount(SystemMessage(message, level=level))
         chat_view.scroll_end(animate=False)
 
-    def _update_toolbar_undo(self) -> None:
-        """Update the toolbar with undo/redo state."""
-        from coding_agent.tools.undo import get_undo_manager
-        manager = get_undo_manager()
-        if manager:
-            toolbar = self.query_one("#toolbar", Toolbar)
-            toolbar.update_undo_state(
-                can_undo=manager.can_undo,
-                can_redo=manager.can_redo,
-                undo_count=manager.undo_count,
-                redo_count=manager.redo_count,
-            )
-
     def _update_status(self) -> None:
         """Update the status bar."""
         status_bar = self.query_one("#status-bar", StatusBar)
@@ -482,6 +425,8 @@ class CodingAgentREPL(App[None]):
             tokens=total_tokens,
             cost=self._cost,
             iteration=self._iteration,
+            model=f"{self._model_name} ({self._provider_name})" if self._model_name else "",
+            plan_mode=self._plan_mode,
         )
 
     def _update_context_pct(self, ratio: float) -> None:
@@ -498,14 +443,220 @@ class CodingAgentREPL(App[None]):
         """Finish the current response."""
         self._current_assistant = None
         self._current_tool = None
+        self._current_subagent = None
+
+    # ------------------------------------------------------------------
+    # Event dispatch handlers
+    # ------------------------------------------------------------------
+
+    async def _on_text(self, event: AgentEvent) -> None:
+        self._handle_text(str(event.data))
+
+    async def _on_loop_start(self, event: AgentEvent) -> None:
+        self._iteration += 1
+        self._update_status()
+
+    async def _on_tool_start(self, event: AgentEvent) -> None:
+        self._stop_thinking()
+        data = event.data if isinstance(event.data, dict) else {}
+        name = data.get("name", "?")
+        args = data.get("args", "")
+        self._handle_tool_start(name, str(args))
+
+    async def _on_tool_result(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        result = data.get("result", "")
+        success = True
+        if hasattr(result, "success"):
+            success = result.success
+            result = result.output or result.error or ""
+        self._handle_tool_result(str(result), success)
+        # Show diff viewer for file edit tools
+        name = data.get("name", "")
+        if name in ("edit_file", "write_file", "apply_patch") and success:
+            file_path = self._extract_tool_file_path(data)
+            if file_path:
+                diff_text = self._try_get_diff(file_path, str(result))
+                if diff_text:
+                    self._show_diff(file_path, diff_text)
+
+    async def _on_usage(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        self._prompt_tokens += int(data.get("prompt_tokens", 0))
+        self._completion_tokens += int(data.get("completion_tokens", 0))
+        self._update_status()
+
+    async def _on_error(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        err = data.get("error", str(event.data))
+        self._show_error(str(err))
+
+    async def _on_max_tokens_recovery(self, event: AgentEvent) -> None:
+        self._show_system("context recovery", "warning")
+
+    async def _on_reactive_compact(self, event: AgentEvent) -> None:
+        self._show_system("context compacted", "warning")
+
+    async def _on_micro_compact(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        compacted = data.get("compacted", 0)
+        remaining = data.get("remaining_messages", 0)
+        self._show_system(
+            f"compacted {compacted} messages ({remaining} remain)",
+            "info",
+        )
+
+    async def _on_undo_push(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        file_path = data.get("file_path", "")
+        tool_name = data.get("tool_name", "")
+        self._update_toolbar_undo()
+
+    async def _on_sibling_abort(self, event: AgentEvent) -> None:
+        pass
+
+    async def _on_hook_block(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        tool_name = data.get("tool_name", "?")
+        self._show_system(f"hook blocked: {tool_name}", "warning")
+
+    async def _on_hook_output(self, event: AgentEvent) -> None:
+        pass
+
+    async def _on_stuck_detected(self, event: AgentEvent) -> None:
+        pass
+
+    async def _on_subagent_start(self, event: AgentEvent) -> None:
+        self._stop_thinking()
+        data = event.data if isinstance(event.data, dict) else {}
+        prompt = data.get("prompt", "")
+        depth = getattr(event, "depth", 1)
+        self._current_subagent = SubAgentToolCallBlock(prompt=prompt, depth=depth)
+        chat_view = self.query_one("#chat-view")
+        await chat_view.mount(self._current_subagent)
+        chat_view.scroll_end(animate=False)
+
+    async def _on_subagent_tool(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        name = data.get("name", "?")
+        args = str(data.get("args", ""))
+        if self._current_subagent:
+            self._current_subagent.add_tool_call(name, args)
+            self._current_subagent.refresh()
+
+    async def _on_subagent_complete(self, event: AgentEvent) -> None:
+        if self._current_subagent:
+            self._current_subagent.set_completed()
+            self._current_subagent.refresh()
+            self._current_subagent = None
+
+    async def _on_plan_mode_change(self, event: AgentEvent) -> None:
+        self._plan_mode = event.type == EventType.PLAN_MODE_ENTERED
+        self._update_status()
+
+    async def _on_context_health(self, event: AgentEvent) -> None:
+        data = event.data if isinstance(event.data, dict) else {}
+        ratio = data.get("usage_ratio", 0)
+        self._update_context_pct(ratio)
+
+    async def _on_plan_update(self, event: AgentEvent) -> None:
+        """Handle plan update events — refresh the plan panel."""
+        data = event.data if isinstance(event.data, dict) else {}
+        plan_data = data.get("plan")
+        if plan_data and isinstance(plan_data, dict):
+            goal = plan_data.get("goal", "")
+            steps = plan_data.get("steps", [])
+            if self._plan_panel:
+                self._plan_panel.update_plan(goal, steps)
+                self._plan_panel.refresh()
+            else:
+                self._plan_panel = PlanPanel()
+                self._plan_panel.update_plan(goal, steps)
+                chat_view = self.query_one("#chat-view")
+                await chat_view.mount(self._plan_panel)
+                chat_view.scroll_end(animate=False)
+
+    async def _on_verification(self, event: AgentEvent) -> None:
+        """Handle verification events — show diff if checks failed."""
+        data = event.data if isinstance(event.data, dict) else {}
+        checks = data.get("checks", [])
+        failed = [c for c in checks if not c.get("passed", True)]
+        if failed:
+            for check in failed:
+                tool = check.get("tool", "?")
+                self._show_system(f"verify failed: {tool}", "warning")
+
+    async def _on_budget_exceeded(self, event: AgentEvent) -> None:
+        self._show_system("budget exceeded", "error")
+
+    async def _on_permission_request(self, event: AgentEvent) -> None:
+        pass
+
+    async def _on_permission_check(self, event: AgentEvent) -> None:
+        pass
+
+    async def _on_reflection(self, event: AgentEvent) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # Diff viewer helpers
+    # ------------------------------------------------------------------
+
+    def _extract_tool_file_path(self, data: dict) -> str:
+        """Extract file path from a tool call result data."""
+        result = data.get("result", "")
+        if hasattr(result, "metadata") and result.metadata:
+            return result.metadata.get("file_path", "")
+        args = data.get("args", {})
+        if isinstance(args, dict):
+            return args.get("path", args.get("file_path", ""))
+        return ""
+
+    def _try_get_diff(self, file_path: str, result_text: str) -> str:
+        """Try to get a git diff for the given file."""
+        try:
+            import subprocess
+            workspace = self.workspace
+            proc = subprocess.run(
+                ["git", "diff", "--", file_path],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout
+        except Exception:
+            pass
+        return ""
+
+    def _show_diff(self, file_path: str, diff_text: str) -> None:
+        """Mount a diff viewer in the chat view."""
+        viewer = DiffViewer(file_path=file_path, diff=diff_text)
+        chat_view = self.query_one("#chat-view")
+        chat_view.mount(viewer)
+        chat_view.scroll_end(animate=False)
 
     @on(Input.Submitted)
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle user input submission."""
-        if self._processing or not event.value.strip():
+        raw = event.value
+        if self._processing or not raw.strip():
             return
 
-        user_input = event.value.strip()
+        # Input validation
+        if len(raw) > 100_000:
+            self._show_system("Input too long (max 100,000 characters)", "error")
+            return
+
+        # Check for binary content
+        if raw and isinstance(raw, str):
+            binary_chars = sum(1 for c in raw if ord(c) < 32 and c not in "\n\r\t")
+            if binary_chars > len(raw) * 0.1:
+                self._show_system("Input appears to contain binary data", "error")
+                return
+
+        user_input = raw.strip()
         event.input.clear()
 
         # Handle slash commands before sending to agent
@@ -513,6 +664,10 @@ class CodingAgentREPL(App[None]):
             handled = await self._handle_command(user_input)
             if handled:
                 return
+
+        if self._agent is None:
+            self._show_system("Agent not initialized. Cannot process input.", "error")
+            return
 
         # Add user message to chat
         chat_view = self.query_one("#chat-view")
@@ -526,7 +681,7 @@ class CodingAgentREPL(App[None]):
         """Interrupt the current agent turn."""
         if self._processing:
             for worker in self.workers:
-                if worker.is_running:
+                if worker.is_running and worker.name == "default":
                     worker.cancel()
             self._processing = False
             self._stop_thinking()
@@ -564,8 +719,9 @@ class CodingAgentREPL(App[None]):
             return
 
         import asyncio
-        from coding_agent.tools.undo import get_undo_manager
+
         from coding_agent.agent.undo import UndoManager
+        from coding_agent.tools.undo import get_undo_manager
 
         manager = get_undo_manager()
         if not manager:
@@ -580,7 +736,7 @@ class CodingAgentREPL(App[None]):
                 UndoManager.apply_entry(entry, redo=False)
                 desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
                 return True, desc
-            except Exception as e:
+            except Exception:
                 manager.push(entry)
                 raise
 
@@ -600,8 +756,9 @@ class CodingAgentREPL(App[None]):
             return
 
         import asyncio
-        from coding_agent.tools.undo import get_undo_manager
+
         from coding_agent.agent.undo import UndoManager
+        from coding_agent.tools.undo import get_undo_manager
 
         manager = get_undo_manager()
         if not manager:
@@ -616,7 +773,7 @@ class CodingAgentREPL(App[None]):
                 UndoManager.apply_entry(entry, redo=True)
                 desc = entry.description or f"{entry.tool_name} on {entry.file_path}"
                 return True, desc
-            except Exception as e:
+            except Exception:
                 manager.push(entry)
                 raise
 
@@ -631,13 +788,46 @@ class CodingAgentREPL(App[None]):
             self._show_system(f"Redo failed: {e}", "error")
 
 
+class _ChatScreenApp(App[None]):
+    """Standalone ChatScreen App (backward compat wrapper)."""
+
+    CSS_PATH = "repl.tcss"
+
+    def __init__(
+        self,
+        workspace: Path = Path("."),
+        permission: str = "auto",
+        session_id: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.workspace = workspace
+        self.permission = permission
+        self._resume_session_id = session_id
+
+    def on_mount(self) -> None:
+        self.register_theme(create_nord_theme())
+        self.theme = "coding-agent"
+
+        def _on_chat_done(value: str | None) -> None:
+            self.exit(value)
+
+        self.push_screen(
+            ChatScreen(
+                workspace=self.workspace,
+                permission=self.permission,
+                session_id=self._resume_session_id,
+            ),
+            _on_chat_done,
+        )
+
+
 def run_repl(
     workspace: Path = Path("."),
     permission: str = "auto",
     session_id: str | None = None,
 ) -> None:
     """Run the interactive REPL."""
-    app = CodingAgentREPL(
+    app = _ChatScreenApp(
         workspace=workspace, permission=permission, session_id=session_id,
     )
     app.run()

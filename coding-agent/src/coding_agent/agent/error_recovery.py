@@ -189,21 +189,22 @@ class ErrorTracker:
             return RetryStrategy.ALTERNATIVE
 
         last = self._history[-1]
+        was_stuck = self.is_stuck()
 
-        # Stuck detection → escalate
-        if self.is_stuck():
+        if was_stuck:
             self._increment_stuck_count()
 
-        # Too many stuck cycles → ask user
+        # Escalation ladder: replan → ask user
         if self._stuck_count >= 3:
             self._ask_user_count += 1
             logger.warning("error_stuck_ask_user", tool=last.name, stuck_count=self._stuck_count)
             return RetryStrategy.ASK_USER
 
-        # Stuck but not yet at ask_user threshold → replan
         if self._stuck_count >= 2:
             logger.warning("error_stuck_replan", tool=last.name, stuck_count=self._stuck_count)
             return RetryStrategy.REPLAN
+
+        # Fall through to category-based classification for first stuck detection
 
         # Classify the error
         category = self.categorize_error(last.error)

@@ -240,7 +240,7 @@ async def _run_agent_clean(
 
     stats = _RunStats(start_time=time.monotonic())
 
-    async for event in agent.process_input(prompt):
+    async for event in agent.process_input(prompt, fresh=True):
         d = _event_dict(event.data)
 
         if event.type == EventType.TEXT:
@@ -357,6 +357,25 @@ async def _run_agent_clean(
         elif event.type == EventType.PERMISSION_MODE_CHANGED:
             mode = d.get("mode", "?")
             print(f"    \u2503   permission mode: {mode}")
+
+        elif event.type == EventType.SUBAGENT_STARTED:
+            prompt_preview = str(d.get("prompt", ""))[:80]
+            print(f"    \u2503   \u25b3 subagent \u2014 {prompt_preview}")
+
+        elif event.type == EventType.SUBAGENT_TOOL_START:
+            name = d.get("name", "?")
+            args = d.get("args", "")
+            args_str = _format_args(args)
+            print(f"    \u2503     \u25f7 {name}({args_str[:60]})")
+
+        elif event.type == EventType.SUBAGENT_COMPLETED:
+            print(f"    \u2503   \u25bf subagent done")
+
+        elif event.type == EventType.PLAN_MODE_ENTERED:
+            print(f"    \u2503   \u25b3 plan mode enabled \u2014 read-only tools")
+
+        elif event.type == EventType.PLAN_MODE_EXITED:
+            print(f"    \u2503   \u25bf plan mode disabled \u2014 execution mode")
 
         elif event.type == EventType.VERIFICATION:
             file_path = d.get("file_path", "")
@@ -565,7 +584,7 @@ async def _run_agent_raw(
         agent_timeout_per_iteration=settings.agent_timeout_per_iteration,
     )
 
-    async for event in agent.process_input(prompt):
+    async for event in agent.process_input(prompt, fresh=True):
         d = _event_dict(event.data)
         if event.type == EventType.TEXT:
             print(str(event.data), end="", flush=True)
@@ -599,6 +618,19 @@ async def _run_agent_raw(
                 print(f"\n  [Verify FAIL: {file_path}]")
                 for c in failed[:3]:
                     print(f"    - [{c.get('tool', '?')}] {c.get('output', '')[:100]}")
+        elif event.type == EventType.SUBAGENT_STARTED:
+            prompt_preview = str(d.get("prompt", ""))[:80]
+            print(f"\n  [Subagent: {prompt_preview}]")
+        elif event.type == EventType.SUBAGENT_TOOL_START:
+            name = d.get("name", "?")
+            args = d.get("args", "")
+            print(f"    [Subagent tool: {name}({str(args)[:60]})]")
+        elif event.type == EventType.SUBAGENT_COMPLETED:
+            print(f"\n  [Subagent done]")
+        elif event.type == EventType.PLAN_MODE_ENTERED:
+            print(f"\n  [Plan mode enabled]")
+        elif event.type == EventType.PLAN_MODE_EXITED:
+            print(f"\n  [Plan mode disabled]")
         elif event.type == EventType.REFLECTION:
             assessment = d.get("assessment", "")
             reason = d.get("reason", "")
@@ -703,7 +735,7 @@ def repl(
 
     effective_level = "DEBUG" if verbose else log_level
     log_file = Settings().log_file
-    setup_logging(level=effective_level, log_file=log_file)
+    setup_logging(level=effective_level, log_file=log_file, capture_for_tui=True)
 
     session_id = None
     if continue_last or resume is not None:
@@ -712,6 +744,30 @@ def repl(
     from coding_agent.tui.repl import run_repl
 
     run_repl(workspace=workspace, permission=permission, session_id=session_id)
+
+
+@app.command()
+def tui(
+    workspace: Path = Path("."),
+    permission: str = typer.Option("auto", help="Permission mode: auto, confirm, deny"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug-level logging"),
+) -> None:
+    """Launch the unified TUI with session browser and chat.
+
+    Browse, resume, or create sessions, then chat with the agent.
+    Ctrl+D to go back to the browser; Ctrl+D again to exit.
+    """
+    from coding_agent.config import Settings
+    from coding_agent.logging import setup_logging
+
+    effective_level = "DEBUG" if verbose else log_level
+    log_file = Settings().log_file
+    setup_logging(level=effective_level, log_file=log_file, capture_for_tui=True)
+
+    from coding_agent.tui.app import CodingAgentApp
+
+    CodingAgentApp(workspace=workspace).run()
 
 
 @app.command()
@@ -933,6 +989,53 @@ def redo() -> None:
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
+
+
+@app.command()
+def reset(
+    workspace: Path = Path("."),
+    memories: bool = typer.Option(False, "--memories", "-m", help="Also clear semantic memories for this workspace"),
+) -> None:
+    """Reset session state: archive active plan and optionally clear memories.
+
+    Use this when the agent picks up a stale plan from a previous session.
+    After running ``reset``, start a fresh session with ``coding-agent run``.
+    """
+    import asyncio
+
+    from coding_agent.config import Settings
+    from coding_agent.session.manager import SessionManager
+
+    ws_str = str(workspace.resolve())
+    settings = Settings()
+
+    async def _reset() -> None:
+        mgr = SessionManager(settings.get_db_path())
+        await mgr.initialize()
+        try:
+            # Archive any active plan
+            plan_data = await mgr.load_active_plan(ws_str)
+            if plan_data:
+                await mgr.complete_plan(plan_data["id"])
+                typer.echo(f"  \u2713 Archived stale plan: \"{plan_data.get('goal', '?')}\"")
+            else:
+                typer.echo("  \u2014 No active plan found.")
+
+            # Optionally clear memories
+            if memories:
+                all_memories = await mgr.get_memories(workspace=ws_str, limit=1000)
+                if all_memories:
+                    ids = [m.id for m in all_memories]
+                    deleted = await mgr.delete_memories(ids)
+                    typer.echo(f"  \u2713 Cleared {deleted} memory entries.")
+                else:
+                    typer.echo("  \u2014 No memories to clear.")
+
+            typer.echo("\n  Ready for a fresh session. Run: coding-agent run --prompt \"...\"")
+        finally:
+            await mgr.close()
+
+    asyncio.run(_reset())
 
 
 if __name__ == "__main__":

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import time
 from pathlib import Path
 
@@ -145,9 +144,13 @@ class SandboxExecutor:
         timeout: int,
         cwd: str | None,
     ) -> ToolResult:
-        """Run directly on the host — mirrors tools/shell.py logic."""
+        """Run directly on the host — mirrors tools/shell.py logic.
+
+        On Windows, uses CMD via ``shell=True`` to support ``&&``,
+        ``dir``, ``type``, and other CMD built-ins.
+        On Unix/macOS, uses ``/bin/sh -c`` via ``shell=True``.
+        """
         exec_start = time.monotonic()
-        use_shell = sys.platform == "win32"
         proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -155,7 +158,7 @@ class SandboxExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-                shell=use_shell,
+                shell=True,
             )
             self._current_proc = proc
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
