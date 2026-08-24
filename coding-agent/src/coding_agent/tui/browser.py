@@ -9,6 +9,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.events import Key
 from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Input, Static
@@ -29,14 +30,15 @@ class BrowserScreen(Screen[str | None]):
         Binding("n", "new_session", "New", show=True),
         Binding("d", "delete_session", "Delete", show=True),
         Binding("r", "refresh", "Refresh", show=True),
+        Binding("tab", "focus_table", "Focus Table", show=False),
     ]
 
     selected_session_id: reactive[str | None] = reactive(None)
-    _sessions: list[dict[str, Any]] = []
 
     def __init__(self, workspace: Path = Path(".")) -> None:
         super().__init__()
         self.workspace = workspace
+        self._sessions: list[dict[str, Any]] = []
 
     def compose(self) -> ComposeResult:
         yield Header(icon="\u2593")
@@ -49,7 +51,7 @@ class BrowserScreen(Screen[str | None]):
             yield DataTable(id="session-table", cursor_type="row")
             with Horizontal(id="info-panel"):
                 yield Static(
-                    " Enter:Resume | n:New | d:Delete | r:Refresh | Ctrl+D:Quit",
+                    " Enter:Resume | n:New | d:Delete | r:Refresh | Tab:Focus | Ctrl+D:Quit",
                     classes="help-hint",
                 )
         yield Footer()
@@ -59,7 +61,16 @@ class BrowserScreen(Screen[str | None]):
         table.add_columns("ID", "Date", "Model", "Tokens", "Cost", "Summary")
         table.zebra_stripes = True
         await self._load_sessions()
-        self.query_one("#search-input").focus()
+        # Focus the table so arrow keys and Enter work immediately
+        table.focus()
+
+    async def on_key(self, event: Key) -> None:
+        """Intercept Enter before DataTable consumes it."""
+        if event.key == "enter":
+            table = self.query_one("#session-table", DataTable)
+            if table.has_focus:
+                await self.action_resume()
+                event.stop()
 
     async def _load_sessions(self, filter_text: str = "") -> None:
         from coding_agent.config import Settings
@@ -100,6 +111,11 @@ class BrowserScreen(Screen[str | None]):
                 "row_key": row_key,
             })
 
+        # Auto-select first row if sessions exist and no filter
+        if self._sessions and not filter_text:
+            table.move_cursor(row=0)
+            self.selected_session_id = self._sessions[0]["id"]
+
     @on(Input.Changed, "#search-input")
     async def on_search_changed(self, event: Input.Changed) -> None:
         await self._load_sessions(filter_text=event.value)
@@ -112,8 +128,16 @@ class BrowserScreen(Screen[str | None]):
 
     async def action_resume(self) -> None:
         """Resume the selected session."""
+        # First try selected_session_id from row click
         if self.selected_session_id:
             self.dismiss(self.selected_session_id)
+            return
+
+        # Fallback: check cursor row directly
+        table = self.query_one("#session-table", DataTable)
+        cursor_row = table.cursor_row
+        if cursor_row is not None and cursor_row < len(self._sessions):
+            self.dismiss(self._sessions[cursor_row]["id"])
 
     async def action_new_session(self) -> None:
         """Start a new session."""
@@ -150,6 +174,11 @@ class BrowserScreen(Screen[str | None]):
         await self._load_sessions(
             filter_text=self.query_one("#search-input", Input).value,
         )
+
+    async def action_focus_table(self) -> None:
+        """Switch focus to the session table."""
+        table = self.query_one("#session-table", DataTable)
+        table.focus()
 
 
 class SessionBrowser(App[str | None]):

@@ -49,7 +49,7 @@ uv run coding-agent tui
 
 ## Architecture
 
-![CoreCode Architecture](architecture.png)
+![CoreCode Architecture](images/Architecture.png)
 
 The agent follows an **observe → think → act** loop. User input flows through the CLI/TUI into the Agent Loop, which orchestrates everything: querying LLM providers, routing tool calls through the registry, managing context, and persisting state.
 
