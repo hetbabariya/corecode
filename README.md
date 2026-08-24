@@ -2,6 +2,10 @@
 
 AI-powered coding agent built from scratch — reads, edits, and executes code in your workspace with multi-provider LLM support, Docker sandboxing, and a terminal UI.
 
+## Demo
+
+https://github.com/user-attachments/assets/fd5c46c6-98f3-47c8-8e74-0aa89766d8ac
+
 ## Features
 
 | Capability | Description |
@@ -49,7 +53,7 @@ uv run coding-agent tui
 
 ## Architecture
 
-![CoreCode Architecture](images/Architecture.png)
+![CoreCode Architecture](resources/Architecture.png)
 
 The agent follows an **observe → think → act** loop. User input flows through the CLI/TUI into the Agent Loop, which orchestrates everything: querying LLM providers, routing tool calls through the registry, managing context, and persisting state.
 
