@@ -51,6 +51,7 @@ class ChatScreen(Screen[str | None]):
         workspace: Path = Path("."),
         permission: str = "auto",
         session_id: str | None = None,
+        demo_mode: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -74,6 +75,10 @@ class ChatScreen(Screen[str | None]):
         self._plan_panel: PlanPanel | None = None
         self._status_panel: StatusPanel | None = None
         self._interrupted: bool = False
+        # Demo mode
+        self._demo_mode = demo_mode
+        self._demo_queue: list[dict[str, str]] = []
+        self._demo_index: int = 0
 
     async def on_unmount(self) -> None:
         """Graceful shutdown — cancel workers, flush session, close DB."""
@@ -82,9 +87,15 @@ class ChatScreen(Screen[str | None]):
                 worker.cancel()
         if self._agent:
             try:
-                if hasattr(self._agent, "session_manager") and self._agent.session_manager:
+                if (
+                    hasattr(self._agent, "session_manager")
+                    and self._agent.session_manager
+                ):
                     await self._agent.session_manager.close()
-                if hasattr(self._agent, "memory_manager") and self._agent.memory_manager:
+                if (
+                    hasattr(self._agent, "memory_manager")
+                    and self._agent.memory_manager
+                ):
                     await self._agent.memory_manager.close()
             except Exception as exc:
                 logger.warning("shutdown_error", error=str(exc))
@@ -107,6 +118,10 @@ class ChatScreen(Screen[str | None]):
         if self._resume_session_id:
             await self._restore_session(self._resume_session_id)
         self.query_one("#input").focus()
+
+        # Start demo mode if enabled
+        if self._demo_mode:
+            self._start_demo()
 
     async def action_quit(self) -> None:
         """Dismiss the screen, returning to the browser or exiting."""
@@ -246,6 +261,53 @@ class ChatScreen(Screen[str | None]):
         if count:
             logger.info("custom_commands_loaded", count=count)
 
+    # ------------------------------------------------------------------
+    # Demo mode
+    # ------------------------------------------------------------------
+
+    def _start_demo(self) -> None:
+        """Initialize and start the demo sequence."""
+        from coding_agent.tui.app import DEMO_SCENARIOS
+
+        self._demo_queue = list(DEMO_SCENARIOS)
+        self._demo_index = 0
+        self._show_system("Demo mode — auto-playing feature showcase", "info")
+        self._show_system(
+            f"Running {len(self._demo_queue)} scenarios. Ctrl+C to interrupt.",
+            "info",
+        )
+        # Start after a short delay
+        self.set_timer(1.0, self._run_next_demo)
+
+    def _run_next_demo(self) -> None:
+        """Submit the next demo prompt after agent is idle."""
+        if self._demo_index >= len(self._demo_queue):
+            self._show_system("Demo complete!", "info")
+            self._show_system("All features showcased. Press Ctrl+D to exit.", "info")
+            return
+
+        if self._processing:
+            # Agent still busy, check again later
+            self.set_timer(0.5, self._run_next_demo)
+            return
+
+        scenario = self._demo_queue[self._demo_index]
+        title = scenario["title"]
+        prompt = scenario["prompt"]
+        self._demo_index += 1
+
+        # Show scenario header
+        self._show_system(
+            f"── Demo {self._demo_index}/{len(self._demo_queue)}: {title} ──",
+            "info",
+        )
+
+        # Submit the prompt
+        input_widget = self.query_one("#input", Input)
+        input_widget.value = prompt
+        # Trigger submission
+        self.post_message(Input.Submitted(input_widget, prompt))
+
     async def _init_model_registry(self) -> None:
         """Initialize the dynamic model registry."""
         from coding_agent.config import Settings
@@ -274,7 +336,9 @@ class ChatScreen(Screen[str | None]):
                 self._agent.context.add_assistant_message(msg.content, msg.tool_calls)
             elif msg.role == "tool" and msg.tool_call_id:
                 self._agent.context.add_tool_result(
-                    msg.tool_call_id, msg.name or "", msg.content,
+                    msg.tool_call_id,
+                    msg.name or "",
+                    msg.content,
                 )
 
         # Point agent at the same session so new messages are appended
@@ -307,8 +371,7 @@ class ChatScreen(Screen[str | None]):
                     await chat_view.mount(widget)
                 elif msg.tool_calls:
                     tool_names = [
-                        tc.get("function", {}).get("name", "?")
-                        for tc in msg.tool_calls
+                        tc.get("function", {}).get("name", "?") for tc in msg.tool_calls
                     ]
                     widget = AssistantMessage()
                     widget.update("  \u21b3 Called: " + ", ".join(tool_names))
@@ -436,7 +499,9 @@ class ChatScreen(Screen[str | None]):
             tokens=total_tokens,
             cost=self._cost,
             iteration=self._iteration,
-            model=f"{self._model_name} ({self._provider_name})" if self._model_name else "",
+            model=f"{self._model_name} ({self._provider_name})"
+            if self._model_name
+            else "",
             plan_mode=self._plan_mode,
         )
 
@@ -455,6 +520,10 @@ class ChatScreen(Screen[str | None]):
         self._current_assistant = None
         self._current_tool = None
         self._current_subagent = None
+
+        # In demo mode, schedule next prompt after a pause
+        if self._demo_mode and self._demo_index < len(self._demo_queue):
+            self.set_timer(2.0, self._run_next_demo)
 
     def _update_toolbar_undo(self) -> None:
         """Update toolbar undo/redo button state."""
@@ -536,8 +605,8 @@ class ChatScreen(Screen[str | None]):
 
     async def _on_undo_push(self, event: AgentEvent) -> None:
         data = event.data if isinstance(event.data, dict) else {}
-        file_path = data.get("file_path", "")
-        tool_name = data.get("tool_name", "")
+        data.get("file_path", "")
+        data.get("tool_name", "")
         self._update_toolbar_undo()
 
     async def _on_sibling_abort(self, event: AgentEvent) -> None:
@@ -644,6 +713,7 @@ class ChatScreen(Screen[str | None]):
         """Try to get a git diff for the given file."""
         try:
             import subprocess
+
             workspace = self.workspace
             proc = subprocess.run(
                 ["git", "diff", "--", file_path],
@@ -750,7 +820,10 @@ class ChatScreen(Screen[str | None]):
     async def action_undo(self) -> None:
         """Undo the last file mutation."""
         if self._processing:
-            self._show_system("Cannot undo while processing. Press Ctrl+C to interrupt first.", "warning")
+            self._show_system(
+                "Cannot undo while processing. Press Ctrl+C to interrupt first.",
+                "warning",
+            )
             return
 
         import asyncio
@@ -788,7 +861,10 @@ class ChatScreen(Screen[str | None]):
     async def action_redo(self) -> None:
         """Redo the last undone mutation."""
         if self._processing:
-            self._show_system("Cannot redo while processing. Press Ctrl+C to interrupt first.", "warning")
+            self._show_system(
+                "Cannot redo while processing. Press Ctrl+C to interrupt first.",
+                "warning",
+            )
             return
 
         import asyncio
@@ -864,6 +940,8 @@ def run_repl(
 ) -> None:
     """Run the interactive REPL."""
     app = _ChatScreenApp(
-        workspace=workspace, permission=permission, session_id=session_id,
+        workspace=workspace,
+        permission=permission,
+        session_id=session_id,
     )
     app.run()

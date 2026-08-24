@@ -752,11 +752,14 @@ def tui(
     permission: str = typer.Option("auto", help="Permission mode: auto, confirm, deny"),
     log_level: str = typer.Option("INFO", help="Log level"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug-level logging"),
+    demo: bool = typer.Option(False, "--demo", help="Run automated demo showcasing all features"),
 ) -> None:
     """Launch the unified TUI with session browser and chat.
 
     Browse, resume, or create sessions, then chat with the agent.
     Ctrl+D to go back to the browser; Ctrl+D again to exit.
+
+    Use --demo to run an automated feature showcase.
     """
     from coding_agent.config import Settings
     from coding_agent.logging import setup_logging
@@ -767,7 +770,7 @@ def tui(
 
     from coding_agent.tui.app import CodingAgentApp
 
-    CodingAgentApp(workspace=workspace).run()
+    CodingAgentApp(workspace=workspace, demo_mode=demo).run()
 
 
 @app.command()

@@ -63,8 +63,6 @@ The agent follows an **observe → think → act** loop. User input flows throug
 
 ### Agent Loop Flow
 
-![Agent Loop Architecture](agent-loop-architecture.png)
-
 The agent loop runs an **observe → think → act** cycle:
 
 1. **Observe** — Build system prompt, select prioritized context via Smart Context Engine, load session history
