@@ -54,9 +54,10 @@ class DiskStore:
     Directory layout::
 
         .coding-agent/undo/
-        ├── stack.json            # session id + ordered entry IDs
+        ├── stack-{session_id}.json  # session-specific stack metadata
+        ├── stack.json               # legacy fallback (no session ID)
         └── entries/
-            ├── {id}.json         # individual entry data
+            ├── {id}.json            # individual entry data
             └── ...
 
     All writes go through a temp-file-then-rename path so that a crash
@@ -100,24 +101,41 @@ class DiskStore:
     # Stack operations
     # ------------------------------------------------------------------
 
-    def load_stack(self) -> Optional[StoredStack]:
-        """Load the stack metadata, or ``None`` if not found."""
-        if not self._stack_path.exists():
-            return None
-        try:
-            raw = json.loads(self._stack_path.read_text(encoding="utf-8"))
-            return StoredStack(
-                session_id=raw["session_id"],
-                created_at=raw["created_at"],
-                undo_ids=raw.get("undo_ids", []),
-                redo_ids=raw.get("redo_ids", []),
-            )
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            logger.warning("undo_stack_load_failed", error=str(exc))
-            return None
+    def load_stack(self, session_id: str | None = None) -> Optional[StoredStack]:
+        """Load the stack metadata, or ``None`` if not found.
+
+        If *session_id* is provided, loads ``stack-{session_id}.json``.
+        Falls back to ``stack.json`` (legacy) if session-specific file not found.
+        """
+        paths: list[Path] = []
+        if session_id:
+            paths.append(self._root / f"stack-{session_id}.json")
+        paths.append(self._stack_path)
+
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                return StoredStack(
+                    session_id=raw["session_id"],
+                    created_at=raw["created_at"],
+                    undo_ids=raw.get("undo_ids", []),
+                    redo_ids=raw.get("redo_ids", []),
+                )
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                logger.warning("undo_stack_load_failed", error=str(exc))
+                continue
+        return None
 
     def save_stack(self, stack: StoredStack) -> None:
-        """Persist the stack metadata."""
+        """Persist the stack metadata to a session-specific file."""
+        session_path = self._root / f"stack-{stack.session_id}.json"
+        self._atomic_write(
+            session_path,
+            asdict(stack),
+        )
+        # Also save to legacy path for backward compatibility
         self._atomic_write(
             self._stack_path,
             asdict(stack),

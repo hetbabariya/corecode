@@ -576,14 +576,23 @@ async def _do_resume(ctx: CommandContext, session_id: str) -> str:
     # Point agent at the same session
     agent.session_id = session_id
 
+    # Restore undo stack for this session
+    agent.undo_manager.init_session(session_id)
+
     # Update the REPL's internal session tracking
     ctx.repl._resume_session_id = session_id
 
+    # Display messages in the chat view
+    await ctx.repl._display_session_messages(messages)
+
     info = await agent.session_manager.get_session(session_id)
     date = info.created_at[:10] if info and info.created_at else "?"
+    undo_info = ""
+    if agent.undo_manager.undo_count:
+        undo_info = f" ({agent.undo_manager.undo_count} undoable)"
     return (
         f"Resumed session {session_id} from {date}. "
-        f"{len(messages)} messages loaded."
+        f"{len(messages)} messages loaded.{undo_info}"
     )
 
 

@@ -89,14 +89,20 @@ class UndoManager:
     def session_id(self) -> str:
         return self._session_id
 
-    def init_session(self) -> str:
-        """Initialise or resume a session.  Returns the session ID."""
+    def init_session(self, session_id: str | None = None) -> str:
+        """Initialise or resume a session.  Returns the session ID.
+
+        If *session_id* is provided, attempts to load the undo stack for
+        that specific session.  Otherwise, loads whatever was last saved.
+        """
         store = self._get_store()
-        saved = store.load_stack()
+        saved = store.load_stack(session_id or None)
 
         if saved is not None:
             # Resume existing session
             self._session_id = saved.session_id
+            self._undo_stack.clear()
+            self._redo_stack.clear()
             for eid in saved.undo_ids:
                 entry = store.load_entry(eid)
                 if entry is not None:

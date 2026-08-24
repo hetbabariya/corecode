@@ -73,6 +73,7 @@ class ChatScreen(Screen[str | None]):
         self._plan_mode: bool = False
         self._plan_panel: PlanPanel | None = None
         self._status_panel: StatusPanel | None = None
+        self._interrupted: bool = False
 
     async def on_unmount(self) -> None:
         """Graceful shutdown — cancel workers, flush session, close DB."""
@@ -279,7 +280,22 @@ class ChatScreen(Screen[str | None]):
         # Point agent at the same session so new messages are appended
         self._agent.session_id = session_id
 
-        # Display previous messages in the chat view
+        # Restore undo stack for this session
+        self._agent.undo_manager.init_session(session_id)
+
+        await self._display_session_messages(messages)
+
+        # Show resume summary
+        info = await self._agent.session_manager.get_session(session_id)
+        if info:
+            date = info.created_at[:10] if info.created_at else "?"
+            self._show_system(
+                f"Resumed session {session_id} from {date}. {len(messages)} messages loaded.",
+                "info",
+            )
+
+    async def _display_session_messages(self, messages: list) -> None:
+        """Render loaded messages into the chat view."""
         chat_view = self.query_one("#chat-view")
         for msg in messages:
             if msg.role == "user":
@@ -305,15 +321,6 @@ class ChatScreen(Screen[str | None]):
                 block.add_class("-success")
                 await chat_view.mount(block)
         chat_view.scroll_end(animate=False)
-
-        # Show resume summary
-        info = await self._agent.session_manager.get_session(session_id)
-        if info:
-            date = info.created_at[:10] if info.created_at else "?"
-            self._show_system(
-                f"Resumed session {session_id} from {date}. {len(messages)} messages loaded.",
-                "info",
-            )
 
     @work
     async def _process_input(self, user_input: str) -> None:
@@ -355,10 +362,14 @@ class ChatScreen(Screen[str | None]):
         except Exception as exc:
             self._show_error(f"Error: {exc}")
         finally:
+            was_interrupted = self._interrupted
+            self._interrupted = False
             self._processing = False
             self._stop_thinking()
             self._set_input_enabled(True)
             self._finish_response()
+            if not was_interrupted:
+                self._update_status()
 
     def _start_thinking(self) -> None:
         """Show thinking indicator."""
@@ -444,6 +455,23 @@ class ChatScreen(Screen[str | None]):
         self._current_assistant = None
         self._current_tool = None
         self._current_subagent = None
+
+    def _update_toolbar_undo(self) -> None:
+        """Update toolbar undo/redo button state."""
+        from coding_agent.tools.undo import get_undo_manager
+
+        manager = get_undo_manager()
+        if manager:
+            try:
+                toolbar = self.query_one("Toolbar")
+                toolbar.update_undo_state(
+                    can_undo=manager.can_undo,
+                    can_redo=manager.can_redo,
+                    undo_count=manager.undo_count,
+                    redo_count=manager.redo_count,
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Event dispatch handlers
@@ -678,14 +706,20 @@ class ChatScreen(Screen[str | None]):
         self._process_input(user_input)
 
     def action_interrupt(self) -> None:
-        """Interrupt the current agent turn."""
+        """Interrupt the current agent turn.
+
+        Only cancels the worker and shows feedback.  All UI state cleanup
+        (``_processing``, input enable, thinking indicator) is deferred to
+        ``_process_input``'s ``finally`` block so it runs *after* the
+        ``CancelledError`` propagates — avoiding the race condition where
+        premature cleanup lets a new worker start while the old one is
+        still winding down.
+        """
         if self._processing:
+            self._interrupted = True
             for worker in self.workers:
-                if worker.is_running and worker.name == "default":
+                if worker.is_running:
                     worker.cancel()
-            self._processing = False
-            self._stop_thinking()
-            self._set_input_enabled(True)
             self._show_system("Interrupted", "warning")
 
     def action_clear(self) -> None:
@@ -716,6 +750,7 @@ class ChatScreen(Screen[str | None]):
     async def action_undo(self) -> None:
         """Undo the last file mutation."""
         if self._processing:
+            self._show_system("Cannot undo while processing. Press Ctrl+C to interrupt first.", "warning")
             return
 
         import asyncio
@@ -753,6 +788,7 @@ class ChatScreen(Screen[str | None]):
     async def action_redo(self) -> None:
         """Redo the last undone mutation."""
         if self._processing:
+            self._show_system("Cannot redo while processing. Press Ctrl+C to interrupt first.", "warning")
             return
 
         import asyncio

@@ -2080,7 +2080,31 @@ class AgentLoop:
         # that may change per iteration
         base = self._cached_system_prompt
         if self._plan_mode:
-            base += "\n\n## PLAN MODE ACTIVE\n\nYou are in Plan Mode. Only read-only tools are available (reads, searches, git status). You cannot write files, run commands, or spawn subagents. Create a detailed implementation plan, then tell the user to use `/build` to start execution."
+            base += (
+                "\n\n"
+                "## ⚠ PLAN MODE — READ-ONLY ⚠\n\n"
+                "You are in **Plan Mode**. Your ONLY job is to analyze the user's "
+                "request and produce a structured implementation plan. You must NOT "
+                "write any code whatsoever.\n\n"
+                "**You MAY:**\n"
+                "- Read files, search code, check git status, inspect the workspace\n"
+                "- Analyze requirements and existing code\n"
+                "- Describe what changes are needed, in which files, and why\n"
+                "- Outline the approach and order of operations\n"
+                "- Identify risks and edge cases\n\n"
+                "**You MUST NOT:**\n"
+                "- Write code, code blocks, file contents, diffs, or patches\n"
+                "- Output anything that looks like a code edit or implementation\n"
+                "- Use edit_file, write_file, apply_patch, or any write tool\n"
+                "- Spawn subagents or run non-read commands\n\n"
+                "**Output format:**\n"
+                "1. **Analysis** — What the user wants and what you discovered reading the code\n"
+                "2. **Plan** — Ordered steps describing *what* to change and *where* (file paths + "
+                "brief description per step). No code snippets.\n"
+                "3. **Risks** — Any edge cases or things to watch out for\n"
+                "4. Say: \"Run `/build` when ready to execute this plan.\"\n\n"
+                "If you output any code, you have failed. Plans are text descriptions, not implementations."
+            )
         if plan_prompt:
             base += f"\n\n## Current Plan\n\n{plan_prompt}"
         if memory_content:
